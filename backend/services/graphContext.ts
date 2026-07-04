@@ -68,6 +68,10 @@ export async function buildGraphContext(input: {
   // Files patched in past matching investigations get a node-score boost so
   // previously-fixed code surfaces in NODES/EDGES automatically.
   boostFiles?: string[];
+  // Extra selection terms beyond the issue text. Used by the fixer to
+  // re-select the subgraph around reproduction evidence (touched targets,
+  // failing assertion text, console/network identifiers).
+  extraTerms?: string[];
 }): Promise<GraphContext> {
   const commitSha = await getHeadSha(input.repoPath);
 
@@ -203,9 +207,15 @@ async function selectContext(
     issueTitle: string;
     issueBody: string;
     boostFiles?: string[];
+    extraTerms?: string[];
   },
 ): Promise<Omit<GraphContext, "commitSha">> {
-  const terms = tokenize(`${input.issueTitle} ${input.issueBody}`);
+  const terms = [
+    ...new Set([
+      ...tokenize(`${input.issueTitle} ${input.issueBody}`),
+      ...tokenize((input.extraTerms ?? []).join(" ")),
+    ]),
+  ];
   const scores = scoreNodes(graph.nodes, terms, input.boostFiles ?? []);
 
   let seedIds = [...scores.entries()]
@@ -214,12 +224,17 @@ async function selectContext(
     .slice(0, MAX_SEED_NODES)
     .map(([id]) => id);
 
-  let notes = `Selected ${seedIds.length} seed nodes from issue terms.`;
+  let seedNote = `Seeds: ${seedIds.length} (from ${terms.length} terms`;
+
+  if (input.extraTerms?.length) {
+    seedNote += `, incl. ${input.extraTerms.length} refine inputs`;
+  }
+  seedNote += ")";
 
   if (seedIds.length === 0) {
     seedIds = topDegreeNodeIds(graph, MAX_SEED_NODES);
-    notes =
-      "No graph nodes matched the issue terms; falling back to the most-connected nodes.";
+    seedNote =
+      "Seeds: 0 term matches; fell back to the most-connected nodes";
   }
 
   const selectedIds = expandNeighbors(graph, seedIds);
@@ -245,6 +260,28 @@ async function selectContext(
     input.repoPath,
     rankFiles(selectedNodes, scores),
   );
+
+  // Observability: which nodes won and why (score includes any boost).
+  const topSeeds = seedIds
+    .slice(0, 8)
+    .map((id) => `${labelById.get(id) ?? id}=${scores.get(id) ?? 0}`)
+    .join(", ");
+  const boosts = (input.boostFiles ?? []).map((file) =>
+    file.replace(/^\.\//, "").toLowerCase(),
+  );
+  const boostHits = selectedNodes.filter((node) =>
+    boosts.some((boost) =>
+      (node.source_file ?? "").replace(/^\.\//, "").toLowerCase().endsWith(boost),
+    ),
+  ).length;
+
+  const notes = [
+    `${seedNote}.`,
+    `Top seeds: ${topSeeds || "none"}.`,
+    `Boost: ${boostHits} node(s) from ${boosts.length} past-fix file(s).`,
+    `Rendered ${Math.min(selectedNodes.length, MAX_NODES)} nodes, ${selectedEdges.length} edges.`,
+    `Hydrated: ${relevantFiles.map((file) => file.path).join(", ") || "none"}.`,
+  ].join(" ");
 
   return {
     available: true,

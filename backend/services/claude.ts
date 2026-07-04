@@ -61,7 +61,19 @@ export type ReproductionStep =
       body?: Record<string, unknown>;
     };
 
+// Per-step execution record. "ambiguous" marks Playwright strict-mode
+// violations (target matched multiple elements) - a plan defect, not
+// evidence that the bug reproduced.
+export type StepResult = {
+  index: number;
+  action: string;
+  status: "passed" | "failed" | "skipped";
+  ambiguous?: boolean;
+  error?: string;
+};
+
 export type BrowserResult = {
+  stepResults?: StepResult[];
   consoleLogs: string[];
   failedNetworkResponses: {
     url: string;
@@ -241,6 +253,11 @@ ${truncate(input.sandboxResult.stderr, 2_000) || ""}
    in "unknowns".
 3. Targets are intent objects (role/name/label/placeholder/text/testId),
    never CSS selectors.
+4. Every target - especially assert targets - must resolve to exactly ONE
+   element; execution runs in strict mode and multiple matches fail the step.
+   Never assert on generic words that appear in buttons, filters, or headings
+   (e.g. "Completed", "Active", "All"). Assert on the specific content in
+   question, such as the exact task title text, or use a testId.
 
 ## Output schema
 
@@ -255,6 +272,182 @@ ${truncate(input.sandboxResult.stderr, 2_000) || ""}
   "expectedFailure": "one sentence: what currently goes wrong",
   "unknowns": ["things the evidence did not prove"]
 }`;
+}
+
+// --- Fixer (Graphify Part 2) ---
+// Runs only after reproduction. Prompt contract:
+// docs/fable/09-graphify-fixer-prompt.md
+
+export type FixPatchEdit = {
+  path: string;
+  find: string;
+  replace: string;
+};
+
+export type FixResult = {
+  status: "patch" | "blocked";
+  rootCause: {
+    file: string;
+    location: string;
+    explanation: string;
+    evidence: string[];
+  };
+  patch: FixPatchEdit[];
+  blockedReason: string;
+};
+
+export type FixInput = {
+  issueTitle: string;
+  issueBody: string;
+  graphContext: GraphContext;
+  intentPlanJson: string;
+  expectedFailure: string;
+  browserErrors: string[];
+  consoleLogs: string[];
+  failedResponses: string[];
+  relevantFiles: AnalyzeIssueInput["sourceFiles"];
+};
+
+export async function generateFix(input: FixInput): Promise<FixResult> {
+  const prompt = `You are the Fixer for an autonomous QA system. The bug below has been
+REPRODUCED in a real browser: the steps ran and the expected failure was
+observed. Produce the smallest patch that makes the same user intent pass.
+
+Return ONLY valid JSON matching the schema at the end. No markdown, no fences.
+
+## Issue
+
+Title: ${input.issueTitle}
+Body:
+${input.issueBody || "(empty)"}
+
+## GRAPH CONTEXT (refined by reproduction evidence)
+
+Selected using the browser evidence below - it traces from the elements the
+test actually touched to the handlers and routes connected to them. NODE
+lines are real code entities; EDGE relations: imports_from, contains, method,
+calls, uses, inherits. EXTRACTED = ground truth, INFERRED = trust cautiously,
+AMBIGUOUS = never rely on alone.
+
+NODES:
+${input.graphContext.graphNodes || "(none)"}
+
+EDGES:
+${input.graphContext.graphEdges || "(none)"}
+
+## Reproduction evidence
+
+Intent plan that ran:
+${input.intentPlanJson}
+
+Expected failure (observed):
+${input.expectedFailure}
+
+Step errors / failing assertion:
+${input.browserErrors.join("\n") || "(none)"}
+
+Console logs:
+${input.consoleLogs.join("\n") || "(none)"}
+
+Failed network responses:
+${input.failedResponses.join("\n") || "(none)"}
+
+## Relevant file contents
+
+${formatSourceFiles(input.relevantFiles)}
+
+## Rules
+
+1. Fix the root cause, not the symptom. Walk the graph from the touched
+   element to its handler to its route; the bug is on that path.
+2. Smallest possible change. No refactors, renames, reformatting, or fixes
+   for unrelated issues.
+3. Do not change UI text, roles, labels, or testids that the intent plan
+   targets - verification reruns the same intent after the patch, and
+   changing those strings breaks it.
+4. "find" must be copied EXACTLY from the provided file contents (byte for
+   byte, including whitespace) and must appear exactly once in that file.
+5. Only patch files whose contents are shown above. If the root cause is in
+   a file you cannot see, return "blocked" and name the file.
+6. If the evidence does not prove the root cause, return "blocked" with the
+   missing evidence named. Never guess.
+
+## Output schema
+
+{
+  "status": "patch",
+  "rootCause": {
+    "file": "path",
+    "location": "line or function",
+    "explanation": "why this exact logic causes the observed failure",
+    "evidence": ["one citation per claim, from graph/trace/files above"]
+  },
+  "patch": [
+    {
+      "path": "path/to/file",
+      "find": "exact existing code",
+      "replace": "replacement code"
+    }
+  ],
+  "blockedReason": ""
+}
+
+When blocked: status="blocked", patch=[], blockedReason names what is missing.`;
+
+  return parseFixResult(await requestJson(prompt, 2_000));
+}
+
+function parseFixResult(text: string): FixResult {
+  const parsed = JSON.parse(text) as unknown;
+
+  if (!isFixResult(parsed)) {
+    throw new Error("Claude returned an invalid fix result.");
+  }
+
+  return parsed;
+}
+
+function isFixResult(value: unknown): value is FixResult {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const result = value as FixResult;
+  const rootCauseValid =
+    !!result.rootCause &&
+    typeof result.rootCause === "object" &&
+    typeof result.rootCause.file === "string" &&
+    typeof result.rootCause.location === "string" &&
+    typeof result.rootCause.explanation === "string" &&
+    Array.isArray(result.rootCause.evidence) &&
+    result.rootCause.evidence.every((item) => typeof item === "string");
+
+  const patchValid =
+    Array.isArray(result.patch) &&
+    result.patch.every(
+      (edit) =>
+        edit &&
+        typeof edit === "object" &&
+        typeof edit.path === "string" &&
+        typeof edit.find === "string" &&
+        edit.find.length > 0 &&
+        typeof edit.replace === "string" &&
+        edit.find !== edit.replace,
+    );
+
+  if (!rootCauseValid || !patchValid || typeof result.blockedReason !== "string") {
+    return false;
+  }
+
+  if (result.status === "patch") {
+    return result.patch.length > 0;
+  }
+
+  if (result.status === "blocked") {
+    return result.blockedReason.length > 0;
+  }
+
+  return false;
 }
 
 // --- Memory reflection (Part 2) ---

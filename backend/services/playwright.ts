@@ -5,6 +5,7 @@ import type {
   IntentStep,
   ReproductionIntentPlan,
   ReproductionPlan,
+  StepResult,
 } from "./claude.js";
 
 const STEP_SETTLE_MS = 1_000;
@@ -25,6 +26,7 @@ export async function runIntentInvestigation(
   const failedNetworkResponses: BrowserResult["failedNetworkResponses"] = [];
   const screenshots: string[] = [];
   const errors: string[] = [];
+  const stepResults: StepResult[] = [];
 
   page.on("console", (message) => {
     consoleLogs.push(`[${message.type()}] ${message.text()}`);
@@ -50,14 +52,32 @@ export async function runIntentInvestigation(
         if (step.action === "click") {
           await waitForPageToSettle(page);
         }
+
+        stepResults.push({ index, action: step.action, status: "passed" });
       } catch (error) {
+        const message = formatError(error);
+
         errors.push(
-          `Step ${index + 1} (${describeIntentStep(step)}): ${formatError(error)}`,
+          `Step ${index + 1} (${describeIntentStep(step)}): ${message}`,
         );
+        stepResults.push({
+          index,
+          action: step.action,
+          status: "failed",
+          ambiguous: message.includes("strict mode violation"),
+          error: message,
+        });
 
         // Assertion failures are evidence (often the bug itself); keep going.
         // Action failures leave the page in an unknown state; stop.
         if (step.action !== "assert") {
+          for (let rest = index + 1; rest < plan.steps.length; rest += 1) {
+            stepResults.push({
+              index: rest,
+              action: plan.steps[rest].action,
+              status: "skipped",
+            });
+          }
           break;
         }
       }
@@ -79,6 +99,7 @@ export async function runIntentInvestigation(
     });
 
     return {
+      stepResults,
       consoleLogs,
       failedNetworkResponses,
       apiResponses: [],
