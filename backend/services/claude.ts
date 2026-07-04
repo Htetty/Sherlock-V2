@@ -1,5 +1,6 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
+import type { GraphContext } from "./graphContext.js";
 
 const client = new Anthropic();
 
@@ -80,6 +81,225 @@ export type BrowserResult = {
 };
 
 export type RepoEvidenceInput = Omit<AnalyzeIssueInput, "browserResult">;
+
+// --- Intent-level reproduction plan (Part 1: Graphify-grounded investigator) ---
+// Model output describes user intent, never CSS selectors.
+// Prompt contract: docs/fable/07-graphify-context-prompt.md
+
+export type DomTargetIntent = {
+  role?: string;
+  name?: string;
+  label?: string;
+  placeholder?: string;
+  text?: string;
+  testId?: string;
+};
+
+export type IntentStep =
+  | { action: "goto"; path: string }
+  | { action: "click"; target: DomTargetIntent }
+  | { action: "fill"; target: DomTargetIntent; value: string }
+  | {
+      action: "assert";
+      target: DomTargetIntent;
+      condition: "visible" | "hidden" | "text_equals";
+      value?: string;
+    };
+
+export type ReproductionIntentPlan = {
+  baseUrl: string;
+  steps: IntentStep[];
+  expectedFailure: string;
+  unknowns: string[];
+};
+
+export type IntentPlanInput = {
+  issueTitle: string;
+  issueBody: string;
+  graphContext: GraphContext;
+  fallbackSourceFiles: AnalyzeIssueInput["sourceFiles"];
+  sandboxResult: AnalyzeIssueInput["sandboxResult"];
+};
+
+export async function generateIntentPlan(
+  input: IntentPlanInput,
+): Promise<ReproductionIntentPlan> {
+  const prompt = buildInvestigatorPrompt(input);
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-4-0",
+    max_tokens: 1_500,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  return parseIntentPlan(getTextContent(message.content));
+}
+
+function buildInvestigatorPrompt(input: IntentPlanInput): string {
+  const relevantFiles = input.graphContext.available
+    ? input.graphContext.relevantFiles
+    : input.fallbackSourceFiles;
+
+  const graphSection = input.graphContext.available
+    ? `## GRAPH CONTEXT
+
+A knowledge graph built by static AST analysis of this repository. NODE lines
+are real code entities with real file paths and line numbers. EDGE relations:
+imports_from, contains, method, calls, uses, inherits. Confidence tags:
+EXTRACTED = stated in source, treat as ground truth. INFERRED = deduced,
+trust cautiously. AMBIGUOUS = never rely on alone.
+
+NODES:
+${input.graphContext.graphNodes || "(none)"}
+
+EDGES:
+${input.graphContext.graphEdges || "(none)"}`
+    : `## GRAPH CONTEXT
+
+(unavailable: ${input.graphContext.notes})
+Rely on the file contents below.`;
+
+  return `You are the Investigator for an autonomous QA system. A GitHub issue was filed
+against the repository below. Produce a reproduction plan describing USER
+INTENT - what a human tester would do in the browser - not CSS selectors.
+
+Return ONLY valid JSON matching the schema at the end. No markdown, no fences.
+
+## Issue
+
+Title: ${input.issueTitle}
+Body:
+${input.issueBody || "(empty)"}
+
+${graphSection}
+
+## Relevant file contents
+
+${formatSourceFiles(relevantFiles)}
+
+## Sandbox
+
+Base URL: ${input.sandboxResult.baseUrl}
+Startup logs (truncated):
+${truncate(input.sandboxResult.stdout, 2_000) || "(empty)"}
+${truncate(input.sandboxResult.stderr, 2_000) || ""}
+
+## Rules
+
+1. Only reference files, routes, components, and UI strings that appear in
+   the evidence above. If it is not in the evidence, it does not exist.
+2. If the evidence does not prove a route, selector, or user flow exists, do
+   not invent it. Return the closest grounded plan and name what is missing
+   in "unknowns".
+3. Targets are intent objects (role/name/label/placeholder/text/testId),
+   never CSS selectors.
+
+## Output schema
+
+{
+  "baseUrl": "${input.sandboxResult.baseUrl}",
+  "steps": [
+    { "action": "goto", "path": "/" },
+    { "action": "fill", "target": { "label": "Email" }, "value": "test@example.com" },
+    { "action": "click", "target": { "role": "button", "name": "Sign in" } },
+    { "action": "assert", "target": { "text": "Welcome" }, "condition": "visible" }
+  ],
+  "expectedFailure": "one sentence: what currently goes wrong",
+  "unknowns": ["things the evidence did not prove"]
+}`;
+}
+
+function truncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+
+  return `${text.slice(0, maxChars)}\n...(truncated)`;
+}
+
+function parseIntentPlan(text: string): ReproductionIntentPlan {
+  const parsed = JSON.parse(text) as unknown;
+
+  if (!isIntentPlan(parsed)) {
+    throw new Error("Claude returned an invalid intent plan.");
+  }
+
+  return parsed;
+}
+
+function isIntentPlan(value: unknown): value is ReproductionIntentPlan {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const plan = value as ReproductionIntentPlan;
+
+  return (
+    typeof plan.baseUrl === "string" &&
+    Array.isArray(plan.steps) &&
+    plan.steps.length > 0 &&
+    plan.steps.every(isIntentStep) &&
+    typeof plan.expectedFailure === "string" &&
+    Array.isArray(plan.unknowns) &&
+    plan.unknowns.every((item) => typeof item === "string")
+  );
+}
+
+function isIntentStep(value: unknown): value is IntentStep {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const step = value as Record<string, unknown>;
+
+  switch (step.action) {
+    case "goto":
+      return typeof step.path === "string";
+    case "click":
+      return isDomTargetIntent(step.target);
+    case "fill":
+      return isDomTargetIntent(step.target) && typeof step.value === "string";
+    case "assert":
+      return (
+        isDomTargetIntent(step.target) &&
+        (step.condition === "visible" ||
+          step.condition === "hidden" ||
+          step.condition === "text_equals") &&
+        (step.value === undefined || typeof step.value === "string")
+      );
+    default:
+      return false;
+  }
+}
+
+const TARGET_KEYS = [
+  "role",
+  "name",
+  "label",
+  "placeholder",
+  "text",
+  "testId",
+] as const;
+
+function isDomTargetIntent(value: unknown): value is DomTargetIntent {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const target = value as Record<string, unknown>;
+  const keys = Object.keys(target);
+
+  return (
+    keys.length > 0 &&
+    keys.every((key) => (TARGET_KEYS as readonly string[]).includes(key)) &&
+    keys.every((key) => typeof target[key] === "string")
+  );
+}
 
 export async function generateReproductionPlan(input: RepoEvidenceInput) {
   const prompt = `

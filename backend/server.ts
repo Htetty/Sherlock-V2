@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
-import { analyzeIssue, generateReproductionPlan } from "./services/claude.js";
+import { analyzeIssue, generateIntentPlan } from "./services/claude.js";
+import { buildGraphContext } from "./services/graphContext.js";
 import {
   cleanupRepoContext,
   cloneRepoForInvestigation,
@@ -11,7 +12,7 @@ import {
   runSandboxInvestigation,
   type SandboxSession,
 } from "./services/sandbox.js";
-import { runPlaywrightInvestigation } from "./services/playwright.js";
+import { runIntentInvestigation } from "./services/playwright.js";
 
 const app = express();
 const PORT = Number(process.env.BACKEND_PORT ?? 4000);
@@ -47,22 +48,26 @@ app.post("/investigations", async (req, res) => {
     console.log("Sandbox result:");
     console.log(sandboxSession.result);
 
-    const reproductionPlan = await generateReproductionPlan({
+    const graphContext = await buildGraphContext({
+      repoPath: repoContext.repoPath,
       issueTitle: payload.issueTitle,
       issueBody: payload.issueBody ?? "",
-      repoUrl: payload.repoUrl,
-      defaultBranch: payload.defaultBranch,
-      fileTree: repoContext.fileTree,
-      packageJson: repoContext.packageJson,
-      readme: repoContext.readme,
-      sourceFiles: repoContext.sourceFiles,
+    });
+
+    console.log(`Graph context: ${graphContext.notes}`);
+
+    const intentPlan = await generateIntentPlan({
+      issueTitle: payload.issueTitle,
+      issueBody: payload.issueBody ?? "",
+      graphContext,
+      fallbackSourceFiles: repoContext.sourceFiles,
       sandboxResult: sandboxSession.result,
     });
 
-    console.log("Reproduction plan:");
-    console.log(reproductionPlan);
+    console.log("Intent plan:");
+    console.log(intentPlan);
 
-    const browserResult = await runPlaywrightInvestigation(reproductionPlan);
+    const browserResult = await runIntentInvestigation(intentPlan);
 
     console.log("Browser result:");
     console.log(browserResult);
@@ -86,7 +91,8 @@ app.post("/investigations", async (req, res) => {
     res.json({
       investigationId: `inv_${Date.now()}`,
       status: "analysis_complete",
-      reproductionPlan,
+      graphContextNotes: graphContext.notes,
+      intentPlan,
       browserResult,
       sandboxResult: sandboxSession.result,
       claudeResult,
