@@ -1,7 +1,18 @@
 import express from "express";
 import cors from "cors";
-import { analyzeIssue, generateIntentPlan } from "./services/claude.js";
-import { buildGraphContext } from "./services/graphContext.js";
+import {
+  analyzeIssue,
+  generateIntentPlan,
+  generateMemoryReflection,
+} from "./services/claude.js";
+import { buildGraphContext, tokenize } from "./services/graphContext.js";
+import {
+  appendMemory,
+  loadMemory,
+  matchMemory,
+  renderPastInvestigations,
+  type MemoryOutcome,
+} from "./services/memory.js";
 import {
   cleanupRepoContext,
   cloneRepoForInvestigation,
@@ -48,10 +59,23 @@ app.post("/investigations", async (req, res) => {
     console.log("Sandbox result:");
     console.log(sandboxSession.result);
 
+    const issueTerms = tokenize(
+      `${payload.issueTitle} ${payload.issueBody ?? ""}`,
+    );
+    const pastEntries = matchMemory(await loadMemory(payload.repoUrl), issueTerms);
+    const pastInvestigations = await renderPastInvestigations(
+      pastEntries,
+      repoContext.repoPath,
+    );
+
+    console.log(`Memory: ${pastEntries.length} matching past investigation(s).`);
+
     const graphContext = await buildGraphContext({
       repoPath: repoContext.repoPath,
+      repoUrl: payload.repoUrl,
       issueTitle: payload.issueTitle,
       issueBody: payload.issueBody ?? "",
+      boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
     });
 
     console.log(`Graph context: ${graphContext.notes}`);
@@ -62,6 +86,7 @@ app.post("/investigations", async (req, res) => {
       graphContext,
       fallbackSourceFiles: repoContext.sourceFiles,
       sandboxResult: sandboxSession.result,
+      pastInvestigations,
     });
 
     console.log("Intent plan:");
@@ -87,6 +112,43 @@ app.post("/investigations", async (req, res) => {
 
     console.log("Claude result:");
     console.log(claudeResult);
+
+    // Record memory. No fixer yet, so outcome is analysis_complete unless an
+    // action step (not an assert) failed, which means reproduction was blocked.
+    const actionFailed = browserResult.errors.some((error) =>
+      /^Step \d+ \((?:goto|click|fill)/.test(error),
+    );
+    const outcome: MemoryOutcome = actionFailed ? "blocked" : "analysis_complete";
+
+    try {
+      const reflection = await generateMemoryReflection({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        outcome,
+        intentPlanJson: JSON.stringify(intentPlan),
+        browserErrors: browserResult.errors,
+        analysisText:
+          claudeResult && claudeResult.type === "text" ? claudeResult.text : "",
+        patchedFiles: [],
+      });
+
+      await appendMemory(payload.repoUrl, {
+        issueTitle: payload.issueTitle,
+        issueTerms: reflection.issueTerms,
+        commitSha: graphContext.commitSha,
+        outcome,
+        rootCause: reflection.rootCause,
+        patchedFiles: [],
+        fileHashes: {},
+        whatWorked: reflection.whatWorked,
+        whatFailed: reflection.whatFailed,
+        createdAt: new Date().toISOString(),
+      });
+
+      console.log("Memory entry recorded.");
+    } catch (error) {
+      console.warn("Could not record memory entry:", error);
+    }
 
     res.json({
       investigationId: `inv_${Date.now()}`,

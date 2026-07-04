@@ -4,9 +4,10 @@
 // renders it as NODE/EDGE lines per docs/fable/07-graphify-context-prompt.md.
 
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { dataDir, repoKey } from "./memory.js";
 import type { SourceFile } from "./repo.js";
 
 const execFileAsync = promisify(execFile);
@@ -27,11 +28,14 @@ const STOPWORDS = new Set([
   "bug", "error", "problem", "expected", "actual", "steps", "reproduce",
 ]);
 
+const BOOST_SCORE = 4;
+
 export type GraphContext = {
   available: boolean;
   graphNodes: string;
   graphEdges: string;
   relevantFiles: SourceFile[];
+  commitSha: string;
   notes: string;
 };
 
@@ -58,22 +62,116 @@ type Graph = {
 
 export async function buildGraphContext(input: {
   repoPath: string;
+  repoUrl?: string;
   issueTitle: string;
   issueBody: string;
+  // Files patched in past matching investigations get a node-score boost so
+  // previously-fixed code surfaces in NODES/EDGES automatically.
+  boostFiles?: string[];
 }): Promise<GraphContext> {
-  try {
-    await runGraphifyExtract(input.repoPath);
-    const graph = await readGraph(input.repoPath);
+  const commitSha = await getHeadSha(input.repoPath);
 
-    return await selectContext(graph, input);
+  try {
+    const cacheNote = await ensureGraph(input.repoPath, input.repoUrl, commitSha);
+    const graph = await readGraph(input.repoPath);
+    const context = await selectContext(graph, input);
+
+    return {
+      ...context,
+      commitSha,
+      notes: `${cacheNote} ${context.notes}`.trim(),
+    };
   } catch (error) {
     return {
       available: false,
       graphNodes: "",
       graphEdges: "",
       relevantFiles: [],
+      commitSha,
       notes: `Graphify context unavailable: ${formatError(error)}`,
     };
+  }
+}
+
+async function getHeadSha(repoPath: string): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: repoPath,
+      timeout: 10_000,
+    });
+
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+
+// Graph cache: ~/.sherlock/graphs/<repoKey>/<sha>/. Exact-SHA hit skips
+// extraction entirely. On miss, the most recent cached graphify-out is copied
+// in first so graphify's own SHA256 file cache makes the re-extract
+// incremental (only changed files are re-parsed).
+function graphCacheDir(repoUrl: string): string {
+  return path.join(dataDir(), "graphs", repoKey(repoUrl));
+}
+
+async function ensureGraph(
+  repoPath: string,
+  repoUrl: string | undefined,
+  commitSha: string,
+): Promise<string> {
+  const outDir = path.join(repoPath, "graphify-out");
+
+  if (repoUrl && commitSha) {
+    const cachedDir = path.join(graphCacheDir(repoUrl), commitSha);
+
+    if (await exists(path.join(cachedDir, "graph.json"))) {
+      await cp(cachedDir, outDir, { recursive: true });
+      return "Graph cache hit (no extraction needed).";
+    }
+
+    const latest = await readLatestSha(repoUrl);
+
+    if (latest) {
+      const latestDir = path.join(graphCacheDir(repoUrl), latest);
+      await cp(latestDir, outDir, { recursive: true }).catch(() => {});
+    }
+  }
+
+  await runGraphifyExtract(repoPath);
+
+  if (repoUrl && commitSha) {
+    const cachedDir = path.join(graphCacheDir(repoUrl), commitSha);
+    await mkdir(cachedDir, { recursive: true });
+    await cp(outDir, cachedDir, { recursive: true }).catch(() => {});
+    await writeFile(path.join(graphCacheDir(repoUrl), "latest"), commitSha).catch(
+      () => {},
+    );
+
+    return "Graph extracted and cached.";
+  }
+
+  return "Graph extracted (no cache key).";
+}
+
+async function readLatestSha(repoUrl: string): Promise<string | null> {
+  try {
+    const sha = await readFile(
+      path.join(graphCacheDir(repoUrl), "latest"),
+      "utf8",
+    );
+
+    return sha.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function exists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -100,10 +198,15 @@ async function readGraph(repoPath: string): Promise<Graph> {
 
 async function selectContext(
   graph: Graph,
-  input: { repoPath: string; issueTitle: string; issueBody: string },
-): Promise<GraphContext> {
+  input: {
+    repoPath: string;
+    issueTitle: string;
+    issueBody: string;
+    boostFiles?: string[];
+  },
+): Promise<Omit<GraphContext, "commitSha">> {
   const terms = tokenize(`${input.issueTitle} ${input.issueBody}`);
-  const scores = scoreNodes(graph.nodes, terms);
+  const scores = scoreNodes(graph.nodes, terms, input.boostFiles ?? []);
 
   let seedIds = [...scores.entries()]
     .filter(([, score]) => score > 0)
@@ -152,7 +255,7 @@ async function selectContext(
   };
 }
 
-function tokenize(text: string): string[] {
+export function tokenize(text: string): string[] {
   const tokens = text
     .toLowerCase()
     .split(/[^a-z0-9_]+/)
@@ -161,19 +264,33 @@ function tokenize(text: string): string[] {
   return [...new Set(tokens)];
 }
 
-function scoreNodes(nodes: GraphNode[], terms: string[]): Map<string, number> {
+function scoreNodes(
+  nodes: GraphNode[],
+  terms: string[],
+  boostFiles: string[],
+): Map<string, number> {
   const scores = new Map<string, number>();
+  const boosts = boostFiles.map((file) =>
+    file.replace(/^\.\//, "").toLowerCase(),
+  );
 
   for (const node of nodes) {
     const label = (node.label ?? "").toLowerCase();
     const id = node.id.toLowerCase();
-    const sourceFile = (node.source_file ?? "").toLowerCase();
+    const sourceFile = (node.source_file ?? "")
+      .replace(/^\.\//, "")
+      .toLowerCase();
     let score = 0;
 
     for (const term of terms) {
       if (label.includes(term)) score += 3;
       if (id.includes(term)) score += 2;
       if (sourceFile.includes(term)) score += 1;
+    }
+
+    // Previously-patched files from matching past investigations.
+    if (boosts.some((boost) => sourceFile.endsWith(boost))) {
+      score += BOOST_SCORE;
     }
 
     scores.set(node.id, score);

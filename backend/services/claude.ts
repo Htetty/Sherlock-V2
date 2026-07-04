@@ -119,6 +119,8 @@ export type IntentPlanInput = {
   graphContext: GraphContext;
   fallbackSourceFiles: AnalyzeIssueInput["sourceFiles"];
   sandboxResult: AnalyzeIssueInput["sandboxResult"];
+  // Rendered PAST lines from memory.json; empty string = section omitted.
+  pastInvestigations?: string;
 };
 
 export async function generateIntentPlan(
@@ -127,7 +129,7 @@ export async function generateIntentPlan(
   const prompt = buildInvestigatorPrompt(input);
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 1_500,
     messages: [
       {
@@ -164,6 +166,26 @@ ${input.graphContext.graphEdges || "(none)"}`
 (unavailable: ${input.graphContext.notes})
 Rely on the file contents below.`;
 
+  const pastSection = input.pastInvestigations
+    ? `
+
+## PAST INVESTIGATIONS (this repo)
+
+Previous issues Sherlock investigated here, with outcomes:
+
+${input.pastInvestigations}
+
+How to use these:
+- Treat "verified" entries as strong hints about where similar bugs live and
+  what reproduction steps work in this app.
+- Treat "blocked"/"failed" entries as warnings: the listed approach did not
+  work - do not repeat it unchanged.
+- An entry marked STALE means the code changed since that fix. Use it as a
+  starting point only; re-verify against the GRAPH CONTEXT and file contents.
+- Past investigations are hints, not evidence. The grounding rules still
+  apply: never reference code that is not in the current evidence.`
+    : "";
+
   return `You are the Investigator for an autonomous QA system. A GitHub issue was filed
 against the repository below. Produce a reproduction plan describing USER
 INTENT - what a human tester would do in the browser - not CSS selectors.
@@ -176,7 +198,7 @@ Title: ${input.issueTitle}
 Body:
 ${input.issueBody || "(empty)"}
 
-${graphSection}
+${graphSection}${pastSection}
 
 ## Relevant file contents
 
@@ -212,6 +234,103 @@ ${truncate(input.sandboxResult.stderr, 2_000) || ""}
   "expectedFailure": "one sentence: what currently goes wrong",
   "unknowns": ["things the evidence did not prove"]
 }`;
+}
+
+// --- Memory reflection (Part 2) ---
+// Distills an investigation into actionable lessons for future runs.
+// Prompt contract: docs/fable/08-memory-prompt.md
+
+export type MemoryReflection = {
+  issueTerms: string[];
+  rootCause: string;
+  whatWorked: string;
+  whatFailed: string;
+};
+
+export async function generateMemoryReflection(input: {
+  issueTitle: string;
+  issueBody: string;
+  outcome: string;
+  intentPlanJson: string;
+  browserErrors: string[];
+  analysisText: string;
+  patchedFiles: string[];
+}): Promise<MemoryReflection> {
+  const prompt = `You are recording the outcome of an automated bug investigation so future
+investigations of this repository start smarter.
+
+Return ONLY valid JSON matching the schema at the end.
+
+## What happened
+
+Issue title: ${input.issueTitle}
+Issue body: ${input.issueBody || "(empty)"}
+Outcome: ${input.outcome}
+Intent plan executed: ${input.intentPlanJson}
+Browser errors/evidence:
+${input.browserErrors.join("\n") || "(none)"}
+Root cause analysis:
+${input.analysisText || "(none)"}
+Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
+
+## Rules
+
+1. "whatWorked" and "whatFailed" must be lessons a future investigator can
+   act on (reproduction ordering, which functions mattered, misleading
+   evidence) - not a summary of the bug.
+2. Keep every field under 40 words. issueTerms: 3-8 lowercase keywords a
+   future similar issue would likely contain.
+3. If outcome was blocked/failed, "whatFailed" is required and must name the
+   step that failed and why.
+4. Record only what the evidence shows. No speculation.
+
+## Output schema
+
+{
+  "issueTerms": ["..."],
+  "rootCause": "one sentence, cite file and function",
+  "whatWorked": "actionable lesson, or empty string",
+  "whatFailed": "actionable lesson, or empty string"
+}`;
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-4-0",
+    max_tokens: 400,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  return parseMemoryReflection(getTextContent(message.content));
+}
+
+function parseMemoryReflection(text: string): MemoryReflection {
+  const parsed = JSON.parse(text) as unknown;
+
+  if (!isMemoryReflection(parsed)) {
+    throw new Error("Claude returned an invalid memory reflection.");
+  }
+
+  return parsed;
+}
+
+function isMemoryReflection(value: unknown): value is MemoryReflection {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const reflection = value as MemoryReflection;
+
+  return (
+    Array.isArray(reflection.issueTerms) &&
+    reflection.issueTerms.every((term) => typeof term === "string") &&
+    typeof reflection.rootCause === "string" &&
+    typeof reflection.whatWorked === "string" &&
+    typeof reflection.whatFailed === "string"
+  );
 }
 
 function truncate(text: string, maxChars: number): string {
@@ -330,7 +449,7 @@ ${formatRepoEvidence(input)}
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 700,
     messages: [
       {
@@ -382,7 +501,7 @@ Provide:
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 500,
     messages: [
       {
