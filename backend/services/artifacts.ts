@@ -7,8 +7,9 @@ import type { ReproductionResult } from "./playwright.js";
 
 const ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const ID_PATTERN = /^inv_[0-9A-Z]{10,}$/;
+const FIX_ATTEMPT_ID_PATTERN = /^fix_[0-9A-Z]{10,}$/;
 
-export function createInvestigationId() {
+function createId(prefix: string) {
   const time = Date.now().toString(32).toUpperCase().padStart(9, "0");
   let random = "";
 
@@ -16,7 +17,19 @@ export function createInvestigationId() {
     random += ID_ALPHABET[byte % ID_ALPHABET.length];
   }
 
-  return `inv_${time}${random}`;
+  return `${prefix}_${time}${random}`;
+}
+
+export function createInvestigationId() {
+  return createId("inv");
+}
+
+export function createFixAttemptId() {
+  return createId("fix");
+}
+
+export function isFixAttemptId(value: unknown): value is string {
+  return typeof value === "string" && FIX_ATTEMPT_ID_PATTERN.test(value);
 }
 
 export function isInvestigationId(value: unknown): value is string {

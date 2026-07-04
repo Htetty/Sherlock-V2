@@ -1,6 +1,11 @@
 import express from "express";
 import cors from "cors";
-import { analyzeIssue, generateReproductionPlan } from "./services/claude.js";
+import {
+  analyzeIssue,
+  generateFixProposal,
+  generateReproductionPlan,
+} from "./services/claude.js";
+import { runFixAttempt, type FixAttemptResult } from "./services/fix.js";
 import {
   cleanupRepoContext,
   cloneRepoForInvestigation,
@@ -23,6 +28,7 @@ import {
   type ArtifactStore,
 } from "./services/artifacts.js";
 import {
+  formatFixComment,
   formatResultComment,
   type InvestigationSummary,
 } from "./services/report.js";
@@ -81,7 +87,8 @@ app.post("/investigations", async (req, res) => {
       });
     }
 
-    log(`Repository cloned to ${repoContext.repoPath}`);
+    log(`Repository cloned to ${repoContext.repoPath} at ${repoContext.commit}`);
+    investigationRecord.commit = repoContext.commit;
 
     sandboxSession = await runSandboxInvestigation({
       repoPath: repoContext.repoPath,
@@ -156,12 +163,88 @@ app.post("/investigations", async (req, res) => {
       await store.writeJson("claude-analysis.json", claudeAnalysis);
     }
 
+    // Verified fix loop: only for a confirmed reproduction, one attempt.
+    let fixAttempt: FixAttemptResult | null = null;
+
+    if (result.outcome === "reproduced") {
+      try {
+        const generatedFix = await generateFixProposal({
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext.fileTree,
+          packageJson: repoContext.packageJson,
+          readme: repoContext.readme,
+          sourceFiles: repoContext.sourceFiles,
+          sandboxResult: sandboxSession.result,
+          commit: repoContext.commit,
+          plan,
+          reproductionResult: result,
+        });
+
+        await store.writeJson("fix-proposal-raw.json", {
+          rawText: generatedFix.rawText,
+          parseError: generatedFix.parseError,
+        });
+
+        const repoPath = repoContext.repoPath;
+        const restart = async () => {
+          if (sandboxSession) {
+            await sandboxSession.stop();
+          }
+
+          sandboxSession = await runSandboxInvestigation({ repoPath });
+          const baseUrl = sandboxSession.result.baseUrl;
+          const ok = await waitForUrl(baseUrl, 30_000);
+
+          return {
+            ok,
+            baseUrl,
+            log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
+              .filter(Boolean)
+              .join("\n"),
+          };
+        };
+
+        fixAttempt = await runFixAttempt({
+          investigationId,
+          investigationDir: store.dir,
+          repoPath,
+          sourceCommit: repoContext.commit,
+          plan,
+          originalOutcome: result.outcome,
+          proposal: generatedFix.parsed,
+          restart,
+        });
+
+        log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+      } catch (error) {
+        log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
+      }
+    }
+
+    const fixComment = fixAttempt
+      ? formatFixComment({
+          investigationId,
+          fixAttemptId: fixAttempt.fixAttemptId,
+          outcome: fixAttempt.outcome,
+          rootCause: fixAttempt.rootCause,
+          changedFiles: fixAttempt.changedFiles,
+          reason: fixAttempt.outcome === "verified" ? null : fixAttempt.reason,
+          verification: fixAttempt.checks
+            .filter((item) => item.passed)
+            .map((item) => item.detail),
+        })
+      : null;
+
     return await finishInvestigation(
       res,
       store,
       investigationRecord,
       buildExecutionSummary(investigationId, plan.expectedBehavior, result),
-      { result, claudeAnalysis },
+      { result, claudeAnalysis, fixAttempt },
+      fixComment,
     );
   } catch (error) {
     console.error(`[${investigationId}] Investigation failed:`, error);
@@ -237,8 +320,11 @@ async function finishInvestigation(
   record: Record<string, unknown>,
   summary: InvestigationSummary,
   extra: Record<string, unknown> = {},
+  extraComment: string | null = null,
 ) {
-  const githubComment = formatResultComment(summary);
+  const githubComment = extraComment
+    ? `${formatResultComment(summary)}\n\n---\n\n${extraComment}`
+    : formatResultComment(summary);
 
   await store.writeJson("investigation.json", {
     ...record,
@@ -258,6 +344,21 @@ async function finishInvestigation(
     artifactsDir: store.dir,
     ...extra,
   });
+}
+
+async function waitForUrl(baseUrl: string, timeoutMs: number) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await fetch(baseUrl, { signal: AbortSignal.timeout(2_000) });
+      return true;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
+  return false;
 }
 
 function formatError(error: unknown) {

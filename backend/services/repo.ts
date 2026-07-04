@@ -57,6 +57,7 @@ const IGNORED_DIRS = new Set([
 export type RepoContext = {
   workspacePath: string;
   repoPath: string;
+  commit: string;
   fileTree: string[];
   packageJson: string | null;
   readme: string | null;
@@ -83,6 +84,7 @@ export async function cloneRepoForInvestigation(input: {
     return {
       workspacePath,
       repoPath,
+      commit: await getHeadCommit(repoPath),
       fileTree: await collectFileTree(repoPath),
       packageJson: await safeRead(path.join(repoPath, "package.json")),
       readme: await readFirstExisting(repoPath, [
@@ -185,6 +187,15 @@ async function cloneRepo(
   }
 
   await runGitClone(["clone", "--depth", "1", repoUrl, repoPath]);
+}
+
+async function getHeadCommit(repoPath: string) {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: repoPath,
+    timeout: 10_000,
+  });
+
+  return stdout.trim();
 }
 
 async function runGitClone(args: string[]) {

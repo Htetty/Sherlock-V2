@@ -1,6 +1,7 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
-import { REPRODUCTION_PLAN_VERSION } from "./plan.js";
+import { REPRODUCTION_PLAN_VERSION, type ReproductionPlan } from "./plan.js";
+import { FIX_PROPOSAL_VERSION, PATCH_LIMITS } from "./fix-proposal.js";
 import type { ReproductionResult } from "./playwright.js";
 
 const client = new Anthropic();
@@ -77,6 +78,90 @@ ${formatRepoEvidence(input)}
   const message = await client.messages.create({
     model: "claude-sonnet-4-0",
     max_tokens: 1_000,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  const rawText = getTextContent(message.content);
+
+  try {
+    return { rawText, parsed: JSON.parse(rawText) as unknown, parseError: null };
+  } catch (error) {
+    return {
+      rawText,
+      parsed: null,
+      parseError: `Claude did not return valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+export type FixProposalInput = RepoEvidenceInput & {
+  commit: string;
+  plan: ReproductionPlan;
+  reproductionResult: ReproductionResult;
+};
+
+export async function generateFixProposal(
+  input: FixProposalInput,
+): Promise<GeneratedPlan> {
+  const prompt = `
+You are proposing a minimal code fix for a bug that Sherlock has deterministically reproduced.
+
+Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
+
+The JSON must match this exact shape:
+{
+  "version": ${FIX_PROPOSAL_VERSION},
+  "summary": "one sentence describing the fix",
+  "rootCause": "one sentence describing the exact root cause",
+  "confidence": 0.0,
+  "files": [
+    {
+      "path": "relative/path/from/repo/root.ts",
+      "edits": [
+        { "oldText": "exact text currently in the file", "newText": "replacement text" }
+      ]
+    }
+  ],
+  "relevantTests": ["npm test"],
+  "risk": "low",
+  "assumptions": []
+}
+
+Rules:
+- Each oldText must appear EXACTLY ONCE in the target file, copied verbatim including whitespace.
+- Make the smallest change that fixes the root cause. Do not refactor.
+- Change at most ${PATCH_LIMITS.maxChangedFiles} files and ${PATCH_LIMITS.maxChangedLines} lines.
+- Never touch .env files, keys, lockfiles, GitHub workflows, or deployment configuration.
+- relevantTests must be plain npm/npx/node commands (no shell operators). Use the smallest relevant project test command; use an empty array if the repository has no runnable tests.
+- Do not create new files.
+
+Repository commit: ${input.commit}
+
+Saved reproduction plan (already verified to reproduce the bug):
+${JSON.stringify(input.plan, null, 2)}
+
+Reproduction outcome: ${input.reproductionResult.outcome} — ${input.reproductionResult.outcomeReason}
+Failed assertion: ${JSON.stringify(input.reproductionResult.assertion)}
+Console errors:
+${input.reproductionResult.consoleErrors.join("\n") || "(none)"}
+Page errors:
+${input.reproductionResult.pageErrors.join("\n") || "(none)"}
+Failed network requests:
+${input.reproductionResult.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join("\n") || "(none)"}
+API responses:
+${input.reproductionResult.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}\n${response.body}`).join("\n\n") || "(none)"}
+
+${formatRepoEvidence(input)}
+`;
+
+  const message = await client.messages.create({
+    model: "claude-sonnet-4-0",
+    max_tokens: 2_000,
     messages: [
       {
         role: "user",

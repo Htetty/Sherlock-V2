@@ -103,6 +103,68 @@ export function redactSecrets(text: string): string {
   );
 }
 
+export type FixCommentSummary = {
+  investigationId: string;
+  fixAttemptId: string;
+  outcome: string;
+  rootCause?: string | null;
+  changedFiles?: string[];
+  reason?: string | null;
+  verification?: string[];
+};
+
+const FIX_OUTCOME_HEADLINES: Record<string, string> = {
+  verified: "Sherlock verified a local fix.",
+  rejected_reproduction_still_fails:
+    "Sherlock generated a fix, but the original failure still occurs.",
+  rejected_build_failed:
+    "Sherlock generated a fix, but the application failed to rebuild or restart with it.",
+  rejected_tests_failed: "Sherlock generated a fix, but verification failed.",
+  rejected_patch_invalid:
+    "Sherlock generated a fix, but it was rejected before being applied.",
+  rejected_environment_failed:
+    "Sherlock generated a fix, but the application environment failed during verification.",
+  rejected_verification_inconclusive:
+    "Sherlock generated a fix, but could not conclusively verify it.",
+};
+
+export function formatFixComment(summary: FixCommentSummary): string {
+  const lines = [
+    FIX_OUTCOME_HEADLINES[summary.outcome] ??
+      "Sherlock completed a fix attempt.",
+    "",
+    `Investigation: ${summary.investigationId}`,
+    `Fix attempt: ${summary.fixAttemptId}`,
+    `Outcome: ${summary.outcome}`,
+  ];
+
+  if (summary.rootCause) {
+    lines.push(`Root cause: ${truncate(summary.rootCause, MAX_ERROR_CHARS)}`);
+  }
+
+  if (summary.changedFiles && summary.changedFiles.length > 0) {
+    lines.push(`Changed: ${summary.changedFiles.join(", ")}`);
+  }
+
+  if (summary.reason) {
+    lines.push(`Reason: ${truncate(summary.reason, MAX_ERROR_CHARS)}`);
+  }
+
+  if (summary.verification && summary.verification.length > 0) {
+    lines.push("Verification:");
+
+    for (const item of summary.verification) {
+      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
+    }
+  }
+
+  if (summary.outcome !== "verified") {
+    lines.push("No pull request was opened.");
+  }
+
+  return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
+}
+
 function truncate(text: string, maxChars: number) {
   if (text.length <= maxChars) {
     return text;
