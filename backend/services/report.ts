@@ -165,6 +165,51 @@ export function formatFixComment(summary: FixCommentSummary): string {
   return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
 }
 
+export type PullRequestCommentSummary = {
+  investigationId: string;
+  fixAttemptId: string;
+  status: string;
+  pullRequestNumber?: number | null;
+  pullRequestUrl?: string | null;
+  branch?: string | null;
+  reason?: string | null;
+};
+
+export function formatPullRequestComment(summary: PullRequestCommentSummary): string {
+  const lines: string[] = [];
+
+  if (summary.status === "created" || summary.status === "already_exists") {
+    lines.push(
+      "Sherlock reproduced the issue, verified a local fix, and opened a pull request.",
+      "",
+      `Investigation: ${summary.investigationId}`,
+      `Fix attempt: ${summary.fixAttemptId}`,
+      `Pull request: ${summary.pullRequestUrl ?? `#${summary.pullRequestNumber}`}`,
+      "Outcome: verified",
+    );
+  } else if (summary.status === "pull_request_failed" && summary.branch) {
+    lines.push(
+      "Sherlock verified a local fix and pushed a branch, but pull request creation failed.",
+      "",
+      `Investigation: ${summary.investigationId}`,
+      `Fix attempt: ${summary.fixAttemptId}`,
+      `Branch: ${summary.branch}`,
+      `Reason: ${truncate(summary.reason ?? "unknown", MAX_ERROR_CHARS)}`,
+    );
+  } else {
+    lines.push(
+      "Sherlock verified a local fix but did not open a pull request.",
+      "",
+      `Investigation: ${summary.investigationId}`,
+      `Fix attempt: ${summary.fixAttemptId}`,
+      `Status: ${summary.status}`,
+      `Reason: ${truncate(summary.reason ?? "unknown", MAX_ERROR_CHARS)}`,
+    );
+  }
+
+  return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
+}
+
 function truncate(text: string, maxChars: number) {
   if (text.length <= maxChars) {
     return text;

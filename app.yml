@@ -61,8 +61,9 @@ default_permissions:
   # checks: read
 
   # Repository contents, commits, branches, downloads, releases, and merges.
+  # Write access is required so Sherlock can push its fix branches.
   # https://developer.github.com/v3/apps/permissions/#permission-on-contents
-  # contents: read
+  contents: write
 
   # Deployments and deployment statuses.
   # https://developer.github.com/v3/apps/permissions/#permission-on-deployments
@@ -81,8 +82,9 @@ default_permissions:
   # pages: read
 
   # Pull requests and related comments, assignees, labels, milestones, and merges.
+  # Write access is required so Sherlock can open pull requests for verified fixes.
   # https://developer.github.com/v3/apps/permissions/#permission-on-pull-requests
-  # pull_requests: read
+  pull_requests: write
 
   # Manage the post-receive hooks for a repository.
   # https://developer.github.com/v3/apps/permissions/#permission-on-repository-hooks

@@ -7,6 +7,11 @@ import {
 } from "./services/claude.js";
 import { runFixAttempt, type FixAttemptResult } from "./services/fix.js";
 import {
+  createFixPullRequest,
+  createGitHubRestClient,
+  type PullRequestResult,
+} from "./services/pull-request.js";
+import {
   cleanupRepoContext,
   cloneRepoForInvestigation,
   type RepoContext,
@@ -29,6 +34,7 @@ import {
 } from "./services/artifacts.js";
 import {
   formatFixComment,
+  formatPullRequestComment,
   formatResultComment,
   type InvestigationSummary,
 } from "./services/report.js";
@@ -224,6 +230,51 @@ app.post("/investigations", async (req, res) => {
       }
     }
 
+    // Verified fix -> GitHub pull request. Only verified fixes may push.
+    let pullRequest: PullRequestResult | null = null;
+
+    if (fixAttempt?.outcome === "verified") {
+      try {
+        const token =
+          typeof payload.installationToken === "string" && payload.installationToken
+            ? payload.installationToken
+            : null;
+        const attemptStore = await createArtifactStore(
+          investigationId,
+          fixAttempt.attemptDir,
+        );
+
+        pullRequest = await createFixPullRequest({
+          investigationId,
+          fixAttempt,
+          store: attemptStore,
+          repoPath: repoContext.repoPath,
+          owner: payload.repoOwner,
+          repo: payload.repoName,
+          baseBranch: payload.defaultBranch,
+          issueNumber: payload.issueNumber,
+          issueTitle: payload.issueTitle,
+          plan,
+          github: token
+            ? createGitHubRestClient({
+                token,
+                owner: payload.repoOwner,
+                repo: payload.repoName,
+              })
+            : null,
+          pushUrl: token
+            ? `https://x-access-token:${token}@github.com/${payload.repoOwner}/${payload.repoName}.git`
+            : null,
+        });
+
+        log(
+          `Pull request flow finished: ${pullRequest.status}${pullRequest.pullRequestUrl ? ` (${pullRequest.pullRequestUrl})` : ""}`,
+        );
+      } catch (error) {
+        log(`Pull request flow failed unexpectedly: ${formatError(error)}`);
+      }
+    }
+
     const fixComment = fixAttempt
       ? formatFixComment({
           investigationId,
@@ -238,13 +289,29 @@ app.post("/investigations", async (req, res) => {
         })
       : null;
 
+    const pullRequestComment =
+      pullRequest && fixAttempt
+        ? formatPullRequestComment({
+            investigationId,
+            fixAttemptId: fixAttempt.fixAttemptId,
+            status: pullRequest.status,
+            pullRequestNumber: pullRequest.pullRequestNumber,
+            pullRequestUrl: pullRequest.pullRequestUrl,
+            branch: pullRequest.branch,
+            reason: pullRequest.reason,
+          })
+        : null;
+
+    const extraComment =
+      [fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
+
     return await finishInvestigation(
       res,
       store,
       investigationRecord,
       buildExecutionSummary(investigationId, plan.expectedBehavior, result),
-      { result, claudeAnalysis, fixAttempt },
-      fixComment,
+      { result, claudeAnalysis, fixAttempt, pullRequest },
+      extraComment,
     );
   } catch (error) {
     console.error(`[${investigationId}] Investigation failed:`, error);

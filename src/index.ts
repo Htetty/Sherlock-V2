@@ -11,8 +11,25 @@ export default (app: Probot) => {
 
     const investigationId = createInvestigationId();
 
+    // Short-lived installation token so the backend can push the Sherlock
+    // branch and open a pull request for a verified fix.
+    let installationToken: string | null = null;
+
+    try {
+      const auth = (await context.octokit.auth({ type: "installation" })) as {
+        token?: string;
+      };
+      installationToken = auth.token ?? null;
+    } catch (error) {
+      console.warn(
+        `[${investigationId}] Could not obtain installation token; pull request creation will be skipped.`,
+        error,
+      );
+    }
+
     const investigationPayload = {
       investigationId,
+      installationToken,
       repoOwner: context.payload.repository.owner.login,
       repoName: context.payload.repository.name,
       repoUrl: context.payload.repository.html_url,
@@ -26,7 +43,13 @@ export default (app: Probot) => {
     };
 
     console.log(`[${investigationId}] Investigation payload:`);
-    console.log(JSON.stringify(investigationPayload, null, 2));
+    console.log(
+      JSON.stringify(
+        { ...investigationPayload, installationToken: installationToken ? "[REDACTED]" : null },
+        null,
+        2,
+      ),
+    );
 
     await context.octokit.rest.issues.createComment(
       context.issue({
