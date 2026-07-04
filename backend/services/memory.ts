@@ -63,6 +63,8 @@ export async function appendMemory(repoUrl: string, entry: MemoryEntry) {
 
 // Top matches by issue-term overlap. Zero-overlap entries are excluded -
 // an empty result means the PAST INVESTIGATIONS section is omitted entirely.
+// Stored terms and the stored issue title are re-tokenized before comparison
+// so multi-word terms (e.g. "active filter") still match single-word tokens.
 export function matchMemory(
   entries: MemoryEntry[],
   issueTerms: string[],
@@ -72,12 +74,36 @@ export function matchMemory(
   return entries
     .map((entry) => ({
       entry,
-      score: entry.issueTerms.filter((term) => terms.has(term)).length,
+      score: overlapScore(entry, terms),
     }))
     .filter(({ score }) => score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_MATCHES)
     .map(({ entry }) => entry);
+}
+
+function overlapScore(entry: MemoryEntry, terms: Set<string>): number {
+  const entryTokens = new Set([
+    ...entry.issueTerms.flatMap(splitTokens),
+    ...splitTokens(entry.issueTitle),
+  ]);
+
+  let score = 0;
+
+  for (const token of entryTokens) {
+    if (terms.has(token)) {
+      score += 1;
+    }
+  }
+
+  return score;
+}
+
+function splitTokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9_]+/)
+    .filter((token) => token.length >= 3);
 }
 
 export async function renderPastInvestigations(

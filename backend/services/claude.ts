@@ -128,9 +128,18 @@ export async function generateIntentPlan(
 ): Promise<ReproductionIntentPlan> {
   const prompt = buildInvestigatorPrompt(input);
 
+  return parseIntentPlan(await requestJson(prompt, 1_500));
+}
+
+// Deterministic JSON generation: temperature 0 for stable output, and
+// extractJsonObject to tolerate markdown fences or stray prose around the
+// object. (claude-sonnet-4-6 does not support assistant prefill, so fences
+// are handled by extraction rather than prevented.)
+async function requestJson(prompt: string, maxTokens: number): Promise<string> {
   const message = await client.messages.create({
     model: "claude-sonnet-4-6",
-    max_tokens: 1_500,
+    max_tokens: maxTokens,
+    temperature: 0,
     messages: [
       {
         role: "user",
@@ -139,7 +148,19 @@ export async function generateIntentPlan(
     ],
   });
 
-  return parseIntentPlan(getTextContent(message.content));
+  return extractJsonObject(getTextContent(message.content));
+}
+
+function extractJsonObject(text: string): string {
+  const cleaned = text.replace(/```(?:json)?/gi, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+
+  if (start === -1 || end <= start) {
+    throw new Error("Model response contained no JSON object.");
+  }
+
+  return cleaned.slice(start, end + 1);
 }
 
 function buildInvestigatorPrompt(input: IntentPlanInput): string {
@@ -293,18 +314,7 @@ Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
   "whatFailed": "actionable lesson, or empty string"
 }`;
 
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
-    max_tokens: 400,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
-
-  return parseMemoryReflection(getTextContent(message.content));
+  return parseMemoryReflection(await requestJson(prompt, 400));
 }
 
 function parseMemoryReflection(text: string): MemoryReflection {
