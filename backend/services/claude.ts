@@ -76,7 +76,7 @@ ${formatRepoEvidence(input)}
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 1_000,
     messages: [
       {
@@ -160,7 +160,7 @@ ${formatRepoEvidence(input)}
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 2_000,
     messages: [
       {
@@ -222,7 +222,7 @@ Provide:
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-0",
+    model: "claude-sonnet-4-6",
     max_tokens: 500,
     messages: [
       {
