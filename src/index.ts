@@ -35,13 +35,21 @@ export default (app: Probot) => {
     console.log("Investigation payload:");
     console.log(JSON.stringify(investigationPayload, null, 2));
 
-    await fetch("http://localhost:4000/investigations", {
+    const backendUrl =
+      process.env.INVESTIGATION_BACKEND_URL ?? "http://localhost:4000";
+    const response = await fetch(new URL("/investigations", backendUrl), {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(investigationPayload),
     });
+
+    if (!response.ok) {
+      throw new Error(
+        `Investigation backend returned ${response.status} ${response.statusText}`,
+      );
+    }
 
     const issueComment = context.issue({
       body: "Investigation started.",

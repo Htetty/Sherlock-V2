@@ -23,7 +23,7 @@ default_events:
   # - fork
   # - gollum
   # - issue_comment
-  - issues
+  - issue_comment
 # - label
 # - milestone
 # - member

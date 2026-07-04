@@ -13,19 +13,29 @@
   ],
   "scripts": {
     "build": "tsc",
-    "start": "probot run ./lib/index.js",
+    "start": "concurrently --kill-others --names backend,bot \"npm:serve:backend\" \"npm:serve:bot\"",
+    "serve:backend": "node ./lib/backend/server.js",
+    "serve:bot": "probot run ./lib/src/index.js",
     "test": "vitest"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "playwright": "^1.61.1",
     "probot": "^14.3.2"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
     "@types/node": "^24.0.0",
+    "concurrently": "^10.0.3",
     "ioredis": "^5.10.1",
     "nock": "^14.0.5",
     "smee-client": "^5.0.0",
-    "vitest": "^3.2.4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
   },
   "overrides": {
     "@types/pg": "8.15.1"

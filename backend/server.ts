@@ -14,10 +14,14 @@ import {
 import { runPlaywrightInvestigation } from "./services/playwright.js";
 
 const app = express();
-const PORT = 4000;
+const PORT = Number(process.env.BACKEND_PORT ?? 4000);
 
 app.use(cors());
 app.use(express.json());
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok" });
+});
 
 app.post("/investigations", async (req, res) => {
   let repoContext: RepoContext | null = null;

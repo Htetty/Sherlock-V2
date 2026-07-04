@@ -6,8 +6,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, beforeEach, afterEach, test, expect } from "vitest";
-// Requiring our fixtures
-import payload from "./fixtures/issues.opened.json" with { type: "json" };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,7 +14,28 @@ const privateKey = fs.readFileSync(
   "utf-8",
 );
 
-const issueCreatedBody = { body: "Thanks for opening this issue!" };
+const investigationStartedBody = { body: "Investigation started." };
+
+const payload = {
+  action: "created",
+  issue: {
+    number: 1,
+    title: "Example bug",
+    body: "Something broke",
+    html_url: "https://github.com/hiimbex/testing-things/issues/1",
+  },
+  comment: {
+    body: "Please investigate this",
+    user: { login: "hiimbex" },
+  },
+  repository: {
+    name: "testing-things",
+    html_url: "https://github.com/hiimbex/testing-things",
+    default_branch: "main",
+    owner: { login: "hiimbex" },
+  },
+  installation: { id: 2 },
+};
 
 describe("My Probot app", () => {
   let probot: any;
@@ -37,7 +56,10 @@ describe("My Probot app", () => {
     probot.load(myProbotApp);
   });
 
-  test("creates a comment when an issue is opened", async () => {
+  test("starts an investigation when requested in an issue comment", async () => {
+    const backendMock = nock("http://localhost:4000")
+      .post("/investigations")
+      .reply(202, { status: "started" });
     const mock = nock("https://api.github.com")
       // Test that we correctly return a test token
       .post("/app/installations/2/access_tokens")
@@ -50,15 +72,16 @@ describe("My Probot app", () => {
 
       // Test that a comment is posted
       .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
-        expect(body).toMatchObject(issueCreatedBody);
+        expect(body).toMatchObject(investigationStartedBody);
         return true;
       })
       .reply(200);
 
     // Receive a webhook event
-    await probot.receive({ name: "issues", payload });
+    await probot.receive({ name: "issue_comment", payload: payload as any });
 
     expect(mock.pendingMocks()).toStrictEqual([]);
+    expect(backendMock.pendingMocks()).toStrictEqual([]);
   });
 
   afterEach(() => {
