@@ -14,7 +14,15 @@ const privateKey = fs.readFileSync(
   "utf-8",
 );
 
-const investigationStartedBody = { body: "Investigation started." };
+const resultComment = [
+  "Sherlock reproduced the reported failure.",
+  "",
+  "Investigation: inv_0TEST123ABC",
+  "Outcome: reproduced",
+  "Observed: Login request returned HTTP 500",
+  "Expected: Login request should return HTTP 401",
+  "Evidence: 3 screenshots, 1 console error, 1 failed network request, 1 failed assertion",
+].join("\n");
 
 const payload = {
   action: "created",
@@ -56,10 +64,23 @@ describe("My Probot app", () => {
     probot.load(myProbotApp);
   });
 
-  test("starts an investigation when requested in an issue comment", async () => {
+  test("posts a progress comment with the investigation id and the backend result comment", async () => {
+    let progressCommentId: string | undefined;
+
     const backendMock = nock("http://localhost:4000")
-      .post("/investigations")
-      .reply(202, { status: "started" });
+      .post("/investigations", (body: any) => {
+        expect(body.investigationId).toMatch(/^inv_[0-9A-Z]{10,}$/);
+        // Same id the progress comment announced (posted before this call)
+        expect(body.investigationId).toBe(progressCommentId);
+        expect(body.repoUrl).toBe("https://github.com/hiimbex/testing-things");
+        return true;
+      })
+      .reply(200, {
+        investigationId: "inv_0TEST123ABC",
+        outcome: "reproduced",
+        githubComment: resultComment,
+      });
+
     const mock = nock("https://api.github.com")
       // Test that we correctly return a test token
       .post("/app/installations/2/access_tokens")
@@ -70,9 +91,19 @@ describe("My Probot app", () => {
         },
       })
 
-      // Test that a comment is posted
+      // Progress comment includes the investigation id
       .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
-        expect(body).toMatchObject(investigationStartedBody);
+        expect(body.body).toContain("Investigation started.");
+        const match = body.body.match(/Investigation: (inv_[0-9A-Z]{10,})/);
+        expect(match).not.toBeNull();
+        progressCommentId = match?.[1];
+        return true;
+      })
+      .reply(200)
+
+      // Result comment is exactly what the backend produced
+      .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
+        expect(body.body).toBe(resultComment);
         return true;
       })
       .reply(200);
@@ -89,12 +120,3 @@ describe("My Probot app", () => {
     nock.enableNetConnect();
   });
 });
-
-// For more information about testing with Jest see:
-// https://facebook.github.io/jest/
-
-// For more information about using TypeScript in your tests, Jest recommends:
-// https://github.com/kulshekhar/ts-jest
-
-// For more information about testing with Nock see:
-// https://github.com/nock/nock

@@ -1,5 +1,7 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
+import { REPRODUCTION_PLAN_VERSION } from "./plan.js";
+import type { ReproductionResult } from "./playwright.js";
 
 const client = new Anthropic();
 
@@ -21,97 +23,60 @@ export type AnalyzeIssueInput = {
     stdout: string;
     stderr: string;
   };
-  browserResult: BrowserResult;
-};
-
-export type ReproductionPlan = {
-  baseUrl: string;
-  steps: ReproductionStep[];
-  expectedFailure: string;
-};
-
-type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-
-export type ReproductionStep =
-  | {
-      action: "goto";
-      path: string;
-    }
-  | {
-      action: "click";
-      selector: string;
-    }
-  | {
-      action: "fill";
-      selector: string;
-      value: string;
-    }
-  | {
-      action: "waitForSelector";
-      selector: string;
-    }
-  | {
-      action: "screenshot";
-    }
-  | {
-      action: "request";
-      method: HttpMethod;
-      path: string;
-      body?: Record<string, unknown>;
-    };
-
-export type BrowserResult = {
-  consoleLogs: string[];
-  failedNetworkResponses: {
-    url: string;
-    status: number;
-    statusText: string;
-  }[];
-  apiResponses: {
-    method: string;
-    url: string;
-    status: number;
-    statusText: string;
-    body: string;
-  }[];
-  html: string;
-  screenshots: string[];
-  errors: string[];
+  browserResult: ReproductionResult;
 };
 
 export type RepoEvidenceInput = Omit<AnalyzeIssueInput, "browserResult">;
 
-export async function generateReproductionPlan(input: RepoEvidenceInput) {
+export type GeneratedPlan = {
+  rawText: string;
+  parsed: unknown | null;
+  parseError: string | null;
+};
+
+export async function generateReproductionPlan(
+  input: RepoEvidenceInput,
+): Promise<GeneratedPlan> {
   const prompt = `
-You are creating a browser reproduction plan for a GitHub issue.
+You are creating a deterministic browser reproduction plan for a GitHub issue.
 
 Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
 
 The JSON must match this exact shape:
 {
+  "version": ${REPRODUCTION_PLAN_VERSION},
   "baseUrl": "${input.sandboxResult.baseUrl}",
   "steps": [
-    { "action": "goto", "path": "/" },
-    { "action": "fill", "selector": "...", "value": "..." },
-    { "action": "click", "selector": "..." },
-    { "action": "request", "method": "POST", "path": "/api/path", "body": { "key": "value" } }
+    { "id": "step-1", "action": "goto", "path": "/" },
+    { "id": "step-2", "action": "fill", "selector": "...", "value": "..." },
+    { "id": "step-3", "action": "click", "selector": "..." },
+    { "id": "step-4", "action": "request", "method": "POST", "path": "/api/path", "body": { "key": "value" } }
   ],
-  "expectedFailure": "..."
+  "expectedBehavior": "one sentence describing correct behavior",
+  "failureCondition": "one sentence describing the reported failure",
+  "assertion": { ... }
 }
 
-Infer the steps from the issue, README, package.json, source files, and sandbox logs.
-Do not hardcode login unless the evidence shows the bug is about login.
+Supported step actions: goto, click, fill, waitForSelector, screenshot, request.
+Every step must have a unique string "id".
+"goto" and "request" paths must be relative and start with "/".
+Do not put method or body on "goto".
 Use stable CSS selectors visible in the provided source code when possible.
 Use "request" for API endpoints or server routes that are not reachable through visible page controls.
-Do not put method or body on "goto"; "goto" only supports action and path.
 Use this exact baseUrl: ${input.sandboxResult.baseUrl}
+
+The "assertion" describes how to detect the reported failure. It must be exactly one of:
+{ "type": "response_status", "pathPattern": "/api/path", "method": "POST", "expected": 401, "failureValue": 500 }
+  (pathPattern and method are optional filters; expected is the correct status; failureValue is the buggy status)
+{ "type": "console_error", "contains": "substring of the expected error message" }
+{ "type": "element_text", "selector": "css selector", "contains": "text shown when the bug occurs" }
 
 ${formatRepoEvidence(input)}
 `;
 
   const message = await client.messages.create({
     model: "claude-sonnet-4-0",
-    max_tokens: 700,
+    max_tokens: 1_000,
     messages: [
       {
         role: "user",
@@ -120,7 +85,17 @@ ${formatRepoEvidence(input)}
     ],
   });
 
-  return parseReproductionPlan(getTextContent(message.content));
+  const rawText = getTextContent(message.content);
+
+  try {
+    return { rawText, parsed: JSON.parse(rawText) as unknown, parseError: null };
+  } catch (error) {
+    return {
+      rawText,
+      parsed: null,
+      parseError: `Claude did not return valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 export async function analyzeIssue(input: AnalyzeIssueInput) {
@@ -134,23 +109,23 @@ ${formatRepoEvidence(input)}
 
 Browser evidence from Playwright:
 
-Console logs:
-${input.browserResult.consoleLogs.join("\n") || "(empty)"}
+Reproduction outcome:
+${input.browserResult.outcome} — ${input.browserResult.outcomeReason}
 
-Failed network responses:
-${formatFailedNetworkResponses(input.browserResult.failedNetworkResponses)}
+Console errors:
+${input.browserResult.consoleErrors.join("\n") || "(none)"}
+
+Page errors:
+${input.browserResult.pageErrors.join("\n") || "(none)"}
+
+Failed network requests:
+${formatNetworkFailures(input.browserResult.networkFailures)}
 
 API responses:
 ${formatApiResponses(input.browserResult.apiResponses)}
 
 Page HTML:
 ${input.browserResult.html || "(empty)"}
-
-Screenshots:
-${input.browserResult.screenshots.join("\n") || "(none)"}
-
-Browser execution errors:
-${input.browserResult.errors.join("\n") || "(none)"}
 
 Provide:
 - Summary
@@ -228,21 +203,19 @@ function formatSourceFiles(sourceFiles: AnalyzeIssueInput["sourceFiles"]) {
     .join("\n\n");
 }
 
-function formatFailedNetworkResponses(
-  responses: BrowserResult["failedNetworkResponses"],
-) {
-  if (responses.length === 0) {
+function formatNetworkFailures(failures: ReproductionResult["networkFailures"]) {
+  if (failures.length === 0) {
     return "(none)";
   }
 
-  return responses
-    .map((response) => {
-      return `${response.status} ${response.statusText} ${response.url}`;
+  return failures
+    .map((failure) => {
+      return `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure} ${failure.statusText}`;
     })
     .join("\n");
 }
 
-function formatApiResponses(responses: BrowserResult["apiResponses"]) {
+function formatApiResponses(responses: ReproductionResult["apiResponses"]) {
   if (responses.length === 0) {
     return "(none)";
   }
@@ -272,84 +245,4 @@ function getTextContent(content: unknown[]) {
     })
     .join("")
     .trim();
-}
-
-function parseReproductionPlan(text: string): ReproductionPlan {
-  const parsed = JSON.parse(text) as unknown;
-
-  if (!isReproductionPlan(parsed)) {
-    throw new Error("Claude returned an invalid reproduction plan.");
-  }
-
-  return parsed;
-}
-
-function isReproductionPlan(value: unknown): value is ReproductionPlan {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const plan = value as ReproductionPlan;
-
-  return (
-    typeof plan.baseUrl === "string" &&
-    Array.isArray(plan.steps) &&
-    plan.steps.every(isReproductionStep) &&
-    typeof plan.expectedFailure === "string"
-  );
-}
-
-function isReproductionStep(value: unknown): value is ReproductionStep {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const step = value as Record<string, unknown>;
-
-  switch (step.action) {
-    case "goto":
-      return (
-        hasOnlyKeys(step, ["action", "path"]) && typeof step.path === "string"
-      );
-    case "click":
-    case "waitForSelector":
-      return (
-        hasOnlyKeys(step, ["action", "selector"]) &&
-        typeof step.selector === "string"
-      );
-    case "fill":
-      return (
-        hasOnlyKeys(step, ["action", "selector", "value"]) &&
-        typeof step.selector === "string" &&
-        typeof step.value === "string"
-      );
-    case "screenshot":
-      return hasOnlyKeys(step, ["action"]);
-    case "request":
-      return (
-        hasOnlyKeys(step, ["action", "method", "path", "body"]) &&
-        isHttpMethod(step.method) &&
-        typeof step.path === "string" &&
-        (step.body === undefined ||
-          (typeof step.body === "object" && step.body !== null))
-      );
-    default:
-      return false;
-  }
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: string[]) {
-  return Object.keys(value).every((key) => {
-    return allowedKeys.includes(key);
-  });
-}
-
-function isHttpMethod(value: unknown): value is HttpMethod {
-  return (
-    value === "GET" ||
-    value === "POST" ||
-    value === "PUT" ||
-    value === "PATCH" ||
-    value === "DELETE"
-  );
 }

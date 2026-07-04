@@ -1,4 +1,5 @@
 import { Probot } from "probot";
+import { createInvestigationId } from "../backend/services/artifacts.js";
 
 export default (app: Probot) => {
   app.on("issue_comment.created", async (context) => {
@@ -8,32 +9,30 @@ export default (app: Probot) => {
       return;
     }
 
-    const repoOwner = context.payload.repository.owner.login;
-    const repoName = context.payload.repository.name;
-    const repoUrl = context.payload.repository.html_url;
-    const defaultBranch = context.payload.repository.default_branch;
-    const issueNumber = context.payload.issue.number;
-    const issueTitle = context.payload.issue.title;
-    const issueBody = context.payload.issue.body ?? "";
-    const issueUrl = context.payload.issue.html_url;
-    const triggerComment = context.payload.comment.body;
-    const triggeredBy = context.payload.comment.user?.login ?? "unknown";
+    const investigationId = createInvestigationId();
 
     const investigationPayload = {
-      repoOwner,
-      repoName,
-      repoUrl,
-      defaultBranch,
-      issueNumber,
-      issueTitle,
-      issueBody,
-      issueUrl,
-      triggerComment,
-      triggeredBy,
+      investigationId,
+      repoOwner: context.payload.repository.owner.login,
+      repoName: context.payload.repository.name,
+      repoUrl: context.payload.repository.html_url,
+      defaultBranch: context.payload.repository.default_branch,
+      issueNumber: context.payload.issue.number,
+      issueTitle: context.payload.issue.title,
+      issueBody: context.payload.issue.body ?? "",
+      issueUrl: context.payload.issue.html_url,
+      triggerComment: context.payload.comment.body,
+      triggeredBy: context.payload.comment.user?.login ?? "unknown",
     };
 
-    console.log("Investigation payload:");
+    console.log(`[${investigationId}] Investigation payload:`);
     console.log(JSON.stringify(investigationPayload, null, 2));
+
+    await context.octokit.rest.issues.createComment(
+      context.issue({
+        body: `Investigation started.\n\nInvestigation: ${investigationId}`,
+      }),
+    );
 
     const backendUrl =
       process.env.INVESTIGATION_BACKEND_URL ?? "http://localhost:4000";
@@ -46,15 +45,26 @@ export default (app: Probot) => {
     });
 
     if (!response.ok) {
+      await context.octokit.rest.issues.createComment(
+        context.issue({
+          body: `Sherlock could not complete this investigation because the investigation backend failed.\n\nInvestigation: ${investigationId}\nOutcome: execution_failed`,
+        }),
+      );
+
       throw new Error(
         `Investigation backend returned ${response.status} ${response.statusText}`,
       );
     }
 
-    const issueComment = context.issue({
-      body: "Investigation started.",
-    });
+    const result = (await response.json()) as { githubComment?: unknown };
 
-    await context.octokit.rest.issues.createComment(issueComment);
+    const resultComment =
+      typeof result.githubComment === "string" && result.githubComment
+        ? result.githubComment
+        : `Investigation finished.\n\nInvestigation: ${investigationId}`;
+
+    await context.octokit.rest.issues.createComment(
+      context.issue({ body: resultComment }),
+    );
   });
 };
