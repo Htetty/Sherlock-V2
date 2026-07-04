@@ -96,9 +96,18 @@ app.post("/investigations", async (req, res) => {
     log(`Repository cloned to ${repoContext.repoPath} at ${repoContext.commit}`);
     investigationRecord.commit = repoContext.commit;
 
-    sandboxSession = await runSandboxInvestigation({
-      repoPath: repoContext.repoPath,
-    });
+    try {
+      sandboxSession = await runSandboxInvestigation({
+        repoPath: repoContext.repoPath,
+      });
+    } catch (error) {
+      return await finishInvestigation(res, store, investigationRecord, {
+        investigationId,
+        outcome: "environment_failed",
+        stage: "application startup",
+        error: formatError(error),
+      });
+    }
 
     log(`Sandbox started at ${sandboxSession.result.baseUrl}`);
 
@@ -198,15 +207,18 @@ app.post("/investigations", async (req, res) => {
         const restart = async () => {
           if (sandboxSession) {
             await sandboxSession.stop();
+            sandboxSession = null;
           }
 
-          sandboxSession = await runSandboxInvestigation({ repoPath });
-          const baseUrl = sandboxSession.result.baseUrl;
-          const ok = await waitForUrl(baseUrl, 30_000);
+          try {
+            sandboxSession = await runSandboxInvestigation({ repoPath });
+          } catch (error) {
+            return { ok: false, log: formatError(error) };
+          }
 
           return {
-            ok,
-            baseUrl,
+            ok: true,
+            baseUrl: sandboxSession.result.baseUrl,
             log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
               .filter(Boolean)
               .join("\n"),
@@ -411,21 +423,6 @@ async function finishInvestigation(
     artifactsDir: store.dir,
     ...extra,
   });
-}
-
-async function waitForUrl(baseUrl: string, timeoutMs: number) {
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < timeoutMs) {
-    try {
-      await fetch(baseUrl, { signal: AbortSignal.timeout(2_000) });
-      return true;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  }
-
-  return false;
 }
 
 function formatError(error: unknown) {

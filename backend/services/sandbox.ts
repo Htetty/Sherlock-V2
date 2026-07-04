@@ -11,8 +11,13 @@ const execAsync = promisify(exec);
 
 // stop the sandbox if the app keeps running instead of exiting
 const SANDBOX_TIMEOUT_MS = 8_000;
-const STARTUP_WAIT_MS = 3_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 30_000;
+
+// Probot (3000) and the Sherlock backend (4000) must never be handed out as a
+// target-application sandbox port: a collision makes reproduction silently
+// talk to the wrong server instead of the cloned app.
+const RESERVED_PORTS = new Set([3000, 4000]);
+const MAX_PORT_ALLOCATION_ATTEMPTS = 10;
 
 type SandboxExecError = Error & {
   stdout?: string | Buffer;
@@ -33,15 +38,22 @@ export type SandboxSession = {
   stop: () => Promise<void>;
 };
 
+// Thrown when the target application never becomes reachable on its
+// allocated port (it crashed, hung, or ignored PORT). Callers must classify
+// this as an environment failure, never as part of the reproduction result.
+export class SandboxUnreachableError extends Error {}
+
 export async function runSandboxInvestigation({
   repoPath,
+  startupTimeoutMs = SANDBOX_STARTUP_TIMEOUT_MS,
 }: {
   repoPath: string;
+  startupTimeoutMs?: number;
 }): Promise<SandboxSession> {
   try {
-    return await runDockerSandbox(repoPath);
+    return await runDockerSandbox(repoPath, startupTimeoutMs);
   } catch (error) {
-    const session = await runLocalSandbox(repoPath);
+    const session = await runLocalSandbox(repoPath, startupTimeoutMs);
     session.result.stderr = [
       `Docker sandbox failed, falling back to local process: ${formatError(error)}`,
       session.result.stderr,
@@ -53,7 +65,10 @@ export async function runSandboxInvestigation({
   }
 }
 
-async function runDockerSandbox(repoPath: string): Promise<SandboxSession> {
+async function runDockerSandbox(
+  repoPath: string,
+  startupTimeoutMs: number,
+): Promise<SandboxSession> {
   const port = await getAvailablePort();
   const baseUrl = `http://localhost:${port}`;
   const containerName = `bugfixbot-sandbox-${randomUUID()}`;
@@ -85,10 +100,17 @@ async function runDockerSandbox(repoPath: string): Promise<SandboxSession> {
   collectProcessOutput(appProcess, output);
 
   // wait until the mapped sandbox URL is reachable before playwright starts
-  await Promise.race([
-    waitForSandboxUrl(baseUrl, output),
-    waitForProcessSpawnError(appProcess),
-  ]);
+  try {
+    await Promise.race([
+      waitForSandboxUrl(baseUrl, output, startupTimeoutMs),
+      waitForProcessSpawnError(appProcess),
+    ]);
+  } catch (error) {
+    await stopDockerSandbox(containerName, appProcess, output);
+    throw new SandboxUnreachableError(
+      `Target application container did not become reachable at ${baseUrl}: ${formatError(error)}`,
+    );
+  }
 
   return {
     result: output,
@@ -98,7 +120,10 @@ async function runDockerSandbox(repoPath: string): Promise<SandboxSession> {
   };
 }
 
-async function runLocalSandbox(repoPath: string): Promise<SandboxSession> {
+async function runLocalSandbox(
+  repoPath: string,
+  startupTimeoutMs: number,
+): Promise<SandboxSession> {
   const port = await getAvailablePort();
   const baseUrl = `http://localhost:${port}`;
   const installResult = await runCommand("npm install", repoPath);
@@ -120,8 +145,22 @@ async function runLocalSandbox(repoPath: string): Promise<SandboxSession> {
   // keep collecting app logs while playwright reproduces the issue
   collectProcessOutput(appProcess, output);
 
-  await wait(STARTUP_WAIT_MS);
-  output.baseUrl = getLoggedBaseUrl(output.stdout) ?? output.baseUrl;
+  // The base URL is always the port Sherlock allocated and injected via
+  // PORT, never a value scraped from the app's own log output: apps often
+  // print a hardcoded default port in their boilerplate startup message
+  // regardless of what they actually bind to, which previously caused
+  // Sherlock to trust a stale/incorrect URL instead of the real one.
+  try {
+    await Promise.race([
+      waitForSandboxUrl(baseUrl, output, startupTimeoutMs),
+      waitForProcessSpawnError(appProcess),
+    ]);
+  } catch (error) {
+    await stopSandboxApp(appProcess, output);
+    throw new SandboxUnreachableError(
+      `Target application did not become reachable at ${baseUrl} (allocated via PORT=${port}): ${formatError(error)}`,
+    );
+  }
 
   return {
     result: output,
@@ -209,10 +248,14 @@ async function stopDockerSandbox(
   }
 }
 
-async function waitForSandboxUrl(baseUrl: string, output: SandboxResult) {
+async function waitForSandboxUrl(
+  baseUrl: string,
+  output: SandboxResult,
+  timeoutMs: number,
+) {
   const startedAt = Date.now();
 
-  while (Date.now() - startedAt < SANDBOX_STARTUP_TIMEOUT_MS) {
+  while (Date.now() - startedAt < timeoutMs) {
     try {
       await fetch(baseUrl);
       return;
@@ -221,7 +264,8 @@ async function waitForSandboxUrl(baseUrl: string, output: SandboxResult) {
     }
   }
 
-  output.stderr += `\nSandbox did not respond at ${baseUrl} within ${SANDBOX_STARTUP_TIMEOUT_MS}ms.`;
+  output.stderr += `\nSandbox did not respond at ${baseUrl} within ${timeoutMs}ms.`;
+  throw new Error(`Sandbox did not respond at ${baseUrl} within ${timeoutMs}ms.`);
 }
 
 function waitForProcessSpawnError(appProcess: ChildProcessWithoutNullStreams) {
@@ -236,7 +280,21 @@ function wait(ms: number) {
   });
 }
 
-function getAvailablePort() {
+async function getAvailablePort() {
+  for (let attempt = 0; attempt < MAX_PORT_ALLOCATION_ATTEMPTS; attempt += 1) {
+    const port = await allocateEphemeralPort();
+
+    if (!RESERVED_PORTS.has(port)) {
+      return port;
+    }
+  }
+
+  throw new Error(
+    `Could not allocate a sandbox port outside of the reserved set (${[...RESERVED_PORTS].join(", ")}) after ${MAX_PORT_ALLOCATION_ATTEMPTS} attempts.`,
+  );
+}
+
+function allocateEphemeralPort() {
   return new Promise<number>((resolve, reject) => {
     const server = createServer();
 
@@ -256,12 +314,6 @@ function getAvailablePort() {
       });
     });
   });
-}
-
-function getLoggedBaseUrl(stdout: string) {
-  const match = stdout.match(/https?:\/\/localhost:\d+/);
-
-  return match?.[0] ?? null;
 }
 
 // convert command output into text that can be added to the claude prompt
