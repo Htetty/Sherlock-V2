@@ -63,6 +63,8 @@ type Graph = {
 export async function buildGraphContext(input: {
   repoPath: string;
   repoUrl?: string;
+  // Known HEAD commit (from RepoContext.commit); skips a duplicate git call.
+  commitSha?: string;
   issueTitle: string;
   issueBody: string;
   // Files patched in past matching investigations get a node-score boost so
@@ -73,7 +75,7 @@ export async function buildGraphContext(input: {
   // failing assertion text, console/network identifiers).
   extraTerms?: string[];
 }): Promise<GraphContext> {
-  const commitSha = await getHeadSha(input.repoPath);
+  const commitSha = input.commitSha ?? (await getHeadSha(input.repoPath));
 
   try {
     const cacheNote = await ensureGraph(input.repoPath, input.repoUrl, commitSha);

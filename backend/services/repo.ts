@@ -1,7 +1,14 @@
 // creates a temp clone of repo, extracting important files that claude can analyze
 
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -57,6 +64,7 @@ const IGNORED_DIRS = new Set([
 export type RepoContext = {
   workspacePath: string;
   repoPath: string;
+  commit: string;
   fileTree: string[];
   packageJson: string | null;
   readme: string | null;
@@ -79,10 +87,12 @@ export async function cloneRepoForInvestigation(input: {
 
   try {
     await cloneRepo(input.repoUrl, repoPath, input.defaultBranch);
+    await writeRepoExcludes(repoPath);
 
     return {
       workspacePath,
       repoPath,
+      commit: await getHeadCommit(repoPath),
       fileTree: await collectFileTree(repoPath),
       packageJson: await safeRead(path.join(repoPath, "package.json")),
       readme: await readFirstExisting(repoPath, [
@@ -185,6 +195,48 @@ async function cloneRepo(
   }
 
   await runGitClone(["clone", "--depth", "1", repoUrl, repoPath]);
+}
+
+// Sherlock's own tooling (graphify extract, npm install in the sandbox)
+// creates untracked directories inside the clone. Target repos without a
+// .gitignore would then fail the fix loop's workspace_clean precondition.
+// .git/info/exclude is repo-local ignoring that never touches the working
+// tree, so the cleanliness check stays strict for anything unexpected.
+const INVESTIGATION_EXCLUDES = [
+  "node_modules/",
+  "graphify-out/",
+  "dist/",
+  "build/",
+  ".next/",
+  ".cache/",
+  ".turbo/",
+  "coverage/",
+];
+
+async function writeRepoExcludes(repoPath: string) {
+  const excludePath = path.join(repoPath, ".git", "info", "exclude");
+
+  try {
+    await mkdir(path.dirname(excludePath), { recursive: true });
+    await appendFile(
+      excludePath,
+      `\n# Added by Sherlock (investigation tooling artifacts)\n${INVESTIGATION_EXCLUDES.join("\n")}\n`,
+      "utf8",
+    );
+  } catch (error) {
+    console.warn(
+      `Could not write .git/info/exclude for ${repoPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+async function getHeadCommit(repoPath: string) {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+    cwd: repoPath,
+    timeout: 10_000,
+  });
+
+  return stdout.trim();
 }
 
 async function runGitClone(args: string[]) {

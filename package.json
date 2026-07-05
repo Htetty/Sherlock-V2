@@ -16,6 +16,7 @@
     "start": "concurrently --kill-others --names backend,bot \"npm:serve:backend\" \"npm:serve:bot\"",
     "serve:backend": "node ./lib/backend/server.js",
     "serve:bot": "probot run ./lib/src/index.js",
+    "replay": "node ./lib/backend/replay.js",
     "test": "vitest"
   },
   "dependencies": {

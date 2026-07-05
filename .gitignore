@@ -9,3 +9,5 @@ lib
 fable
 dist
 .DS_Store
+
+artifacts

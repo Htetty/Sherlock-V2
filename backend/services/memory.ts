@@ -71,7 +71,16 @@ export function matchMemory(
 ): MemoryEntry[] {
   const terms = new Set(issueTerms);
 
-  return entries
+  // Reruns of the same issue append near-identical entries; keep only the
+  // newest per issue title so the top matches stay diverse and reflect the
+  // latest outcome. Entries are appended chronologically.
+  const newestByTitle = new Map<string, MemoryEntry>();
+
+  for (const entry of entries) {
+    newestByTitle.set(entry.issueTitle, entry);
+  }
+
+  return [...newestByTitle.values()]
     .map((entry) => ({
       entry,
       score: overlapScore(entry, terms),

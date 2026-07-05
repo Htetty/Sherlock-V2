@@ -1,8 +1,18 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
+import { REPRODUCTION_PLAN_VERSION, type ReproductionPlan } from "./plan.js";
+import {
+  FIX_PROPOSAL_VERSION,
+  PATCH_LIMITS,
+  extractFixProposalJson,
+  requestValidProposal,
+} from "./fix-proposal.js";
 import type { GraphContext } from "./graphContext.js";
+import type { ReproductionResult } from "./playwright.js";
 
 const client = new Anthropic();
+
+const MODEL = "claude-sonnet-4-6";
 
 export type AnalyzeIssueInput = {
   issueTitle: string;
@@ -22,135 +32,102 @@ export type AnalyzeIssueInput = {
     stdout: string;
     stderr: string;
   };
-  browserResult: BrowserResult;
-};
-
-export type ReproductionPlan = {
-  baseUrl: string;
-  steps: ReproductionStep[];
-  expectedFailure: string;
-};
-
-type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
-
-export type ReproductionStep =
-  | {
-      action: "goto";
-      path: string;
-    }
-  | {
-      action: "click";
-      selector: string;
-    }
-  | {
-      action: "fill";
-      selector: string;
-      value: string;
-    }
-  | {
-      action: "waitForSelector";
-      selector: string;
-    }
-  | {
-      action: "screenshot";
-    }
-  | {
-      action: "request";
-      method: HttpMethod;
-      path: string;
-      body?: Record<string, unknown>;
-    };
-
-// Per-step execution record. "ambiguous" marks Playwright strict-mode
-// violations (target matched multiple elements) - a plan defect, not
-// evidence that the bug reproduced.
-export type StepResult = {
-  index: number;
-  action: string;
-  status: "passed" | "failed" | "skipped";
-  ambiguous?: boolean;
-  error?: string;
-};
-
-export type BrowserResult = {
-  stepResults?: StepResult[];
-  consoleLogs: string[];
-  failedNetworkResponses: {
-    url: string;
-    status: number;
-    statusText: string;
-  }[];
-  apiResponses: {
-    method: string;
-    url: string;
-    status: number;
-    statusText: string;
-    body: string;
-  }[];
-  html: string;
-  screenshots: string[];
-  errors: string[];
+  browserResult: ReproductionResult;
 };
 
 export type RepoEvidenceInput = Omit<AnalyzeIssueInput, "browserResult">;
 
-// --- Intent-level reproduction plan (Part 1: Graphify-grounded investigator) ---
-// Model output describes user intent, never CSS selectors.
-// Prompt contract: docs/fable/07-graphify-context-prompt.md
-
-export type DomTargetIntent = {
-  role?: string;
-  name?: string;
-  label?: string;
-  placeholder?: string;
-  text?: string;
-  testId?: string;
+export type GeneratedPlan = {
+  rawText: string;
+  parsed: unknown | null;
+  parseError: string | null;
+  // Present for fix proposals: every model response, including rejected
+  // format attempts, for artifact debugging.
+  attempts?: { rawText: string; error: string | null }[];
 };
 
-export type IntentStep =
-  | { action: "goto"; path: string }
-  | { action: "click"; target: DomTargetIntent }
-  | { action: "fill"; target: DomTargetIntent; value: string }
-  | {
-      action: "assert";
-      target: DomTargetIntent;
-      condition: "visible" | "hidden" | "text_equals";
-      value?: string;
-    };
-
-export type ReproductionIntentPlan = {
-  baseUrl: string;
-  steps: IntentStep[];
-  expectedFailure: string;
-  unknowns: string[];
-};
-
-export type IntentPlanInput = {
-  issueTitle: string;
-  issueBody: string;
-  graphContext: GraphContext;
-  fallbackSourceFiles: AnalyzeIssueInput["sourceFiles"];
-  sandboxResult: AnalyzeIssueInput["sandboxResult"];
-  // Rendered PAST lines from memory.json; empty string = section omitted.
+// Graph/memory context threading (docs/fable/07 + 08). Both optional so the
+// pipeline degrades gracefully when graphify is unavailable or memory is
+// empty. When graphContext is available the caller passes graph-hydrated
+// files as `sourceFiles`, so formatRepoEvidence needs no changes.
+export type PlanGenerationInput = RepoEvidenceInput & {
+  graphContext?: GraphContext | null;
   pastInvestigations?: string;
 };
 
-export async function generateIntentPlan(
-  input: IntentPlanInput,
-): Promise<ReproductionIntentPlan> {
-  const prompt = buildInvestigatorPrompt(input);
+export async function generateReproductionPlan(
+  input: PlanGenerationInput,
+): Promise<GeneratedPlan> {
+  const prompt = `
+You are creating a deterministic browser reproduction plan for a GitHub issue.
 
-  return parseIntentPlan(await requestJson(prompt, 1_500));
+Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
+
+The JSON must match this exact shape:
+{
+  "version": ${REPRODUCTION_PLAN_VERSION},
+  "baseUrl": "${input.sandboxResult.baseUrl}",
+  "steps": [
+    { "id": "step-1", "action": "goto", "path": "/" },
+    { "id": "step-2", "action": "fill", "target": { "label": "Email" }, "value": "test@example.com" },
+    { "id": "step-3", "action": "click", "target": { "role": "button", "name": "Sign in" } },
+    { "id": "step-4", "action": "request", "method": "POST", "path": "/api/path", "body": { "key": "value" } }
+  ],
+  "expectedBehavior": "one sentence describing correct behavior",
+  "failureCondition": "one sentence describing the reported failure",
+  "assertion": { ... }
 }
 
-// Deterministic JSON generation: temperature 0 for stable output, and
-// extractJsonObject to tolerate markdown fences or stray prose around the
-// object. (claude-sonnet-4-6 does not support assistant prefill, so fences
-// are handled by extraction rather than prevented.)
-async function requestJson(prompt: string, maxTokens: number): Promise<string> {
+Supported step actions: goto, click, fill, waitForSelector, screenshot, wait, request.
+Every step must have a unique string "id".
+"goto" and "request" paths must be relative and start with "/".
+Do not put method or body on "goto".
+
+Targets describe USER INTENT, never CSS selectors. A target is an object with
+one or more of: role, name, label, placeholder, text, testId, id. Values must
+be strings that appear in the provided source code or page evidence.
+Every target must resolve to exactly ONE element; execution runs in strict
+mode and multiple matches fail the step. Never target generic words that
+appear in buttons, filters, or headings (e.g. "Completed", "Active", "All").
+Target key rules:
+- "testId" is ONLY for data-testid attribute values. An HTML id attribute is
+  NOT a testId - use "id" for id="..." attributes.
+- For form fields, prefer "label" (the visible label text) or "placeholder";
+  these match how a user identifies the field.
+- Preference order: testId (when data-testid exists), then role+name, then
+  label/placeholder, then id, then unique text.
+
+Use "request" for API endpoints or server routes that are not reachable through visible page controls.
+Use { "id": "...", "action": "wait", "ms": 2000 } (max 10000) after triggering asynchronous work.
+IMPORTANT: if an endpoint runs work asynchronously (returns 202, "queued", a job id, or schedules a background job), insert a "wait" step long enough for the job to finish BEFORE the step that checks the resulting state; otherwise the check races the job and the bug cannot be observed.
+Use this exact baseUrl: ${input.sandboxResult.baseUrl}
+
+The "assertion" describes how to detect the reported failure. It must be exactly one of:
+{ "type": "response_status", "pathPattern": "/api/path", "method": "POST", "expected": 401, "failureValue": 500 }
+  (pathPattern and method are optional filters; expected is the correct status; failureValue is the buggy status)
+{ "type": "response_body", "pathPattern": "/api/path", "method": "GET", "failureContains": "text present only when the bug occurs", "expectedContains": "text present only when behavior is correct" }
+  (checks the body of the LAST matching "request" step response; pathPattern, method, and expectedContains are optional)
+{ "type": "console_error", "contains": "substring of the expected error message" }
+{ "type": "element_text", "target": { "text": "unique text of the element" }, "contains": "text shown when the bug occurs" }
+
+Assertion rules:
+- "console_error" and "element_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
+- "element_text" targets must resolve to exactly one element; target the specific content in question (e.g. the exact task title), never a shared word.
+- Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
+- The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
+${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}
+Grounding rules:
+- Only reference files, routes, components, and UI strings that appear in the
+  evidence below. If it is not in the evidence, it does not exist.
+- If the evidence does not prove a route, element, or user flow exists, use
+  the closest grounded plan instead of inventing one.
+
+${formatRepoEvidence(input)}
+`;
+
   const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: maxTokens,
+    model: MODEL,
+    max_tokens: 1_500,
     temperature: 0,
     messages: [
       {
@@ -160,299 +137,172 @@ async function requestJson(prompt: string, maxTokens: number): Promise<string> {
     ],
   });
 
-  return extractJsonObject(getTextContent(message.content));
-}
+  const rawText = getTextContent(message.content);
+  const extracted = extractFixProposalJson(rawText);
 
-function extractJsonObject(text: string): string {
-  const cleaned = text.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-
-  if (start === -1 || end <= start) {
-    throw new Error("Model response contained no JSON object.");
+  if (!extracted.ok) {
+    return { rawText, parsed: null, parseError: extracted.error };
   }
 
-  return cleaned.slice(start, end + 1);
+  return { rawText, parsed: extracted.value, parseError: null };
 }
 
-function buildInvestigatorPrompt(input: IntentPlanInput): string {
-  const relevantFiles = input.graphContext.available
-    ? input.graphContext.relevantFiles
-    : input.fallbackSourceFiles;
+export type FixProposalInput = RepoEvidenceInput & {
+  commit: string;
+  plan: ReproductionPlan;
+  reproductionResult: ReproductionResult;
+  graphContext?: GraphContext | null;
+};
 
-  const graphSection = input.graphContext.available
-    ? `## GRAPH CONTEXT
+export async function generateFixProposal(
+  input: FixProposalInput,
+): Promise<GeneratedPlan> {
+  const prompt = `
+You are proposing a minimal code fix for a bug that Sherlock has deterministically reproduced.
 
-A knowledge graph built by static AST analysis of this repository. NODE lines
-are real code entities with real file paths and line numbers. EDGE relations:
-imports_from, contains, method, calls, uses, inherits. Confidence tags:
-EXTRACTED = stated in source, treat as ground truth. INFERRED = deduced,
-trust cautiously. AMBIGUOUS = never rely on alone.
+Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
 
-NODES:
-${input.graphContext.graphNodes || "(none)"}
-
-EDGES:
-${input.graphContext.graphEdges || "(none)"}`
-    : `## GRAPH CONTEXT
-
-(unavailable: ${input.graphContext.notes})
-Rely on the file contents below.`;
-
-  const pastSection = input.pastInvestigations
-    ? `
-
-## PAST INVESTIGATIONS (this repo)
-
-Previous issues Sherlock investigated here, with outcomes:
-
-${input.pastInvestigations}
-
-How to use these:
-- Treat "verified" entries as strong hints about where similar bugs live and
-  what reproduction steps work in this app.
-- Treat "blocked"/"failed" entries as warnings: the listed approach did not
-  work - do not repeat it unchanged.
-- An entry marked STALE means the code changed since that fix. Use it as a
-  starting point only; re-verify against the GRAPH CONTEXT and file contents.
-- Past investigations are hints, not evidence. The grounding rules still
-  apply: never reference code that is not in the current evidence.`
-    : "";
-
-  return `You are the Investigator for an autonomous QA system. A GitHub issue was filed
-against the repository below. Produce a reproduction plan describing USER
-INTENT - what a human tester would do in the browser - not CSS selectors.
-
-Return ONLY valid JSON matching the schema at the end. No markdown, no fences.
-
-## Issue
-
-Title: ${input.issueTitle}
-Body:
-${input.issueBody || "(empty)"}
-
-${graphSection}${pastSection}
-
-## Relevant file contents
-
-${formatSourceFiles(relevantFiles)}
-
-## Sandbox
-
-Base URL: ${input.sandboxResult.baseUrl}
-Startup logs (truncated):
-${truncate(input.sandboxResult.stdout, 2_000) || "(empty)"}
-${truncate(input.sandboxResult.stderr, 2_000) || ""}
-
-## Rules
-
-1. Only reference files, routes, components, and UI strings that appear in
-   the evidence above. If it is not in the evidence, it does not exist.
-2. If the evidence does not prove a route, selector, or user flow exists, do
-   not invent it. Return the closest grounded plan and name what is missing
-   in "unknowns".
-3. Targets are intent objects (role/name/label/placeholder/text/testId),
-   never CSS selectors.
-4. Every target - especially assert targets - must resolve to exactly ONE
-   element; execution runs in strict mode and multiple matches fail the step.
-   Never assert on generic words that appear in buttons, filters, or headings
-   (e.g. "Completed", "Active", "All"). Assert on the specific content in
-   question, such as the exact task title text, or use a testId.
-
-## Output schema
-
+The JSON must match this exact shape:
 {
-  "baseUrl": "${input.sandboxResult.baseUrl}",
-  "steps": [
-    { "action": "goto", "path": "/" },
-    { "action": "fill", "target": { "label": "Email" }, "value": "test@example.com" },
-    { "action": "click", "target": { "role": "button", "name": "Sign in" } },
-    { "action": "assert", "target": { "text": "Welcome" }, "condition": "visible" }
-  ],
-  "expectedFailure": "one sentence: what currently goes wrong",
-  "unknowns": ["things the evidence did not prove"]
-}`;
-}
-
-// --- Fixer (Graphify Part 2) ---
-// Runs only after reproduction. Prompt contract:
-// docs/fable/09-graphify-fixer-prompt.md
-
-export type FixPatchEdit = {
-  path: string;
-  find: string;
-  replace: string;
-};
-
-export type FixResult = {
-  status: "patch" | "blocked";
-  rootCause: {
-    file: string;
-    location: string;
-    explanation: string;
-    evidence: string[];
-  };
-  patch: FixPatchEdit[];
-  blockedReason: string;
-};
-
-export type FixInput = {
-  issueTitle: string;
-  issueBody: string;
-  graphContext: GraphContext;
-  intentPlanJson: string;
-  expectedFailure: string;
-  browserErrors: string[];
-  consoleLogs: string[];
-  failedResponses: string[];
-  relevantFiles: AnalyzeIssueInput["sourceFiles"];
-};
-
-export async function generateFix(input: FixInput): Promise<FixResult> {
-  const prompt = `You are the Fixer for an autonomous QA system. The bug below has been
-REPRODUCED in a real browser: the steps ran and the expected failure was
-observed. Produce the smallest patch that makes the same user intent pass.
-
-Return ONLY valid JSON matching the schema at the end. No markdown, no fences.
-
-## Issue
-
-Title: ${input.issueTitle}
-Body:
-${input.issueBody || "(empty)"}
-
-## GRAPH CONTEXT (refined by reproduction evidence)
-
-Selected using the browser evidence below - it traces from the elements the
-test actually touched to the handlers and routes connected to them. NODE
-lines are real code entities; EDGE relations: imports_from, contains, method,
-calls, uses, inherits. EXTRACTED = ground truth, INFERRED = trust cautiously,
-AMBIGUOUS = never rely on alone.
-
-NODES:
-${input.graphContext.graphNodes || "(none)"}
-
-EDGES:
-${input.graphContext.graphEdges || "(none)"}
-
-## Reproduction evidence
-
-Intent plan that ran:
-${input.intentPlanJson}
-
-Expected failure (observed):
-${input.expectedFailure}
-
-Step errors / failing assertion:
-${input.browserErrors.join("\n") || "(none)"}
-
-Console logs:
-${input.consoleLogs.join("\n") || "(none)"}
-
-Failed network responses:
-${input.failedResponses.join("\n") || "(none)"}
-
-## Relevant file contents
-
-${formatSourceFiles(input.relevantFiles)}
-
-## Rules
-
-1. Fix the root cause, not the symptom. Walk the graph from the touched
-   element to its handler to its route; the bug is on that path.
-2. Smallest possible change. No refactors, renames, reformatting, or fixes
-   for unrelated issues.
-3. Do not change UI text, roles, labels, or testids that the intent plan
-   targets - verification reruns the same intent after the patch, and
-   changing those strings breaks it.
-4. "find" must be copied EXACTLY from the provided file contents (byte for
-   byte, including whitespace) and must appear exactly once in that file.
-5. Only patch files whose contents are shown above. If the root cause is in
-   a file you cannot see, return "blocked" and name the file.
-6. If the evidence does not prove the root cause, return "blocked" with the
-   missing evidence named. Never guess.
-
-## Output schema
-
-{
-  "status": "patch",
-  "rootCause": {
-    "file": "path",
-    "location": "line or function",
-    "explanation": "why this exact logic causes the observed failure",
-    "evidence": ["one citation per claim, from graph/trace/files above"]
-  },
-  "patch": [
+  "version": ${FIX_PROPOSAL_VERSION},
+  "summary": "one sentence describing the fix",
+  "rootCause": "one sentence describing the exact root cause",
+  "confidence": 0.0,
+  "files": [
     {
-      "path": "path/to/file",
-      "find": "exact existing code",
-      "replace": "replacement code"
+      "path": "relative/path/from/repo/root.ts",
+      "edits": [
+        { "oldText": "exact text currently in the file", "newText": "replacement text" }
+      ]
     }
   ],
-  "blockedReason": ""
+  "relevantTests": ["npm test"],
+  "risk": "low",
+  "assumptions": []
 }
 
-When blocked: status="blocked", patch=[], blockedReason names what is missing.`;
+Rules:
+- Each oldText must appear EXACTLY ONCE in the target file, copied verbatim including whitespace.
+- Make the smallest change that fixes the root cause. Do not refactor.
+- Change at most ${PATCH_LIMITS.maxChangedFiles} files and ${PATCH_LIMITS.maxChangedLines} lines.
+- Never touch .env files, keys, lockfiles, GitHub workflows, or deployment configuration.
+- relevantTests must be plain npm/npx/node commands (no shell operators). Use the smallest relevant project test command; use an empty array if the repository has no runnable tests.
+- Do not create new files.
+- Do not change UI text, roles, labels, or testids that the reproduction plan targets - verification replays the same plan after the patch, and changing those strings breaks it.
+- Fix the root cause, not the symptom. Walk the graph context (when present) from the touched element to its handler to its route; the bug is on that path.
+- If graph context is present, ground your rootCause in it: cite the file and function the graph points to.
 
-  return parseFixResult(await requestJson(prompt, 2_000));
+Repository commit: ${input.commit}
+
+Saved reproduction plan (already verified to reproduce the bug):
+${JSON.stringify(input.plan, null, 2)}
+
+Reproduction outcome: ${input.reproductionResult.outcome} — ${input.reproductionResult.outcomeReason}
+Failed assertion: ${JSON.stringify(input.reproductionResult.assertion)}
+Console errors:
+${input.reproductionResult.consoleErrors.join("\n") || "(none)"}
+Page errors:
+${input.reproductionResult.pageErrors.join("\n") || "(none)"}
+Failed network requests:
+${input.reproductionResult.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join("\n") || "(none)"}
+API responses:
+${input.reproductionResult.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}\n${response.body}`).join("\n\n") || "(none)"}
+${formatGraphSection(input.graphContext, "refined by reproduction evidence")}
+${formatRepoEvidence(input)}
+`;
+
+  // One retry on format failure: the extraction error is fed back together
+  // with the schema (already part of the base prompt) and a bare-JSON
+  // instruction.
+  const result = await requestValidProposal(async (retryError) => {
+    const finalPrompt =
+      retryError === null
+        ? prompt
+        : `${prompt}
+
+Your previous response was rejected because it was not a valid fix proposal: ${retryError}
+
+Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, explanations, or any text before or after the JSON object.`;
+
+    const message = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2_000,
+      temperature: 0,
+      messages: [
+        {
+          role: "user",
+          content: finalPrompt,
+        },
+      ],
+    });
+
+    return getTextContent(message.content);
+  });
+
+  const lastAttempt = result.attempts[result.attempts.length - 1];
+
+  return {
+    rawText: lastAttempt?.rawText ?? "",
+    parsed: result.proposal,
+    parseError: result.parseError,
+    attempts: result.attempts,
+  };
 }
 
-function parseFixResult(text: string): FixResult {
-  const parsed = JSON.parse(text) as unknown;
+export async function analyzeIssue(input: AnalyzeIssueInput) {
+  const prompt = `
+You are analyzing a GitHub issue against the actual repository context.
 
-  if (!isFixResult(parsed)) {
-    throw new Error("Claude returned an invalid fix result.");
-  }
+Do not give generic possible causes. Use the provided source code and runtime logs to identify the exact root cause. Mention the specific file and logic causing the bug.
+If the provided evidence is not enough to identify an exact root cause, say what evidence is missing instead of guessing.
 
-  return parsed;
+${formatRepoEvidence(input)}
+
+Browser evidence from Playwright:
+
+Reproduction outcome:
+${input.browserResult.outcome} — ${input.browserResult.outcomeReason}
+
+Console errors:
+${input.browserResult.consoleErrors.join("\n") || "(none)"}
+
+Page errors:
+${input.browserResult.pageErrors.join("\n") || "(none)"}
+
+Failed network requests:
+${formatNetworkFailures(input.browserResult.networkFailures)}
+
+API responses:
+${formatApiResponses(input.browserResult.apiResponses)}
+
+Page HTML:
+${input.browserResult.html || "(empty)"}
+
+Provide:
+- Summary
+- Likely project type/framework
+- How to run locally
+- Reproduction plan
+- Exact root cause, citing the specific file and logic
+- Evidence from source code and sandbox logs that supports the root cause
+`;
+
+  const message = await client.messages.create({
+    model: MODEL,
+    max_tokens: 500,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  return message.content[0];
 }
 
-function isFixResult(value: unknown): value is FixResult {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const result = value as FixResult;
-  const rootCauseValid =
-    !!result.rootCause &&
-    typeof result.rootCause === "object" &&
-    typeof result.rootCause.file === "string" &&
-    typeof result.rootCause.location === "string" &&
-    typeof result.rootCause.explanation === "string" &&
-    Array.isArray(result.rootCause.evidence) &&
-    result.rootCause.evidence.every((item) => typeof item === "string");
-
-  const patchValid =
-    Array.isArray(result.patch) &&
-    result.patch.every(
-      (edit) =>
-        edit &&
-        typeof edit === "object" &&
-        typeof edit.path === "string" &&
-        typeof edit.find === "string" &&
-        edit.find.length > 0 &&
-        typeof edit.replace === "string" &&
-        edit.find !== edit.replace,
-    );
-
-  if (!rootCauseValid || !patchValid || typeof result.blockedReason !== "string") {
-    return false;
-  }
-
-  if (result.status === "patch") {
-    return result.patch.length > 0;
-  }
-
-  if (result.status === "blocked") {
-    return result.blockedReason.length > 0;
-  }
-
-  return false;
-}
-
-// --- Memory reflection (Part 2) ---
+// --- Memory reflection (docs/fable/08) ---
 // Distills an investigation into actionable lessons for future runs.
-// Prompt contract: docs/fable/08-memory-prompt.md
 
 export type MemoryReflection = {
   issueTerms: string[];
@@ -480,7 +330,7 @@ Return ONLY valid JSON matching the schema at the end.
 Issue title: ${input.issueTitle}
 Issue body: ${input.issueBody || "(empty)"}
 Outcome: ${input.outcome}
-Intent plan executed: ${input.intentPlanJson}
+Reproduction plan executed: ${input.intentPlanJson}
 Browser errors/evidence:
 ${input.browserErrors.join("\n") || "(none)"}
 Root cause analysis:
@@ -494,8 +344,8 @@ Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
    evidence) - not a summary of the bug.
 2. Keep every field under 40 words. issueTerms: 3-8 lowercase keywords a
    future similar issue would likely contain.
-3. If outcome was blocked/failed, "whatFailed" is required and must name the
-   step that failed and why.
+3. If the outcome was not verified, "whatFailed" is required and must name
+   the step that failed and why.
 4. Record only what the evidence shows. No speculation.
 
 ## Output schema
@@ -507,17 +357,29 @@ Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
   "whatFailed": "actionable lesson, or empty string"
 }`;
 
-  return parseMemoryReflection(await requestJson(prompt, 400));
-}
+  const message = await client.messages.create({
+    model: MODEL,
+    max_tokens: 400,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
 
-function parseMemoryReflection(text: string): MemoryReflection {
-  const parsed = JSON.parse(text) as unknown;
+  const extracted = extractFixProposalJson(getTextContent(message.content));
 
-  if (!isMemoryReflection(parsed)) {
-    throw new Error("Claude returned an invalid memory reflection.");
+  if (!extracted.ok) {
+    throw new Error(`Claude returned an invalid memory reflection: ${extracted.error}`);
   }
 
-  return parsed;
+  if (!isMemoryReflection(extracted.value)) {
+    throw new Error("Claude returned a memory reflection with an invalid shape.");
+  }
+
+  return extracted.value;
 }
 
 function isMemoryReflection(value: unknown): value is MemoryReflection {
@@ -536,185 +398,57 @@ function isMemoryReflection(value: unknown): value is MemoryReflection {
   );
 }
 
-function truncate(text: string, maxChars: number): string {
-  if (text.length <= maxChars) {
-    return text;
+// --- Prompt sections -------------------------------------------------------
+
+function formatGraphSection(
+  graphContext: GraphContext | null | undefined,
+  label = "",
+): string {
+  if (!graphContext?.available) {
+    return "";
   }
 
-  return `${text.slice(0, maxChars)}\n...(truncated)`;
-}
+  const heading = label ? `GRAPH CONTEXT (${label})` : "GRAPH CONTEXT";
 
-function parseIntentPlan(text: string): ReproductionIntentPlan {
-  const parsed = JSON.parse(text) as unknown;
+  return `
+${heading}:
 
-  if (!isIntentPlan(parsed)) {
-    throw new Error("Claude returned an invalid intent plan.");
-  }
+A knowledge graph built by static AST analysis of this repository. NODE lines
+are real code entities with real file paths and line numbers. EDGE relations:
+imports_from, contains, method, calls, uses, inherits. Confidence tags:
+EXTRACTED = stated in source, treat as ground truth. INFERRED = deduced,
+trust cautiously. AMBIGUOUS = never rely on alone.
 
-  return parsed;
-}
+NODES:
+${graphContext.graphNodes || "(none)"}
 
-function isIntentPlan(value: unknown): value is ReproductionIntentPlan {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const plan = value as ReproductionIntentPlan;
-
-  return (
-    typeof plan.baseUrl === "string" &&
-    Array.isArray(plan.steps) &&
-    plan.steps.length > 0 &&
-    plan.steps.every(isIntentStep) &&
-    typeof plan.expectedFailure === "string" &&
-    Array.isArray(plan.unknowns) &&
-    plan.unknowns.every((item) => typeof item === "string")
-  );
-}
-
-function isIntentStep(value: unknown): value is IntentStep {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const step = value as Record<string, unknown>;
-
-  switch (step.action) {
-    case "goto":
-      return typeof step.path === "string";
-    case "click":
-      return isDomTargetIntent(step.target);
-    case "fill":
-      return isDomTargetIntent(step.target) && typeof step.value === "string";
-    case "assert":
-      return (
-        isDomTargetIntent(step.target) &&
-        (step.condition === "visible" ||
-          step.condition === "hidden" ||
-          step.condition === "text_equals") &&
-        (step.value === undefined || typeof step.value === "string")
-      );
-    default:
-      return false;
-  }
-}
-
-const TARGET_KEYS = [
-  "role",
-  "name",
-  "label",
-  "placeholder",
-  "text",
-  "testId",
-] as const;
-
-function isDomTargetIntent(value: unknown): value is DomTargetIntent {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const target = value as Record<string, unknown>;
-  const keys = Object.keys(target);
-
-  return (
-    keys.length > 0 &&
-    keys.every((key) => (TARGET_KEYS as readonly string[]).includes(key)) &&
-    keys.every((key) => typeof target[key] === "string")
-  );
-}
-
-export async function generateReproductionPlan(input: RepoEvidenceInput) {
-  const prompt = `
-You are creating a browser reproduction plan for a GitHub issue.
-
-Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
-
-The JSON must match this exact shape:
-{
-  "baseUrl": "${input.sandboxResult.baseUrl}",
-  "steps": [
-    { "action": "goto", "path": "/" },
-    { "action": "fill", "selector": "...", "value": "..." },
-    { "action": "click", "selector": "..." },
-    { "action": "request", "method": "POST", "path": "/api/path", "body": { "key": "value" } }
-  ],
-  "expectedFailure": "..."
-}
-
-Infer the steps from the issue, README, package.json, source files, and sandbox logs.
-Do not hardcode login unless the evidence shows the bug is about login.
-Use stable CSS selectors visible in the provided source code when possible.
-Use "request" for API endpoints or server routes that are not reachable through visible page controls.
-Do not put method or body on "goto"; "goto" only supports action and path.
-Use this exact baseUrl: ${input.sandboxResult.baseUrl}
-
-${formatRepoEvidence(input)}
+EDGES:
+${graphContext.graphEdges || "(none)"}
 `;
-
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 700,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
-
-  return parseReproductionPlan(getTextContent(message.content));
 }
 
-export async function analyzeIssue(input: AnalyzeIssueInput) {
-  const prompt = `
-You are analyzing a GitHub issue against the actual repository context.
+function formatPastSection(pastInvestigations: string | undefined): string {
+  if (!pastInvestigations) {
+    return "";
+  }
 
-Do not give generic possible causes. Use the provided source code and runtime logs to identify the exact root cause. Mention the specific file and logic causing the bug.
-If the provided evidence is not enough to identify an exact root cause, say what evidence is missing instead of guessing.
+  return `
+PAST INVESTIGATIONS (this repo):
 
-${formatRepoEvidence(input)}
+Previous issues Sherlock investigated here, with outcomes:
 
-Browser evidence from Playwright:
+${pastInvestigations}
 
-Console logs:
-${input.browserResult.consoleLogs.join("\n") || "(empty)"}
-
-Failed network responses:
-${formatFailedNetworkResponses(input.browserResult.failedNetworkResponses)}
-
-API responses:
-${formatApiResponses(input.browserResult.apiResponses)}
-
-Page HTML:
-${input.browserResult.html || "(empty)"}
-
-Screenshots:
-${input.browserResult.screenshots.join("\n") || "(none)"}
-
-Browser execution errors:
-${input.browserResult.errors.join("\n") || "(none)"}
-
-Provide:
-- Summary
-- Likely project type/framework
-- How to run locally
-- Reproduction plan
-- Exact root cause, citing the specific file and logic
-- Evidence from source code and sandbox logs that supports the root cause
+How to use these:
+- Treat "verified" entries as strong hints about where similar bugs live and
+  what reproduction steps work in this app.
+- Treat "blocked"/"failed" entries as warnings: the listed approach did not
+  work - do not repeat it unchanged.
+- An entry marked STALE means the code changed since that fix. Use it as a
+  starting point only; re-verify against the current evidence.
+- Past investigations are hints, not evidence. The grounding rules still
+  apply: never reference code that is not in the current evidence.
 `;
-
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 500,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
-
-  return message.content[0];
 }
 
 function formatRepoEvidence(input: RepoEvidenceInput) {
@@ -770,21 +504,19 @@ function formatSourceFiles(sourceFiles: AnalyzeIssueInput["sourceFiles"]) {
     .join("\n\n");
 }
 
-function formatFailedNetworkResponses(
-  responses: BrowserResult["failedNetworkResponses"],
-) {
-  if (responses.length === 0) {
+function formatNetworkFailures(failures: ReproductionResult["networkFailures"]) {
+  if (failures.length === 0) {
     return "(none)";
   }
 
-  return responses
-    .map((response) => {
-      return `${response.status} ${response.statusText} ${response.url}`;
+  return failures
+    .map((failure) => {
+      return `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure} ${failure.statusText}`;
     })
     .join("\n");
 }
 
-function formatApiResponses(responses: BrowserResult["apiResponses"]) {
+function formatApiResponses(responses: ReproductionResult["apiResponses"]) {
   if (responses.length === 0) {
     return "(none)";
   }
@@ -814,84 +546,4 @@ function getTextContent(content: unknown[]) {
     })
     .join("")
     .trim();
-}
-
-function parseReproductionPlan(text: string): ReproductionPlan {
-  const parsed = JSON.parse(text) as unknown;
-
-  if (!isReproductionPlan(parsed)) {
-    throw new Error("Claude returned an invalid reproduction plan.");
-  }
-
-  return parsed;
-}
-
-function isReproductionPlan(value: unknown): value is ReproductionPlan {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const plan = value as ReproductionPlan;
-
-  return (
-    typeof plan.baseUrl === "string" &&
-    Array.isArray(plan.steps) &&
-    plan.steps.every(isReproductionStep) &&
-    typeof plan.expectedFailure === "string"
-  );
-}
-
-function isReproductionStep(value: unknown): value is ReproductionStep {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
-
-  const step = value as Record<string, unknown>;
-
-  switch (step.action) {
-    case "goto":
-      return (
-        hasOnlyKeys(step, ["action", "path"]) && typeof step.path === "string"
-      );
-    case "click":
-    case "waitForSelector":
-      return (
-        hasOnlyKeys(step, ["action", "selector"]) &&
-        typeof step.selector === "string"
-      );
-    case "fill":
-      return (
-        hasOnlyKeys(step, ["action", "selector", "value"]) &&
-        typeof step.selector === "string" &&
-        typeof step.value === "string"
-      );
-    case "screenshot":
-      return hasOnlyKeys(step, ["action"]);
-    case "request":
-      return (
-        hasOnlyKeys(step, ["action", "method", "path", "body"]) &&
-        isHttpMethod(step.method) &&
-        typeof step.path === "string" &&
-        (step.body === undefined ||
-          (typeof step.body === "object" && step.body !== null))
-      );
-    default:
-      return false;
-  }
-}
-
-function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: string[]) {
-  return Object.keys(value).every((key) => {
-    return allowedKeys.includes(key);
-  });
-}
-
-function isHttpMethod(value: unknown): value is HttpMethod {
-  return (
-    value === "GET" ||
-    value === "POST" ||
-    value === "PUT" ||
-    value === "PATCH" ||
-    value === "DELETE"
-  );
 }

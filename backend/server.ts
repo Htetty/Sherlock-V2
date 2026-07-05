@@ -2,13 +2,11 @@ import express from "express";
 import cors from "cors";
 import {
   analyzeIssue,
-  generateFix,
-  generateIntentPlan,
+  generateFixProposal,
   generateMemoryReflection,
-  type BrowserResult,
-  type FixResult,
-  type IntentStep,
+  generateReproductionPlan,
 } from "./services/claude.js";
+import { runFixAttempt, type FixAttemptResult } from "./services/fix.js";
 import { buildGraphContext, tokenize } from "./services/graphContext.js";
 import {
   appendMemory,
@@ -18,18 +16,39 @@ import {
   renderPastInvestigations,
   type MemoryOutcome,
 } from "./services/memory.js";
-import { applyPatch } from "./services/patch.js";
+import {
+  createFixPullRequest,
+  createGitHubRestClient,
+  type PullRequestResult,
+} from "./services/pull-request.js";
 import {
   cleanupRepoContext,
   cloneRepoForInvestigation,
   type RepoContext,
 } from "./services/repo.js";
-
 import {
   runSandboxInvestigation,
   type SandboxSession,
 } from "./services/sandbox.js";
-import { runIntentInvestigation } from "./services/playwright.js";
+import {
+  executeReproductionPlan,
+  type ReproductionResult,
+} from "./services/playwright.js";
+import { validateReproductionPlan, type ReproductionPlan } from "./services/plan.js";
+import {
+  createArtifactStore,
+  createInvestigationId,
+  isInvestigationId,
+  writeExecutionArtifacts,
+  type ArtifactStore,
+} from "./services/artifacts.js";
+import {
+  formatFixComment,
+  formatPullRequestComment,
+  formatResultComment,
+  redactSecrets,
+  type InvestigationSummary,
+} from "./services/report.js";
 
 const app = express();
 const PORT = Number(process.env.BACKEND_PORT ?? 4000);
@@ -42,68 +61,108 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/investigations", async (req, res) => {
+  const payload = req.body;
+  const investigationId = isInvestigationId(payload?.investigationId)
+    ? payload.investigationId
+    : createInvestigationId();
+  const log = (message: string) => {
+    console.log(`[${investigationId}] ${message}`);
+  };
+
   let repoContext: RepoContext | null = null;
   let sandboxSession: SandboxSession | null = null;
+  let store: ArtifactStore | null = null;
+  let investigationRecord: Record<string, unknown> = { investigationId };
 
   try {
-    const payload = req.body;
+    log("Investigation started.");
 
-    console.log("Investigation payload received:");
-    console.log(payload);
-
-    repoContext = await cloneRepoForInvestigation({
+    store = await createArtifactStore(investigationId);
+    investigationRecord = {
+      investigationId,
+      createdAt: new Date().toISOString(),
+      status: "running",
       repoUrl: payload.repoUrl,
-      defaultBranch: payload.defaultBranch,
-    });
+      issueNumber: payload.issueNumber,
+      issueTitle: payload.issueTitle,
+      issueUrl: payload.issueUrl,
+      triggeredBy: payload.triggeredBy,
+    };
+    await store.writeJson("investigation.json", investigationRecord);
 
-    console.log(`Repository cloned to ${repoContext.repoPath}`);
+    try {
+      repoContext = await cloneRepoForInvestigation({
+        repoUrl: payload.repoUrl,
+        defaultBranch: payload.defaultBranch,
+      });
+    } catch (error) {
+      return await finishInvestigation(res, store, investigationRecord, {
+        investigationId,
+        outcome: "environment_failed",
+        stage: "git clone",
+        error: formatError(error),
+      });
+    }
 
-    sandboxSession = await runSandboxInvestigation({
-      repoPath: repoContext.repoPath,
-    });
+    log(`Repository cloned to ${repoContext.repoPath} at ${repoContext.commit}`);
+    investigationRecord.commit = repoContext.commit;
 
-    console.log("Sandbox result:");
-    console.log(sandboxSession.result);
-
+    // --- Memory (docs/fable/08): past investigations of this repo ---------
     const issueTerms = tokenize(
       `${payload.issueTitle} ${payload.issueBody ?? ""}`,
     );
-    const pastEntries = matchMemory(await loadMemory(payload.repoUrl), issueTerms);
+    const memoryEntries = await loadMemory(payload.repoUrl);
+    const pastEntries = matchMemory(memoryEntries, issueTerms);
     const pastInvestigations = await renderPastInvestigations(
       pastEntries,
       repoContext.repoPath,
     );
 
-    console.log(`Memory: ${pastEntries.length} matching past investigation(s).`);
+    log(
+      `Memory: ${memoryEntries.length} stored entr${memoryEntries.length === 1 ? "y" : "ies"} for this repo; using top ${pastEntries.length} match(es).`,
+    );
 
+    try {
+      sandboxSession = await runSandboxInvestigation({
+        repoPath: repoContext.repoPath,
+      });
+    } catch (error) {
+      return await finishInvestigation(res, store, investigationRecord, {
+        investigationId,
+        outcome: "environment_failed",
+        stage: "application startup",
+        error: formatError(error),
+      });
+    }
+
+    log(`Sandbox started at ${sandboxSession.result.baseUrl}`);
+
+    // --- Graph context (docs/fable/07): issue-specific repo context -------
     const graphContext = await buildGraphContext({
       repoPath: repoContext.repoPath,
       repoUrl: payload.repoUrl,
+      commitSha: repoContext.commit,
       issueTitle: payload.issueTitle,
       issueBody: payload.issueBody ?? "",
       boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
     });
 
-    console.log(`Graph context: ${graphContext.notes}`);
-
-    const intentPlan = await generateIntentPlan({
-      issueTitle: payload.issueTitle,
-      issueBody: payload.issueBody ?? "",
-      graphContext,
-      fallbackSourceFiles: repoContext.sourceFiles,
-      sandboxResult: sandboxSession.result,
+    log(`Graph context: ${graphContext.notes}`);
+    await store.writeJson("repo-context.json", {
+      available: graphContext.available,
+      commitSha: graphContext.commitSha,
+      notes: graphContext.notes,
+      nodes: graphContext.graphNodes,
+      edges: graphContext.graphEdges,
+      hydratedFiles: graphContext.relevantFiles.map((file) => file.path),
       pastInvestigations,
     });
 
-    console.log("Intent plan:");
-    console.log(JSON.stringify(intentPlan, null, 2));
+    const contextSourceFiles = graphContext.available
+      ? graphContext.relevantFiles
+      : repoContext.sourceFiles;
 
-    const browserResult = await runIntentInvestigation(intentPlan);
-
-    console.log("Browser result:");
-    console.log(browserResult);
-
-    const claudeResult = await analyzeIssue({
+    const generated = await generateReproductionPlan({
       issueTitle: payload.issueTitle,
       issueBody: payload.issueBody ?? "",
       repoUrl: payload.repoUrl,
@@ -111,212 +170,236 @@ app.post("/investigations", async (req, res) => {
       fileTree: repoContext.fileTree,
       packageJson: repoContext.packageJson,
       readme: repoContext.readme,
-      sourceFiles: repoContext.sourceFiles,
+      sourceFiles: contextSourceFiles,
       sandboxResult: sandboxSession.result,
-      browserResult,
+      graphContext,
+      pastInvestigations,
     });
 
-    console.log("Claude result:");
-    console.log(claudeResult);
+    await store.writeJson("reproduction-plan-raw.json", {
+      rawText: generated.rawText,
+      parseError: generated.parseError,
+    });
 
-    // Reproduction gate (doc 09): fix only when the plan's actions all ran
-    // AND the expected failure was observed as a REAL failing assert.
-    // Ambiguous asserts (strict-mode violations) are plan defects, not bug
-    // evidence - they fail regardless of whether the bug exists.
-    const beforeSteps = browserResult.stepResults ?? [];
-    const actionFailed = beforeSteps.some(
-      (step) => step.action !== "assert" && step.status === "failed",
-    );
-    const ambiguousAsserts = beforeSteps.filter(
-      (step) =>
-        step.action === "assert" && step.status === "failed" && step.ambiguous,
-    );
-    const realAssertFailures = beforeSteps.filter(
-      (step) =>
-        step.action === "assert" && step.status === "failed" && !step.ambiguous,
-    );
-    const reproduced = realAssertFailures.length > 0 && !actionFailed;
-
-    if (ambiguousAsserts.length > 0) {
-      console.warn(
-        `Plan defect: ${ambiguousAsserts.length} assert step(s) had ambiguous targets (counted as warnings, not bug evidence): steps ${ambiguousAsserts
-          .map((step) => step.index + 1)
-          .join(", ")}`,
-      );
+    if (generated.parseError !== null) {
+      return await finishInvestigation(res, store, investigationRecord, {
+        investigationId,
+        outcome: "plan_failed",
+        planErrors: [generated.parseError],
+      });
     }
 
-    console.log(
-      `Reproduction gate: actions ${actionFailed ? "FAILED" : "ok"}, real assert failures: ${realAssertFailures
-        .map((step) => step.index + 1)
-        .join(", ") || "none"} -> reproduced=${reproduced}`,
-    );
+    const validation = validateReproductionPlan(generated.parsed);
 
-    let fixResult: FixResult | null = null;
-    let patchDiff = "";
-    let patchedFiles: string[] = [];
-    let afterBrowserResult: BrowserResult | null = null;
-    let verification = reproduced ? "not_attempted" : "not_reproduced";
+    if (!validation.ok) {
+      log(`Plan rejected: ${validation.errors.join(" | ")}`);
 
-    if (reproduced) {
-      const refineTerms = collectRefineTerms(
-        intentPlan.steps,
-        intentPlan.expectedFailure,
-        browserResult,
-      );
+      return await finishInvestigation(res, store, investigationRecord, {
+        investigationId,
+        outcome: "plan_failed",
+        planErrors: validation.errors,
+      });
+    }
 
-      console.log(
-        `Refine inputs (${refineTerms.length}): ${refineTerms.slice(0, 10).join(" | ").slice(0, 400)}`,
-      );
+    const plan = validation.plan;
+    await store.writeJson("reproduction-plan.json", plan);
+    log("Validated reproduction plan saved.");
 
-      const refinedContext = await buildGraphContext({
-        repoPath: repoContext.repoPath,
+    const result = await executeReproductionPlan(plan, store);
+    await writeExecutionArtifacts(store, result);
+    log(`Plan executed with outcome: ${result.outcome}`);
+
+    let claudeAnalysis: unknown = null;
+
+    if (result.outcome === "reproduced" || result.outcome === "not_reproduced") {
+      claudeAnalysis = await analyzeIssue({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
         repoUrl: payload.repoUrl,
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
-        extraTerms: refineTerms,
+        defaultBranch: payload.defaultBranch,
+        fileTree: repoContext.fileTree,
+        packageJson: repoContext.packageJson,
+        readme: repoContext.readme,
+        sourceFiles: contextSourceFiles,
+        sandboxResult: sandboxSession.result,
+        browserResult: result,
+      }).catch((error: unknown) => {
+        log(`Claude analysis failed: ${formatError(error)}`);
+        return null;
       });
 
-      console.log(`Refined graph context: ${refinedContext.notes}`);
-
-      fixResult = await generateFix({
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        graphContext: refinedContext,
-        intentPlanJson: JSON.stringify(intentPlan),
-        expectedFailure: intentPlan.expectedFailure,
-        browserErrors: browserResult.errors,
-        consoleLogs: browserResult.consoleLogs,
-        failedResponses: browserResult.failedNetworkResponses.map(
-          (response) => `${response.status} ${response.statusText} ${response.url}`,
-        ),
-        relevantFiles: refinedContext.available
-          ? refinedContext.relevantFiles
-          : repoContext.sourceFiles,
-      });
-
-      console.log("Fix result:");
-      console.log(fixResult);
-
-      if (fixResult.status === "patch") {
-        try {
-          const applied = await applyPatch(repoContext.repoPath, fixResult.patch);
-          patchDiff = applied.diff;
-          patchedFiles = applied.patchedFiles;
-
-          // Restart the sandbox on the patched code and rerun the SAME intent.
-          await sandboxSession.stop();
-          sandboxSession = await runSandboxInvestigation({
-            repoPath: repoContext.repoPath,
-          });
-
-          afterBrowserResult = await runIntentInvestigation({
-            ...intentPlan,
-            baseUrl: sandboxSession.result.baseUrl,
-          });
-
-          // Per-step semantic comparison (doc 09):
-          // - every action step must pass after the patch
-          // - every REAL assert failure from before must now pass
-          // - no step that passed before may fail after
-          // - asserts that were ambiguous before and are still ambiguous are
-          //   tolerated (pre-existing plan defect, unrelated to the patch)
-          const afterSteps = afterBrowserResult.stepResults ?? [];
-          const failedBefore = new Set(
-            realAssertFailures.map((step) => step.index),
-          );
-          const problems: string[] = [];
-
-          console.log("Verification step comparison (before -> after):");
-
-          for (const after of afterSteps) {
-            const before = beforeSteps[after.index];
-            const beforeLabel = describeStepStatus(before);
-            const afterLabel = describeStepStatus(after);
-
-            console.log(
-              `  Step ${after.index + 1} [${after.action}]: ${beforeLabel} -> ${afterLabel}`,
-            );
-
-            if (after.status === "skipped") {
-              problems.push(`step ${after.index + 1} did not run after patch`);
-            } else if (after.action !== "assert" && after.status === "failed") {
-              problems.push(
-                `action step ${after.index + 1} failed after patch: ${after.error ?? ""}`,
-              );
-            } else if (after.action === "assert" && after.status === "failed") {
-              if (failedBefore.has(after.index)) {
-                problems.push(
-                  `previously-failing assert step ${after.index + 1} still fails: ${after.error ?? ""}`,
-                );
-              } else if (after.ambiguous && before?.ambiguous) {
-                console.warn(
-                  `  Step ${after.index + 1}: still ambiguous (pre-existing plan defect, tolerated)`,
-                );
-              } else if (before?.status === "passed") {
-                problems.push(
-                  `assert step ${after.index + 1} passed before but fails after patch (regression)`,
-                );
-              } else {
-                problems.push(
-                  `assert step ${after.index + 1} fails after patch: ${after.error ?? ""}`,
-                );
-              }
-            }
-          }
-
-          verification = problems.length === 0 ? "verified" : "failed";
-
-          if (problems.length > 0) {
-            console.warn("Verification problems:");
-            for (const problem of problems) {
-              console.warn(`  - ${problem}`);
-            }
-          }
-        } catch (error) {
-          verification = "failed";
-          console.warn("Patch/verification failed:", error);
-        }
-      } else {
-        verification = "fix_blocked";
-      }
-
-      console.log(`Verification: ${verification}`);
-    } else {
-      console.log(
-        `Reproduction gate not passed (actionFailed=${actionFailed}, realAssertFailures=${realAssertFailures.length}, ambiguousAsserts=${ambiguousAsserts.length}); skipping fixer.`,
-      );
+      await store.writeJson("claude-analysis.json", claudeAnalysis);
     }
 
-    const outcome: MemoryOutcome =
-      verification === "verified"
-        ? "verified"
-        : verification === "failed"
-          ? "failed"
-          : actionFailed || verification === "fix_blocked"
-            ? "blocked"
-            : "analysis_complete";
+    // Verified fix loop: only for a confirmed reproduction, one attempt.
+    let fixAttempt: FixAttemptResult | null = null;
 
+    if (result.outcome === "reproduced") {
+      try {
+        // Re-select the graph around reproduction evidence (docs/fable/09):
+        // by now we know which elements were touched and what failed.
+        const refineTerms = collectRefineTerms(plan, result);
+        log(
+          `Refine inputs (${refineTerms.length}): ${refineTerms.slice(0, 10).join(" | ").slice(0, 400)}`,
+        );
+
+        const refinedContext = await buildGraphContext({
+          repoPath: repoContext.repoPath,
+          repoUrl: payload.repoUrl,
+          commitSha: repoContext.commit,
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
+          extraTerms: refineTerms,
+        });
+
+        log(`Refined graph context: ${refinedContext.notes}`);
+        await store.writeJson("repo-context-refined.json", {
+          available: refinedContext.available,
+          notes: refinedContext.notes,
+          nodes: refinedContext.graphNodes,
+          edges: refinedContext.graphEdges,
+          hydratedFiles: refinedContext.relevantFiles.map((file) => file.path),
+        });
+
+        const generatedFix = await generateFixProposal({
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext.fileTree,
+          packageJson: repoContext.packageJson,
+          readme: repoContext.readme,
+          sourceFiles: refinedContext.available
+            ? refinedContext.relevantFiles
+            : contextSourceFiles,
+          sandboxResult: sandboxSession.result,
+          commit: repoContext.commit,
+          plan,
+          reproductionResult: result,
+          graphContext: refinedContext,
+        });
+
+        // Sanitized raw model responses (every attempt) kept for debugging
+        // rejected proposals.
+        await store.writeJson("fix-proposal-raw.json", {
+          rawText: redactSecrets(generatedFix.rawText),
+          parseError: generatedFix.parseError,
+          attempts: (generatedFix.attempts ?? []).map((attempt) => ({
+            rawText: redactSecrets(attempt.rawText),
+            error: attempt.error,
+          })),
+        });
+
+        const repoPath = repoContext.repoPath;
+        const restart = async () => {
+          if (sandboxSession) {
+            await sandboxSession.stop();
+            sandboxSession = null;
+          }
+
+          try {
+            sandboxSession = await runSandboxInvestigation({ repoPath });
+          } catch (error) {
+            return { ok: false, log: formatError(error) };
+          }
+
+          return {
+            ok: true,
+            baseUrl: sandboxSession.result.baseUrl,
+            log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
+              .filter(Boolean)
+              .join("\n"),
+          };
+        };
+
+        fixAttempt = await runFixAttempt({
+          investigationId,
+          investigationDir: store.dir,
+          repoPath,
+          sourceCommit: repoContext.commit,
+          plan,
+          originalOutcome: result.outcome,
+          proposal: generatedFix.parsed,
+          restart,
+        });
+
+        log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+      } catch (error) {
+        log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
+      }
+    }
+
+    // Verified fix -> GitHub pull request. Only verified fixes may push.
+    let pullRequest: PullRequestResult | null = null;
+
+    if (fixAttempt?.outcome === "verified") {
+      try {
+        const token =
+          typeof payload.installationToken === "string" && payload.installationToken
+            ? payload.installationToken
+            : null;
+        const attemptStore = await createArtifactStore(
+          investigationId,
+          fixAttempt.attemptDir,
+        );
+
+        pullRequest = await createFixPullRequest({
+          investigationId,
+          fixAttempt,
+          store: attemptStore,
+          repoPath: repoContext.repoPath,
+          owner: payload.repoOwner,
+          repo: payload.repoName,
+          baseBranch: payload.defaultBranch,
+          issueNumber: payload.issueNumber,
+          issueTitle: payload.issueTitle,
+          plan,
+          github: token
+            ? createGitHubRestClient({
+                token,
+                owner: payload.repoOwner,
+                repo: payload.repoName,
+              })
+            : null,
+          pushUrl: token
+            ? `https://x-access-token:${token}@github.com/${payload.repoOwner}/${payload.repoName}.git`
+            : null,
+        });
+
+        log(
+          `Pull request flow finished: ${pullRequest.status}${pullRequest.pullRequestUrl ? ` (${pullRequest.pullRequestUrl})` : ""}`,
+        );
+      } catch (error) {
+        log(`Pull request flow failed unexpectedly: ${formatError(error)}`);
+      }
+    }
+
+    // --- Memory recording (docs/fable/08): always learn from the run ------
     try {
+      const outcome = mapMemoryOutcome(result, fixAttempt);
+      const patchedFiles = fixAttempt?.changedFiles ?? [];
       const reflection = await generateMemoryReflection({
         issueTitle: payload.issueTitle,
         issueBody: payload.issueBody ?? "",
         outcome,
-        intentPlanJson: JSON.stringify(intentPlan),
-        browserErrors: browserResult.errors,
-        analysisText:
-          claudeResult && claudeResult.type === "text" ? claudeResult.text : "",
+        intentPlanJson: JSON.stringify(plan),
+        browserErrors: [
+          result.outcomeReason,
+          ...(result.assertion ? [result.assertion.detail] : []),
+          ...result.consoleErrors,
+          ...result.pageErrors,
+        ],
+        analysisText: extractAnalysisText(claudeAnalysis),
         patchedFiles,
       });
 
       await appendMemory(payload.repoUrl, {
         issueTitle: payload.issueTitle,
         issueTerms: reflection.issueTerms,
-        commitSha: graphContext.commitSha,
+        commitSha: repoContext.commit,
         outcome,
-        rootCause: fixResult?.rootCause
-          ? `${fixResult.rootCause.explanation} (${fixResult.rootCause.file}, ${fixResult.rootCause.location})`
-          : reflection.rootCause,
+        rootCause: fixAttempt?.rootCause ?? reflection.rootCause,
         patchedFiles,
         fileHashes: await hashRepoFiles(repoContext.repoPath, patchedFiles),
         whatWorked: reflection.whatWorked,
@@ -324,32 +407,74 @@ app.post("/investigations", async (req, res) => {
         createdAt: new Date().toISOString(),
       });
 
-      console.log("Memory entry recorded.");
+      log(`Memory entry recorded (outcome: ${outcome}).`);
     } catch (error) {
-      console.warn("Could not record memory entry:", error);
+      log(`Could not record memory entry: ${formatError(error)}`);
     }
 
-    res.json({
-      investigationId: `inv_${Date.now()}`,
-      status: outcome,
-      reproduced,
-      verification,
-      graphContextNotes: graphContext.notes,
-      intentPlan,
-      browserResult,
-      fixResult,
-      patchDiff,
-      patchedFiles,
-      afterBrowserResult,
-      sandboxResult: sandboxSession.result,
-      claudeResult,
-    });
-  } catch (error) {
-    console.error("Investigation failed:", error);
+    const fixComment = fixAttempt
+      ? formatFixComment({
+          investigationId,
+          fixAttemptId: fixAttempt.fixAttemptId,
+          outcome: fixAttempt.outcome,
+          rootCause: fixAttempt.rootCause,
+          changedFiles: fixAttempt.changedFiles,
+          reason: fixAttempt.outcome === "verified" ? null : fixAttempt.reason,
+          verification: fixAttempt.checks
+            .filter((item) => item.passed)
+            .map((item) => item.detail),
+        })
+      : null;
 
-    res.status(500).json({
+    const pullRequestComment =
+      pullRequest && fixAttempt
+        ? formatPullRequestComment({
+            investigationId,
+            fixAttemptId: fixAttempt.fixAttemptId,
+            status: pullRequest.status,
+            pullRequestNumber: pullRequest.pullRequestNumber,
+            pullRequestUrl: pullRequest.pullRequestUrl,
+            branch: pullRequest.branch,
+            reason: pullRequest.reason,
+          })
+        : null;
+
+    const extraComment =
+      [fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
+
+    return await finishInvestigation(
+      res,
+      store,
+      investigationRecord,
+      buildExecutionSummary(investigationId, plan.expectedBehavior, result),
+      {
+        result,
+        claudeAnalysis,
+        fixAttempt,
+        pullRequest,
+        graphContextNotes: graphContext.notes,
+        memoryMatches: pastEntries.length,
+      },
+      extraComment,
+    );
+  } catch (error) {
+    console.error(`[${investigationId}] Investigation failed:`, error);
+
+    const summary: InvestigationSummary = {
+      investigationId,
+      outcome: "execution_failed",
+      error: formatError(error),
+    };
+
+    if (store) {
+      return await finishInvestigation(res, store, investigationRecord, summary);
+    }
+
+    return res.status(500).json({
+      investigationId,
       status: "error",
-      message: "Investigation failed.",
+      outcome: "execution_failed",
+      githubComment: formatResultComment(summary),
     });
   } finally {
     if (sandboxSession) {
@@ -362,37 +487,158 @@ app.post("/investigations", async (req, res) => {
   }
 });
 
-function describeStepStatus(
-  step: { status: string; ambiguous?: boolean } | undefined,
-): string {
-  if (!step) {
-    return "n/a";
+// Memory outcome mapping (docs/fable/10):
+// verified fix -> verified; failed/rejected fix attempt -> failed;
+// reproduced but no usable fix attempt -> blocked; otherwise analysis only.
+function mapMemoryOutcome(
+  result: ReproductionResult,
+  fixAttempt: FixAttemptResult | null,
+): MemoryOutcome {
+  if (fixAttempt?.outcome === "verified") {
+    return "verified";
   }
 
-  if (step.status === "failed" && step.ambiguous) {
-    return "failed(ambiguous)";
+  if (fixAttempt) {
+    return "failed";
   }
 
-  return step.status;
+  if (
+    result.outcome === "reproduced" ||
+    result.outcome === "execution_failed" ||
+    result.outcome === "environment_failed"
+  ) {
+    return "blocked";
+  }
+
+  return "analysis_complete";
 }
 
-// Refine terms for the fixer's graph re-selection (doc 09): intent target
-// strings, the expected failure text, step errors, and failed request paths.
+function extractAnalysisText(claudeAnalysis: unknown): string {
+  if (
+    claudeAnalysis &&
+    typeof claudeAnalysis === "object" &&
+    "type" in claudeAnalysis &&
+    claudeAnalysis.type === "text" &&
+    "text" in claudeAnalysis &&
+    typeof claudeAnalysis.text === "string"
+  ) {
+    return claudeAnalysis.text;
+  }
+
+  return "";
+}
+
+// Refine terms for the fixer's graph re-selection (docs/fable/09): step
+// target/selector strings, expected/failure text, assertion detail, and
+// runtime error evidence.
 function collectRefineTerms(
-  steps: IntentStep[],
-  expectedFailure: string,
-  browserResult: BrowserResult,
+  plan: ReproductionPlan,
+  result: ReproductionResult,
 ): string[] {
-  const targetStrings = steps
-    .flatMap((step) => ("target" in step ? Object.values(step.target) : []))
-    .filter((value): value is string => typeof value === "string");
+  const stepStrings = plan.steps.flatMap((step) => {
+    if ("target" in step) {
+      return Object.values(step.target).filter(
+        (value): value is string => typeof value === "string",
+      );
+    }
+
+    if ("selector" in step) {
+      return [step.selector];
+    }
+
+    return [];
+  });
 
   return [
-    ...targetStrings,
-    expectedFailure,
-    ...browserResult.errors,
-    ...browserResult.failedNetworkResponses.map((response) => response.url),
+    ...stepStrings,
+    plan.expectedBehavior,
+    plan.failureCondition,
+    ...(result.assertion ? [result.assertion.detail] : []),
+    ...result.steps
+      .filter((step) => step.error)
+      .map((step) => step.error as string),
+    ...result.consoleErrors,
+    ...result.pageErrors,
+    ...result.networkFailures.map((failure) => failure.url),
   ];
+}
+
+function buildExecutionSummary(
+  investigationId: string,
+  expectedBehavior: string,
+  result: ReproductionResult,
+): InvestigationSummary {
+  const base: InvestigationSummary = {
+    investigationId,
+    outcome: result.outcome,
+    evidence: {
+      screenshots: result.screenshots.length,
+      consoleErrors: result.consoleErrors.length + result.pageErrors.length,
+      networkFailures: result.networkFailures.length,
+      failedAssertions: result.assertion?.matchedFailure ? 1 : 0,
+    },
+  };
+
+  switch (result.outcome) {
+    case "reproduced":
+    case "not_reproduced":
+      return {
+        ...base,
+        observed: result.assertion?.detail ?? result.outcomeReason,
+        expected: expectedBehavior,
+      };
+    case "environment_failed":
+      return {
+        ...base,
+        stage: "application startup",
+        error: result.outcomeReason,
+      };
+    case "execution_failed":
+      return {
+        ...base,
+        error: result.outcomeReason,
+      };
+  }
+}
+
+async function finishInvestigation(
+  res: express.Response,
+  store: ArtifactStore,
+  record: Record<string, unknown>,
+  summary: InvestigationSummary,
+  extra: Record<string, unknown> = {},
+  extraComment: string | null = null,
+) {
+  const githubComment = extraComment
+    ? `${formatResultComment(summary)}\n\n---\n\n${extraComment}`
+    : formatResultComment(summary);
+
+  await store.writeJson("investigation.json", {
+    ...record,
+    finishedAt: new Date().toISOString(),
+    status: "finished",
+    outcome: summary.outcome,
+    summary,
+  });
+
+  console.log(`[${summary.investigationId}] Outcome: ${summary.outcome}`);
+
+  return res.json({
+    investigationId: summary.investigationId,
+    outcome: summary.outcome,
+    summary,
+    githubComment,
+    artifactsDir: store.dir,
+    ...extra,
+  });
+}
+
+function formatError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
 }
 
 app.listen(PORT, () => {
