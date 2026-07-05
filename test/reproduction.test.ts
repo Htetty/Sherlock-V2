@@ -210,6 +210,66 @@ describe("deterministic reproduction", () => {
   );
 
   test(
+    "reproduces an API-only bug with wait and response_body assertion",
+    { timeout: 60_000 },
+    async () => {
+      const baseUrl = await startFixtureApp({ buggy: true });
+      const store = await makeStore();
+
+      // Pure-API plan: no browser steps, so a console_error assertion would
+      // be rejected by validation; response_body inspects the state instead,
+      // and the wait step lets any async server work settle first.
+      const validation = validateReproductionPlan({
+        version: REPRODUCTION_PLAN_VERSION,
+        baseUrl,
+        steps: [
+          {
+            id: "step-1",
+            action: "request",
+            method: "POST",
+            path: "/api/login",
+            body: { email: "unknown@example.com" },
+          },
+          { id: "step-2", action: "wait", ms: 300 },
+          {
+            id: "step-3",
+            action: "request",
+            method: "POST",
+            path: "/api/login",
+            body: { email: "unknown@example.com" },
+          },
+        ],
+        expectedBehavior: "Login rejects unknown users with an Invalid credentials body.",
+        failureCondition: "Login responds with an Internal Server Error body.",
+        assertion: {
+          type: "response_body",
+          pathPattern: "/api/login",
+          method: "POST",
+          failureContains: "Internal Server Error",
+          expectedContains: "Invalid credentials",
+        },
+      });
+
+      expect(validation.ok).toBe(true);
+
+      if (!validation.ok) {
+        return;
+      }
+
+      const result = await executeReproductionPlan(validation.plan, store);
+
+      expect(result.outcome).toBe("reproduced");
+      expect(result.assertion?.matchedFailure).toBe(true);
+      expect(result.assertion?.observed).toContain("Internal Server Error");
+      expect(result.steps.map((step) => step.outcome)).toEqual([
+        "passed",
+        "passed",
+        "passed",
+      ]);
+    },
+  );
+
+  test(
     "classifies an unreachable application as environment_failed",
     { timeout: 30_000 },
     async () => {

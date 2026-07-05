@@ -58,19 +58,28 @@ The JSON must match this exact shape:
   "assertion": { ... }
 }
 
-Supported step actions: goto, click, fill, waitForSelector, screenshot, request.
+Supported step actions: goto, click, fill, waitForSelector, screenshot, wait, request.
 Every step must have a unique string "id".
 "goto" and "request" paths must be relative and start with "/".
 Do not put method or body on "goto".
 Use stable CSS selectors visible in the provided source code when possible.
 Use "request" for API endpoints or server routes that are not reachable through visible page controls.
+Use { "id": "...", "action": "wait", "ms": 2000 } (max 10000) after triggering asynchronous work.
+IMPORTANT: if an endpoint runs work asynchronously (returns 202, "queued", a job id, or schedules a background job), insert a "wait" step long enough for the job to finish BEFORE the step that checks the resulting state; otherwise the check races the job and the bug cannot be observed.
 Use this exact baseUrl: ${input.sandboxResult.baseUrl}
 
 The "assertion" describes how to detect the reported failure. It must be exactly one of:
 { "type": "response_status", "pathPattern": "/api/path", "method": "POST", "expected": 401, "failureValue": 500 }
   (pathPattern and method are optional filters; expected is the correct status; failureValue is the buggy status)
+{ "type": "response_body", "pathPattern": "/api/path", "method": "GET", "failureContains": "text present only when the bug occurs", "expectedContains": "text present only when behavior is correct" }
+  (checks the body of the LAST matching "request" step response; pathPattern, method, and expectedContains are optional)
 { "type": "console_error", "contains": "substring of the expected error message" }
 { "type": "element_text", "selector": "css selector", "contains": "text shown when the bug occurs" }
+
+Assertion rules:
+- "console_error" and "element_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
+- Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
+- The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
 
 ${formatRepoEvidence(input)}
 `;

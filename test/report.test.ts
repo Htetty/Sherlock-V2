@@ -80,4 +80,14 @@ describe("redactSecrets", () => {
 
     expect(redactSecrets(text)).toBe(text);
   });
+
+  test("keeps benign env vars like PORT visible in startup diagnostics", () => {
+    const text =
+      "Attempted command: PORT=59743 npm start\nStartup env: NODE_ENV=production DATABASE_URL=postgres://u:p@h/db";
+    const redacted = redactSecrets(text);
+
+    expect(redacted).toContain("PORT=59743");
+    expect(redacted).toContain("NODE_ENV=production");
+    expect(redacted).toContain("DATABASE_URL=[REDACTED]");
+  });
 });

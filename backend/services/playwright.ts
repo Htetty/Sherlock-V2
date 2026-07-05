@@ -219,6 +219,10 @@ export async function executeReproductionPlan(
           case "screenshot":
             record.screenshot = await saveScreenshot(page, store, result, step.id);
             break;
+          case "wait":
+            // Bounded by plan validation; lets async server work settle.
+            await page.waitForTimeout(step.ms);
+            break;
           case "request": {
             const url = new URL(step.path, plan.baseUrl).toString();
             const response = await page.request.fetch(url, {
@@ -350,6 +354,47 @@ async function evaluateAssertion(
         detail: match
           ? `Console/page error contained "${assertion.contains}".`
           : `No console/page error contained "${assertion.contains}".`,
+      };
+    }
+    case "response_body": {
+      const matches = result.apiResponses.filter((response) => {
+        if (assertion.method && response.method !== assertion.method) {
+          return false;
+        }
+
+        if (assertion.pathPattern && !response.url.includes(assertion.pathPattern)) {
+          return false;
+        }
+
+        return true;
+      });
+
+      const lastMatch = matches[matches.length - 1];
+
+      if (!lastMatch) {
+        return {
+          assertion,
+          observed: null,
+          matchedFailure: false,
+          matchedExpected: false,
+          detail:
+            "No API response from a request step matched the assertion filter.",
+        };
+      }
+
+      const matchedFailure = lastMatch.body.includes(assertion.failureContains);
+      const matchedExpected = assertion.expectedContains
+        ? lastMatch.body.includes(assertion.expectedContains) && !matchedFailure
+        : !matchedFailure;
+
+      return {
+        assertion,
+        observed: lastMatch.body.slice(0, 500),
+        matchedFailure,
+        matchedExpected,
+        detail: matchedFailure
+          ? `${lastMatch.method} ${lastMatch.url} response body contained "${assertion.failureContains}".`
+          : `${lastMatch.method} ${lastMatch.url} response body did not contain "${assertion.failureContains}".`,
       };
     }
     case "element_text": {

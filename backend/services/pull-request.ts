@@ -518,6 +518,8 @@ function describeStep(step: ReproductionPlan["steps"][number]) {
       return `wait for ${step.selector}`;
     case "screenshot":
       return "screenshot";
+    case "wait":
+      return `wait ${step.ms}ms`;
     case "request":
       return `${step.method} ${step.path}`;
   }

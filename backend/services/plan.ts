@@ -12,6 +12,9 @@ export type ReproductionStep =
   | { id: string; action: "fill"; selector: string; value: string }
   | { id: string; action: "waitForSelector"; selector: string }
   | { id: string; action: "screenshot" }
+  // Bounded pause so plans can let asynchronous work (queued jobs, debounced
+  // saves) settle before checking state.
+  | { id: string; action: "wait"; ms: number }
   | {
       id: string;
       action: "request";
@@ -37,6 +40,17 @@ export type PlanAssertion =
       type: "element_text";
       selector: string;
       contains: string;
+    }
+  // Substring check against the body of the last matching API response from
+  // a "request" step. The failure condition matches when the body contains
+  // failureContains; expectedContains (optional) confirms correct behavior,
+  // otherwise the absence of failureContains counts as expected.
+  | {
+      type: "response_body";
+      pathPattern?: string;
+      method?: HttpMethod;
+      failureContains: string;
+      expectedContains?: string;
     };
 
 export type ReproductionPlan = {
@@ -53,6 +67,12 @@ export type PlanValidationResult =
   | { ok: false; errors: string[] };
 
 const MAX_STEPS = 30;
+const MAX_WAIT_MS = 10_000;
+
+// Steps that drive a real browser page. Assertions that read browser state
+// (console errors, element text) are vacuous without at least one of these.
+const BROWSER_ACTIONS = new Set(["goto", "click", "fill", "waitForSelector"]);
+const BROWSER_ONLY_ASSERTIONS = new Set(["console_error", "element_text"]);
 
 export function validateReproductionPlan(value: unknown): PlanValidationResult {
   const errors: string[] = [];
@@ -108,6 +128,22 @@ export function validateReproductionPlan(value: unknown): PlanValidationResult {
 
   errors.push(...validateAssertion(plan.assertion));
 
+  // Vacuous-assertion guard: a browser-state assertion over a plan that never
+  // opens a page can only ever pass, which silently turns real bugs into
+  // false "not_reproduced" verdicts.
+  if (errors.length === 0) {
+    const assertionType = (plan.assertion as Record<string, unknown>).type as string;
+    const hasBrowserStep = (plan.steps as ReproductionStep[]).some((step) =>
+      BROWSER_ACTIONS.has(step.action),
+    );
+
+    if (BROWSER_ONLY_ASSERTIONS.has(assertionType) && !hasBrowserStep) {
+      errors.push(
+        `A "${assertionType}" assertion requires at least one browser step (goto, click, fill, waitForSelector); this plan only makes API requests. Use a "response_status" or "response_body" assertion instead.`,
+      );
+    }
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -160,6 +196,19 @@ function validateStep(value: unknown, index: number): string[] {
     case "screenshot":
       if (!hasOnlyKeys(step, ["id", "action"])) {
         return [`${label} (screenshot) must have only id and action.`];
+      }
+      return [];
+    case "wait":
+      if (
+        !hasOnlyKeys(step, ["id", "action", "ms"]) ||
+        typeof step.ms !== "number" ||
+        !Number.isInteger(step.ms) ||
+        step.ms < 1 ||
+        step.ms > MAX_WAIT_MS
+      ) {
+        return [
+          `${label} (wait) must have only id, action, and an integer ms between 1 and ${MAX_WAIT_MS}.`,
+        ];
       }
       return [];
     case "request":
@@ -223,6 +272,30 @@ function validateAssertion(value: unknown): string[] {
         !assertion.contains
       ) {
         return ["element_text assertion must have non-empty selector and contains strings."];
+      }
+      return [];
+    case "response_body":
+      if (
+        !hasOnlyKeys(assertion, [
+          "type",
+          "pathPattern",
+          "method",
+          "failureContains",
+          "expectedContains",
+        ]) ||
+        typeof assertion.failureContains !== "string" ||
+        !assertion.failureContains ||
+        (assertion.pathPattern !== undefined && typeof assertion.pathPattern !== "string") ||
+        (assertion.method !== undefined && !isHttpMethod(assertion.method)) ||
+        (assertion.expectedContains !== undefined &&
+          (typeof assertion.expectedContains !== "string" || !assertion.expectedContains))
+      ) {
+        return [
+          "response_body assertion must have a non-empty string failureContains, optional string pathPattern, optional HTTP method, and optional non-empty expectedContains.",
+        ];
+      }
+      if (assertion.failureContains === assertion.expectedContains) {
+        return ["response_body assertion failureContains and expectedContains must differ."];
       }
       return [];
     default:

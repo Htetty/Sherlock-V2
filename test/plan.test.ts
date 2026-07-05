@@ -61,6 +61,81 @@ describe("validateReproductionPlan", () => {
     expect(result.ok).toBe(false);
   });
 
+  test("rejects browser-state assertions on plans with no browser steps", () => {
+    // A console_error assertion over a pure-API plan can only ever pass:
+    // no page is loaded, so no console error can be observed (the false
+    // not_reproduced from investigation inv_1JSNU471PMDETKX).
+    const apiOnlyPlan = {
+      ...validPlan,
+      steps: [
+        { id: "step-1", action: "request", method: "POST", path: "/tasks", body: { title: "A" } },
+        { id: "step-2", action: "request", method: "GET", path: "/tasks" },
+      ],
+      assertion: { type: "console_error", contains: "Archive job" },
+    };
+
+    const rejected = validateReproductionPlan(apiOnlyPlan);
+    expect(rejected.ok).toBe(false);
+
+    if (!rejected.ok) {
+      expect(rejected.errors.join(" ")).toContain("requires at least one browser step");
+    }
+
+    // The same assertion is fine once the plan actually opens a page.
+    const withBrowserStep = validateReproductionPlan({
+      ...apiOnlyPlan,
+      steps: [{ id: "step-0", action: "goto", path: "/" }, ...apiOnlyPlan.steps],
+    });
+    expect(withBrowserStep.ok).toBe(true);
+  });
+
+  test("validates wait steps and their bounds", () => {
+    const withWait = validateReproductionPlan({
+      ...validPlan,
+      steps: [...validPlan.steps, { id: "step-6", action: "wait", ms: 2_000 }],
+    });
+    expect(withWait.ok).toBe(true);
+
+    for (const ms of [0, -5, 10_001, 1.5, "2000"]) {
+      const result = validateReproductionPlan({
+        ...validPlan,
+        steps: [...validPlan.steps, { id: "step-6", action: "wait", ms }],
+      });
+
+      expect(result.ok).toBe(false);
+
+      if (!result.ok) {
+        expect(result.errors.join(" ")).toContain("(wait)");
+      }
+    }
+  });
+
+  test("validates response_body assertions", () => {
+    const valid = validateReproductionPlan({
+      ...validPlan,
+      assertion: {
+        type: "response_body",
+        pathPattern: "/tasks",
+        method: "GET",
+        failureContains: '"completed":true',
+        expectedContains: '"tasks"',
+      },
+    });
+    expect(valid.ok).toBe(true);
+
+    const missingFailure = validateReproductionPlan({
+      ...validPlan,
+      assertion: { type: "response_body", pathPattern: "/tasks" },
+    });
+    expect(missingFailure.ok).toBe(false);
+
+    const sameValues = validateReproductionPlan({
+      ...validPlan,
+      assertion: { type: "response_body", failureContains: "x", expectedContains: "x" },
+    });
+    expect(sameValues.ok).toBe(false);
+  });
+
   test("rejects a plan with duplicate step ids", () => {
     const result = validateReproductionPlan({
       ...validPlan,

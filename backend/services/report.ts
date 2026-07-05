@@ -25,6 +25,10 @@ export type InvestigationSummary = {
 };
 
 const MAX_ERROR_CHARS = 300;
+// Environment/startup errors carry multi-line diagnostics (attempted command,
+// stdout/stderr tails); clipping them at MAX_ERROR_CHARS hid exactly the part
+// needed to debug a failed startup.
+const MAX_DIAGNOSTIC_ERROR_CHARS = 1_600;
 const MAX_COMMENT_CHARS = 3_000;
 
 const OUTCOME_HEADLINES: Record<InvestigationOutcome, string> = {
@@ -60,7 +64,7 @@ export function formatResultComment(summary: InvestigationSummary): string {
   }
 
   if (summary.error) {
-    lines.push(`Error: ${truncate(summary.error, MAX_ERROR_CHARS)}`);
+    lines.push(`Error: ${truncate(summary.error, MAX_DIAGNOSTIC_ERROR_CHARS)}`);
   }
 
   if (summary.planErrors && summary.planErrors.length > 0) {
@@ -82,6 +86,10 @@ export function formatResultComment(summary: InvestigationSummary): string {
   return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
 }
 
+// Env vars whose values are inherently non-sensitive; everything else in
+// NAME=value form is redacted. Keep this list small and obviously safe.
+const BENIGN_ENV_VARS = new Set(["PORT", "HOST", "HOSTNAME", "NODE_ENV"]);
+
 // Best-effort scrubbing of secret-shaped content from text that will be
 // posted publicly or saved into shareable summaries.
 export function redactSecrets(text: string): string {
@@ -95,7 +103,11 @@ export function redactSecrets(text: string): string {
         "$1$2[REDACTED]",
       )
       // SCREAMING_SNAKE env-style assignments (e.g. DATABASE_URL=postgres://...)
-      .replace(/\b([A-Z][A-Z0-9_]{2,})=(\S+)/g, "$1=[REDACTED]")
+      // except a short allowlist of values that are never secrets and are
+      // needed for diagnostics (e.g. "Attempted command: PORT=59743 npm start")
+      .replace(/\b([A-Z][A-Z0-9_]{2,})=(\S+)/g, (match, name: string) =>
+        BENIGN_ENV_VARS.has(name) ? match : `${name}=[REDACTED]`,
+      )
       // credentials embedded in URLs
       .replace(/\b([a-z][a-z0-9+.-]*:\/\/[^:/\s@]+):[^@\s]+@/gi, "$1:[REDACTED]@")
       // well-known token prefixes
