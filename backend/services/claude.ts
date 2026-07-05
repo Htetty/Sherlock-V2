@@ -4,11 +4,15 @@ import { REPRODUCTION_PLAN_VERSION, type ReproductionPlan } from "./plan.js";
 import {
   FIX_PROPOSAL_VERSION,
   PATCH_LIMITS,
+  extractFixProposalJson,
   requestValidProposal,
 } from "./fix-proposal.js";
+import type { GraphContext } from "./graphContext.js";
 import type { ReproductionResult } from "./playwright.js";
 
 const client = new Anthropic();
+
+const MODEL = "claude-sonnet-4-6";
 
 export type AnalyzeIssueInput = {
   issueTitle: string;
@@ -42,8 +46,17 @@ export type GeneratedPlan = {
   attempts?: { rawText: string; error: string | null }[];
 };
 
+// Graph/memory context threading (docs/fable/07 + 08). Both optional so the
+// pipeline degrades gracefully when graphify is unavailable or memory is
+// empty. When graphContext is available the caller passes graph-hydrated
+// files as `sourceFiles`, so formatRepoEvidence needs no changes.
+export type PlanGenerationInput = RepoEvidenceInput & {
+  graphContext?: GraphContext | null;
+  pastInvestigations?: string;
+};
+
 export async function generateReproductionPlan(
-  input: RepoEvidenceInput,
+  input: PlanGenerationInput,
 ): Promise<GeneratedPlan> {
   const prompt = `
 You are creating a deterministic browser reproduction plan for a GitHub issue.
@@ -56,8 +69,8 @@ The JSON must match this exact shape:
   "baseUrl": "${input.sandboxResult.baseUrl}",
   "steps": [
     { "id": "step-1", "action": "goto", "path": "/" },
-    { "id": "step-2", "action": "fill", "selector": "...", "value": "..." },
-    { "id": "step-3", "action": "click", "selector": "..." },
+    { "id": "step-2", "action": "fill", "target": { "label": "Email" }, "value": "test@example.com" },
+    { "id": "step-3", "action": "click", "target": { "role": "button", "name": "Sign in" } },
     { "id": "step-4", "action": "request", "method": "POST", "path": "/api/path", "body": { "key": "value" } }
   ],
   "expectedBehavior": "one sentence describing correct behavior",
@@ -69,7 +82,21 @@ Supported step actions: goto, click, fill, waitForSelector, screenshot, wait, re
 Every step must have a unique string "id".
 "goto" and "request" paths must be relative and start with "/".
 Do not put method or body on "goto".
-Use stable CSS selectors visible in the provided source code when possible.
+
+Targets describe USER INTENT, never CSS selectors. A target is an object with
+one or more of: role, name, label, placeholder, text, testId, id. Values must
+be strings that appear in the provided source code or page evidence.
+Every target must resolve to exactly ONE element; execution runs in strict
+mode and multiple matches fail the step. Never target generic words that
+appear in buttons, filters, or headings (e.g. "Completed", "Active", "All").
+Target key rules:
+- "testId" is ONLY for data-testid attribute values. An HTML id attribute is
+  NOT a testId - use "id" for id="..." attributes.
+- For form fields, prefer "label" (the visible label text) or "placeholder";
+  these match how a user identifies the field.
+- Preference order: testId (when data-testid exists), then role+name, then
+  label/placeholder, then id, then unique text.
+
 Use "request" for API endpoints or server routes that are not reachable through visible page controls.
 Use { "id": "...", "action": "wait", "ms": 2000 } (max 10000) after triggering asynchronous work.
 IMPORTANT: if an endpoint runs work asynchronously (returns 202, "queued", a job id, or schedules a background job), insert a "wait" step long enough for the job to finish BEFORE the step that checks the resulting state; otherwise the check races the job and the bug cannot be observed.
@@ -81,44 +108,65 @@ The "assertion" describes how to detect the reported failure. It must be exactly
 { "type": "response_body", "pathPattern": "/api/path", "method": "GET", "failureContains": "text present only when the bug occurs", "expectedContains": "text present only when behavior is correct" }
   (checks the body of the LAST matching "request" step response; pathPattern, method, and expectedContains are optional)
 { "type": "console_error", "contains": "substring of the expected error message" }
-{ "type": "element_text", "selector": "css selector", "contains": "text shown when the bug occurs" }
+{ "type": "element_text", "target": { "text": "unique text of the element" }, "contains": "text shown when the bug occurs" }
 
 Assertion rules:
 - "console_error" and "element_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
+- "element_text" targets must resolve to exactly one element; target the specific content in question (e.g. the exact task title), never a shared word.
 - Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
 - The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
+${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}
+Grounding rules:
+- Only reference files, routes, components, and UI strings that appear in the
+  evidence below. If it is not in the evidence, it does not exist.
+- If the evidence does not prove a route, element, or user flow exists, use
+  the closest grounded plan instead of inventing one.
 
 ${formatRepoEvidence(input)}
 `;
 
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1_000,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
+  // Same retry-once contract as fix proposals: a malformed response is fed
+  // back with the extraction error so the model can correct its format.
+  const result = await requestValidProposal(async (retryError) => {
+    const finalPrompt =
+      retryError === null
+        ? prompt
+        : `${prompt}
+
+Your previous response was rejected because it was not a valid reproduction plan: ${retryError}
+
+Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, reasoning, or any text before or after the JSON object.`;
+
+    const message = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2_500,
+      temperature: 0,
+      messages: [
+        {
+          role: "user",
+          content: finalPrompt,
+        },
+      ],
+    });
+
+    return getTextContent(message.content);
   });
 
-  const rawText = getTextContent(message.content);
+  const lastAttempt = result.attempts[result.attempts.length - 1];
 
-  try {
-    return { rawText, parsed: JSON.parse(rawText) as unknown, parseError: null };
-  } catch (error) {
-    return {
-      rawText,
-      parsed: null,
-      parseError: `Claude did not return valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
+  return {
+    rawText: lastAttempt?.rawText ?? "",
+    parsed: result.proposal,
+    parseError: result.parseError,
+    attempts: result.attempts,
+  };
 }
 
 export type FixProposalInput = RepoEvidenceInput & {
   commit: string;
   plan: ReproductionPlan;
   reproductionResult: ReproductionResult;
+  graphContext?: GraphContext | null;
 };
 
 export async function generateFixProposal(
@@ -155,6 +203,9 @@ Rules:
 - Never touch .env files, keys, lockfiles, GitHub workflows, or deployment configuration.
 - relevantTests must be plain npm/npx/node commands (no shell operators). Use the smallest relevant project test command; use an empty array if the repository has no runnable tests.
 - Do not create new files.
+- Do not change UI text, roles, labels, or testids that the reproduction plan targets - verification replays the same plan after the patch, and changing those strings breaks it.
+- Fix the root cause, not the symptom. Walk the graph context (when present) from the touched element to its handler to its route; the bug is on that path.
+- If graph context is present, ground your rootCause in it: cite the file and function the graph points to.
 
 Repository commit: ${input.commit}
 
@@ -171,7 +222,7 @@ Failed network requests:
 ${input.reproductionResult.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join("\n") || "(none)"}
 API responses:
 ${input.reproductionResult.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}\n${response.body}`).join("\n\n") || "(none)"}
-
+${formatGraphSection(input.graphContext, "refined by reproduction evidence")}
 ${formatRepoEvidence(input)}
 `;
 
@@ -189,8 +240,9 @@ Your previous response was rejected because it was not a valid fix proposal: ${r
 Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, explanations, or any text before or after the JSON object.`;
 
     const message = await client.messages.create({
-      model: "claude-sonnet-4-6",
+      model: MODEL,
       max_tokens: 2_000,
+      temperature: 0,
       messages: [
         {
           role: "user",
@@ -251,7 +303,7 @@ Provide:
 `;
 
   const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: MODEL,
     max_tokens: 500,
     messages: [
       {
@@ -262,6 +314,156 @@ Provide:
   });
 
   return message.content[0];
+}
+
+// --- Memory reflection (docs/fable/08) ---
+// Distills an investigation into actionable lessons for future runs.
+
+export type MemoryReflection = {
+  issueTerms: string[];
+  rootCause: string;
+  whatWorked: string;
+  whatFailed: string;
+};
+
+export async function generateMemoryReflection(input: {
+  issueTitle: string;
+  issueBody: string;
+  outcome: string;
+  intentPlanJson: string;
+  browserErrors: string[];
+  analysisText: string;
+  patchedFiles: string[];
+}): Promise<MemoryReflection> {
+  const prompt = `You are recording the outcome of an automated bug investigation so future
+investigations of this repository start smarter.
+
+Return ONLY valid JSON matching the schema at the end.
+
+## What happened
+
+Issue title: ${input.issueTitle}
+Issue body: ${input.issueBody || "(empty)"}
+Outcome: ${input.outcome}
+Reproduction plan executed: ${input.intentPlanJson}
+Browser errors/evidence:
+${input.browserErrors.join("\n") || "(none)"}
+Root cause analysis:
+${input.analysisText || "(none)"}
+Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
+
+## Rules
+
+1. "whatWorked" and "whatFailed" must be lessons a future investigator can
+   act on (reproduction ordering, which functions mattered, misleading
+   evidence) - not a summary of the bug.
+2. Keep every field under 40 words. issueTerms: 3-8 lowercase keywords a
+   future similar issue would likely contain.
+3. If the outcome was not verified, "whatFailed" is required and must name
+   the step that failed and why.
+4. Record only what the evidence shows. No speculation.
+
+## Output schema
+
+{
+  "issueTerms": ["..."],
+  "rootCause": "one sentence, cite file and function",
+  "whatWorked": "actionable lesson, or empty string",
+  "whatFailed": "actionable lesson, or empty string"
+}`;
+
+  const message = await client.messages.create({
+    model: MODEL,
+    max_tokens: 400,
+    temperature: 0,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  const extracted = extractFixProposalJson(getTextContent(message.content));
+
+  if (!extracted.ok) {
+    throw new Error(`Claude returned an invalid memory reflection: ${extracted.error}`);
+  }
+
+  if (!isMemoryReflection(extracted.value)) {
+    throw new Error("Claude returned a memory reflection with an invalid shape.");
+  }
+
+  return extracted.value;
+}
+
+function isMemoryReflection(value: unknown): value is MemoryReflection {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const reflection = value as MemoryReflection;
+
+  return (
+    Array.isArray(reflection.issueTerms) &&
+    reflection.issueTerms.every((term) => typeof term === "string") &&
+    typeof reflection.rootCause === "string" &&
+    typeof reflection.whatWorked === "string" &&
+    typeof reflection.whatFailed === "string"
+  );
+}
+
+// --- Prompt sections -------------------------------------------------------
+
+function formatGraphSection(
+  graphContext: GraphContext | null | undefined,
+  label = "",
+): string {
+  if (!graphContext?.available) {
+    return "";
+  }
+
+  const heading = label ? `GRAPH CONTEXT (${label})` : "GRAPH CONTEXT";
+
+  return `
+${heading}:
+
+A knowledge graph built by static AST analysis of this repository. NODE lines
+are real code entities with real file paths and line numbers. EDGE relations:
+imports_from, contains, method, calls, uses, inherits. Confidence tags:
+EXTRACTED = stated in source, treat as ground truth. INFERRED = deduced,
+trust cautiously. AMBIGUOUS = never rely on alone.
+
+NODES:
+${graphContext.graphNodes || "(none)"}
+
+EDGES:
+${graphContext.graphEdges || "(none)"}
+`;
+}
+
+function formatPastSection(pastInvestigations: string | undefined): string {
+  if (!pastInvestigations) {
+    return "";
+  }
+
+  return `
+PAST INVESTIGATIONS (this repo):
+
+Previous issues Sherlock investigated here, with outcomes:
+
+${pastInvestigations}
+
+How to use these:
+- Treat "verified" entries as strong hints about where similar bugs live and
+  what reproduction steps work in this app.
+- Treat "blocked"/"failed" entries as warnings: the listed approach did not
+  work - do not repeat it unchanged.
+- An entry marked STALE means the code changed since that fix. Use it as a
+  starting point only; re-verify against the current evidence.
+- Past investigations are hints, not evidence. The grounding rules still
+  apply: never reference code that is not in the current evidence.
+`;
 }
 
 function formatRepoEvidence(input: RepoEvidenceInput) {

@@ -1,10 +1,20 @@
 // Deterministic execution of a validated, saved reproduction plan.
 // This module must stay free of Claude/Anthropic imports so saved plans can be
 // replayed without any Claude dependency.
+//
+// Merge note: steps and element_text assertions accept either a raw CSS
+// selector (dev replay compatibility) or an intent-level target
+// (docs/fable/07). Targets resolve through Playwright's strict-mode
+// user-facing locators: zero or multiple matches throw, so the step fails
+// with `ambiguous` recorded instead of acting on the wrong element.
 
 import path from "node:path";
-import { chromium, type Page } from "playwright";
-import type { PlanAssertion, ReproductionPlan } from "./plan.js";
+import { chromium, type Locator, type Page } from "playwright";
+import type {
+  DomTargetIntent,
+  PlanAssertion,
+  ReproductionPlan,
+} from "./plan.js";
 import type { ArtifactStore } from "./artifacts.js";
 
 const STEP_TIMEOUT_MS = 10_000;
@@ -22,6 +32,9 @@ export type StepRecord = {
   finishedAt: string | null;
   outcome: StepOutcome;
   error: string | null;
+  // True when the failure was a strict-mode violation (target matched
+  // multiple elements) - a plan defect, not evidence about the bug.
+  ambiguous: boolean;
   screenshot: string | null;
 };
 
@@ -98,6 +111,7 @@ export async function executeReproductionPlan(
     finishedAt: null,
     outcome: "skipped",
     error: null,
+    ambiguous: false,
     screenshot: null,
   }));
 
@@ -207,14 +221,33 @@ export async function executeReproductionPlan(
             });
             break;
           case "click":
-            await page.click(step.selector);
+            if ("selector" in step) {
+              await page.click(step.selector);
+            } else {
+              await resolveTarget(page, step.target).click({
+                timeout: STEP_TIMEOUT_MS,
+              });
+            }
             await waitForPageToSettle(page);
             break;
           case "fill":
-            await page.fill(step.selector, step.value);
+            if ("selector" in step) {
+              await page.fill(step.selector, step.value);
+            } else {
+              await resolveTarget(page, step.target).fill(step.value, {
+                timeout: STEP_TIMEOUT_MS,
+              });
+            }
             break;
           case "waitForSelector":
-            await page.waitForSelector(step.selector);
+            if ("selector" in step) {
+              await page.waitForSelector(step.selector);
+            } else {
+              await resolveTarget(page, step.target).waitFor({
+                state: "visible",
+                timeout: STEP_TIMEOUT_MS,
+              });
+            }
             break;
           case "screenshot":
             record.screenshot = await saveScreenshot(page, store, result, step.id);
@@ -256,6 +289,21 @@ export async function executeReproductionPlan(
       } catch (error) {
         record.outcome = "failed";
         record.error = formatError(error);
+        record.ambiguous = record.error.includes("strict mode violation");
+
+        // Explain WHY an intent target failed: per-key match counts plus
+        // hints for common mistakes (e.g. HTML id passed as testId).
+        if ("target" in step) {
+          const diagnostics = await describeTargetDiagnostics(
+            page,
+            step.target,
+          ).catch(() => "");
+
+          if (diagnostics) {
+            record.error = `${record.error}\nTarget diagnostics: ${diagnostics}`;
+          }
+        }
+
         record.screenshot = await saveScreenshot(
           page,
           store,
@@ -278,7 +326,9 @@ export async function executeReproductionPlan(
 
     if (failedStep) {
       result.outcome = "execution_failed";
-      result.outcomeReason = `Step "${failedStep.id}" (${failedStep.action}) failed: ${failedStep.error}`;
+      result.outcomeReason = failedStep.ambiguous
+        ? `Step "${failedStep.id}" (${failedStep.action}) was blocked: its target matched multiple elements (plan defect, no action taken): ${failedStep.error}`
+        : `Step "${failedStep.id}" (${failedStep.action}) failed: ${failedStep.error}`;
     } else {
       result.assertion = await evaluateAssertion(plan.assertion, result, page);
 
@@ -301,6 +351,118 @@ export async function executeReproductionPlan(
   }
 
   return result;
+}
+
+// Strict-mode resolution of an intent target. Priority mirrors
+// docs/fable/07: testId, then role(+name), then label, placeholder, text,
+// then bare name as a button. No `.first()` anywhere - ambiguity must throw.
+function resolveTarget(page: Page, target: DomTargetIntent): Locator {
+  if (target.testId) {
+    return page.getByTestId(target.testId);
+  }
+
+  if (target.id) {
+    return page.locator(`#${target.id}`);
+  }
+
+  if (target.role) {
+    return page.getByRole(target.role as Parameters<Page["getByRole"]>[0], {
+      name: target.name,
+      exact: false,
+    });
+  }
+
+  if (target.label) {
+    return page.getByLabel(target.label);
+  }
+
+  if (target.placeholder) {
+    return page.getByPlaceholder(target.placeholder);
+  }
+
+  if (target.text) {
+    return page.getByText(target.text);
+  }
+
+  if (target.name) {
+    return page.getByRole("button", { name: target.name });
+  }
+
+  throw new Error(`Intent target has no usable keys: ${JSON.stringify(target)}`);
+}
+
+// Per-key match counts for a failed target, plus cross-checks for the two
+// most common model mistakes: an HTML id passed as testId, and vice versa.
+async function describeTargetDiagnostics(
+  page: Page,
+  target: DomTargetIntent,
+): Promise<string> {
+  const probes: { label: string; locator: Locator }[] = [];
+
+  if (target.testId) {
+    probes.push({
+      label: `testId="${target.testId}"`,
+      locator: page.getByTestId(target.testId),
+    });
+  }
+
+  if (target.id) {
+    probes.push({ label: `id="${target.id}"`, locator: page.locator(`#${target.id}`) });
+  }
+
+  if (target.role) {
+    probes.push({
+      label: `role="${target.role}"${target.name ? ` name="${target.name}"` : ""}`,
+      locator: page.getByRole(target.role as Parameters<Page["getByRole"]>[0], {
+        name: target.name,
+      }),
+    });
+  }
+
+  if (target.label) {
+    probes.push({ label: `label="${target.label}"`, locator: page.getByLabel(target.label) });
+  }
+
+  if (target.placeholder) {
+    probes.push({
+      label: `placeholder="${target.placeholder}"`,
+      locator: page.getByPlaceholder(target.placeholder),
+    });
+  }
+
+  if (target.text) {
+    probes.push({ label: `text="${target.text}"`, locator: page.getByText(target.text) });
+  }
+
+  const parts: string[] = [];
+
+  for (const probe of probes) {
+    const count = await probe.locator.count().catch(() => -1);
+    parts.push(`${probe.label} -> ${count} match(es)`);
+  }
+
+  // Cross-checks for misclassified identifiers.
+  if (target.testId) {
+    const asId = await page.locator(`#${target.testId}`).count().catch(() => 0);
+
+    if (asId > 0) {
+      parts.push(
+        `note: an element with HTML id="${target.testId}" exists (${asId} match(es)); testId means the data-testid attribute - use { "id": "${target.testId}" } instead`,
+      );
+    }
+  }
+
+  if (target.id) {
+    const asTestId = await page.getByTestId(target.id).count().catch(() => 0);
+
+    if (asTestId > 0) {
+      parts.push(
+        `note: an element with data-testid="${target.id}" exists (${asTestId} match(es)); use { "testId": "${target.id}" } instead`,
+      );
+    }
+  }
+
+  return parts.join("; ");
 }
 
 async function evaluateAssertion(
@@ -398,9 +560,19 @@ async function evaluateAssertion(
       };
     }
     case "element_text": {
-      const text = await page
-        .textContent(assertion.selector, { timeout: STEP_TIMEOUT_MS })
-        .catch(() => null);
+      const targetLabel =
+        "selector" in assertion
+          ? `"${assertion.selector}"`
+          : JSON.stringify(assertion.target);
+
+      const text =
+        "selector" in assertion
+          ? await page
+              .textContent(assertion.selector, { timeout: STEP_TIMEOUT_MS })
+              .catch(() => null)
+          : await resolveTarget(page, assertion.target)
+              .textContent({ timeout: STEP_TIMEOUT_MS })
+              .catch(() => null);
 
       if (text === null) {
         return {
@@ -408,7 +580,7 @@ async function evaluateAssertion(
           observed: null,
           matchedFailure: false,
           matchedExpected: false,
-          detail: `Element "${assertion.selector}" was not found.`,
+          detail: `Element ${targetLabel} was not found (or did not resolve to exactly one element).`,
         };
       }
 
@@ -420,8 +592,8 @@ async function evaluateAssertion(
         matchedFailure: matched,
         matchedExpected: !matched,
         detail: matched
-          ? `Element "${assertion.selector}" contained "${assertion.contains}".`
-          : `Element "${assertion.selector}" did not contain "${assertion.contains}".`,
+          ? `Element ${targetLabel} contained "${assertion.contains}".`
+          : `Element ${targetLabel} did not contain "${assertion.contains}".`,
       };
     }
   }

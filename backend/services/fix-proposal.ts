@@ -65,14 +65,26 @@ export type ProposalExtractionResult =
 export function extractFixProposalJson(rawText: string): ProposalExtractionResult {
   const trimmed = rawText.trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = (fenced ? fenced[1] : trimmed).trim();
+  let candidate = (fenced ? fenced[1] : trimmed).trim();
 
   if (!candidate.startsWith("{")) {
-    return {
-      ok: false,
-      error:
-        'Response must be a single top-level JSON object starting with "{" — not prose, an array, a primitive, or a JSON-encoded string.',
-    };
+    // Recovery for the common "reasoning prose, then the object" failure.
+    // Deliberately NOT applied to arrays ("[") or JSON-encoded strings ('"')
+    // - those are format violations, not prose, and stay rejected.
+    const recoverable =
+      !candidate.startsWith("[") && !candidate.startsWith('"')
+        ? findBalancedObject(candidate)
+        : null;
+
+    if (recoverable === null) {
+      return {
+        ok: false,
+        error:
+          'Response must be a single top-level JSON object starting with "{" — not prose, an array, a primitive, or a JSON-encoded string.',
+      };
+    }
+
+    candidate = recoverable;
   }
 
   let parsed: unknown;
@@ -94,6 +106,49 @@ export function extractFixProposalJson(rawText: string): ProposalExtractionResul
   }
 
   return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+// Finds the first balanced top-level {...} in text, respecting JSON string
+// literals and escapes. Returns null when no balanced object exists.
+function findBalancedObject(text: string): string | null {
+  const start = text.indexOf("{");
+
+  if (start === -1) {
+    return null;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === '"') {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
 }
 
 export type ProposalAttempt = {

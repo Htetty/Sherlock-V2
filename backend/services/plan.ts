@@ -6,11 +6,31 @@ export const REPRODUCTION_PLAN_VERSION = 1;
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
+// Intent-level target (docs/fable/07): describes the element the way a user
+// sees it. Resolved via Playwright's strict-mode user-facing locators, so
+// zero or multiple matches fail the step instead of guessing. The model-facing
+// prompt only teaches targets; raw selectors remain valid for saved-plan
+// replay compatibility.
+export type DomTargetIntent = {
+  role?: string;
+  name?: string;
+  label?: string;
+  placeholder?: string;
+  text?: string;
+  // data-testid attribute value (NOT the HTML id attribute).
+  testId?: string;
+  // HTML id attribute value.
+  id?: string;
+};
+
 export type ReproductionStep =
   | { id: string; action: "goto"; path: string }
   | { id: string; action: "click"; selector: string }
+  | { id: string; action: "click"; target: DomTargetIntent }
   | { id: string; action: "fill"; selector: string; value: string }
+  | { id: string; action: "fill"; target: DomTargetIntent; value: string }
   | { id: string; action: "waitForSelector"; selector: string }
+  | { id: string; action: "waitForSelector"; target: DomTargetIntent }
   | { id: string; action: "screenshot" }
   // Bounded pause so plans can let asynchronous work (queued jobs, debounced
   // saves) settle before checking state.
@@ -39,6 +59,11 @@ export type PlanAssertion =
   | {
       type: "element_text";
       selector: string;
+      contains: string;
+    }
+  | {
+      type: "element_text";
+      target: DomTargetIntent;
       contains: string;
     }
   // Substring check against the body of the last matching API response from
@@ -174,25 +199,40 @@ function validateStep(value: unknown, index: number): string[] {
       }
       return [];
     case "click":
-    case "waitForSelector":
-      if (
-        !hasOnlyKeys(step, ["id", "action", "selector"]) ||
-        typeof step.selector !== "string" ||
-        !step.selector
-      ) {
-        return [`${label} (${step.action}) must have only id, action, and a non-empty selector.`];
+    case "waitForSelector": {
+      const bySelector =
+        hasOnlyKeys(step, ["id", "action", "selector"]) &&
+        typeof step.selector === "string" &&
+        !!step.selector;
+      const byTarget =
+        hasOnlyKeys(step, ["id", "action", "target"]) &&
+        isDomTargetIntent(step.target);
+
+      if (!bySelector && !byTarget) {
+        return [
+          `${label} (${step.action}) must have id, action, and either a non-empty selector or a valid target object (${TARGET_KEYS.join("/")}).`,
+        ];
       }
       return [];
-    case "fill":
-      if (
-        !hasOnlyKeys(step, ["id", "action", "selector", "value"]) ||
-        typeof step.selector !== "string" ||
-        !step.selector ||
-        typeof step.value !== "string"
-      ) {
-        return [`${label} (fill) must have only id, action, selector, and a string value.`];
+    }
+    case "fill": {
+      const bySelector =
+        hasOnlyKeys(step, ["id", "action", "selector", "value"]) &&
+        typeof step.selector === "string" &&
+        !!step.selector &&
+        typeof step.value === "string";
+      const byTarget =
+        hasOnlyKeys(step, ["id", "action", "target", "value"]) &&
+        isDomTargetIntent(step.target) &&
+        typeof step.value === "string";
+
+      if (!bySelector && !byTarget) {
+        return [
+          `${label} (fill) must have id, action, a string value, and either a non-empty selector or a valid target object (${TARGET_KEYS.join("/")}).`,
+        ];
       }
       return [];
+    }
     case "screenshot":
       if (!hasOnlyKeys(step, ["id", "action"])) {
         return [`${label} (screenshot) must have only id and action.`];
@@ -263,17 +303,26 @@ function validateAssertion(value: unknown): string[] {
         return ["console_error assertion must have a non-empty string contains."];
       }
       return [];
-    case "element_text":
+    case "element_text": {
+      const bySelector =
+        hasOnlyKeys(assertion, ["type", "selector", "contains"]) &&
+        typeof assertion.selector === "string" &&
+        !!assertion.selector;
+      const byTarget =
+        hasOnlyKeys(assertion, ["type", "target", "contains"]) &&
+        isDomTargetIntent(assertion.target);
+
       if (
-        !hasOnlyKeys(assertion, ["type", "selector", "contains"]) ||
-        typeof assertion.selector !== "string" ||
-        !assertion.selector ||
+        (!bySelector && !byTarget) ||
         typeof assertion.contains !== "string" ||
         !assertion.contains
       ) {
-        return ["element_text assertion must have non-empty selector and contains strings."];
+        return [
+          "element_text assertion must have a non-empty contains string and either a non-empty selector or a valid target object.",
+        ];
       }
       return [];
+    }
     case "response_body":
       if (
         !hasOnlyKeys(assertion, [
@@ -301,6 +350,31 @@ function validateAssertion(value: unknown): string[] {
     default:
       return [`Unsupported assertion type ${JSON.stringify(assertion.type)}.`];
   }
+}
+
+const TARGET_KEYS = [
+  "role",
+  "name",
+  "label",
+  "placeholder",
+  "text",
+  "testId",
+  "id",
+] as const;
+
+export function isDomTargetIntent(value: unknown): value is DomTargetIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  const target = value as Record<string, unknown>;
+  const keys = Object.keys(target);
+
+  return (
+    keys.length > 0 &&
+    keys.every((key) => (TARGET_KEYS as readonly string[]).includes(key)) &&
+    keys.every((key) => typeof target[key] === "string" && target[key] !== "")
+  );
 }
 
 function isSafeBaseUrl(value: string) {

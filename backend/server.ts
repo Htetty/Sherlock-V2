@@ -3,9 +3,19 @@ import cors from "cors";
 import {
   analyzeIssue,
   generateFixProposal,
+  generateMemoryReflection,
   generateReproductionPlan,
 } from "./services/claude.js";
 import { runFixAttempt, type FixAttemptResult } from "./services/fix.js";
+import { buildGraphContext, tokenize } from "./services/graphContext.js";
+import {
+  appendMemory,
+  hashRepoFiles,
+  loadMemory,
+  matchMemory,
+  renderPastInvestigations,
+  type MemoryOutcome,
+} from "./services/memory.js";
 import {
   createFixPullRequest,
   createGitHubRestClient,
@@ -24,7 +34,7 @@ import {
   executeReproductionPlan,
   type ReproductionResult,
 } from "./services/playwright.js";
-import { validateReproductionPlan } from "./services/plan.js";
+import { validateReproductionPlan, type ReproductionPlan } from "./services/plan.js";
 import {
   createArtifactStore,
   createInvestigationId,
@@ -97,6 +107,21 @@ app.post("/investigations", async (req, res) => {
     log(`Repository cloned to ${repoContext.repoPath} at ${repoContext.commit}`);
     investigationRecord.commit = repoContext.commit;
 
+    // --- Memory (docs/fable/08): past investigations of this repo ---------
+    const issueTerms = tokenize(
+      `${payload.issueTitle} ${payload.issueBody ?? ""}`,
+    );
+    const memoryEntries = await loadMemory(payload.repoUrl);
+    const pastEntries = matchMemory(memoryEntries, issueTerms);
+    const pastInvestigations = await renderPastInvestigations(
+      pastEntries,
+      repoContext.repoPath,
+    );
+
+    log(
+      `Memory: ${memoryEntries.length} stored entr${memoryEntries.length === 1 ? "y" : "ies"} for this repo; using top ${pastEntries.length} match(es).`,
+    );
+
     try {
       sandboxSession = await runSandboxInvestigation({
         repoPath: repoContext.repoPath,
@@ -112,6 +137,31 @@ app.post("/investigations", async (req, res) => {
 
     log(`Sandbox started at ${sandboxSession.result.baseUrl}`);
 
+    // --- Graph context (docs/fable/07): issue-specific repo context -------
+    const graphContext = await buildGraphContext({
+      repoPath: repoContext.repoPath,
+      repoUrl: payload.repoUrl,
+      commitSha: repoContext.commit,
+      issueTitle: payload.issueTitle,
+      issueBody: payload.issueBody ?? "",
+      boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
+    });
+
+    log(`Graph context: ${graphContext.notes}`);
+    await store.writeJson("repo-context.json", {
+      available: graphContext.available,
+      commitSha: graphContext.commitSha,
+      notes: graphContext.notes,
+      nodes: graphContext.graphNodes,
+      edges: graphContext.graphEdges,
+      hydratedFiles: graphContext.relevantFiles.map((file) => file.path),
+      pastInvestigations,
+    });
+
+    const contextSourceFiles = graphContext.available
+      ? graphContext.relevantFiles
+      : repoContext.sourceFiles;
+
     const generated = await generateReproductionPlan({
       issueTitle: payload.issueTitle,
       issueBody: payload.issueBody ?? "",
@@ -120,16 +170,28 @@ app.post("/investigations", async (req, res) => {
       fileTree: repoContext.fileTree,
       packageJson: repoContext.packageJson,
       readme: repoContext.readme,
-      sourceFiles: repoContext.sourceFiles,
+      sourceFiles: contextSourceFiles,
       sandboxResult: sandboxSession.result,
+      graphContext,
+      pastInvestigations,
     });
 
     await store.writeJson("reproduction-plan-raw.json", {
       rawText: generated.rawText,
       parseError: generated.parseError,
+      attempts: generated.attempts ?? [],
     });
 
+    for (const [index, attempt] of (generated.attempts ?? []).entries()) {
+      log(
+        `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+      );
+    }
+
     if (generated.parseError !== null) {
+      log(`Plan generation failed after all attempts: ${generated.parseError}`);
+      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+
       return await finishInvestigation(res, store, investigationRecord, {
         investigationId,
         outcome: "plan_failed",
@@ -140,7 +202,11 @@ app.post("/investigations", async (req, res) => {
     const validation = validateReproductionPlan(generated.parsed);
 
     if (!validation.ok) {
-      log(`Plan rejected: ${validation.errors.join(" | ")}`);
+      log(`Plan rejected by validator:`);
+      for (const validationError of validation.errors) {
+        log(`  - ${validationError}`);
+      }
+      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
 
       return await finishInvestigation(res, store, investigationRecord, {
         investigationId,
@@ -151,11 +217,38 @@ app.post("/investigations", async (req, res) => {
 
     const plan = validation.plan;
     await store.writeJson("reproduction-plan.json", plan);
-    log("Validated reproduction plan saved.");
+    log(`Validated plan: ${plan.steps.length} step(s), assertion ${plan.assertion.type}`);
+    for (const step of plan.steps) {
+      log(`  ${step.id}: ${describePlanStep(step)}`);
+    }
+    log(`  expectedBehavior: ${plan.expectedBehavior}`);
+    log(`  failureCondition: ${plan.failureCondition}`);
+    log(`  assertion: ${JSON.stringify(plan.assertion)}`);
 
     const result = await executeReproductionPlan(plan, store);
     await writeExecutionArtifacts(store, result);
-    log(`Plan executed with outcome: ${result.outcome}`);
+
+    log(`Plan executed with outcome: ${result.outcome} (${durationMs(result.startedAt, result.finishedAt)}ms)`);
+    for (const step of result.steps) {
+      const timing =
+        step.startedAt && step.finishedAt
+          ? ` ${durationMs(step.startedAt, step.finishedAt)}ms`
+          : "";
+      const detail = step.error
+        ? ` - ${step.ambiguous ? "AMBIGUOUS: " : ""}${firstLine(step.error)}`
+        : "";
+      log(`  ${step.id} [${step.outcome}${timing}]${detail}`);
+    }
+    if (result.assertion) {
+      log(
+        `  assertion: matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected}`,
+      );
+      log(`  assertion detail: ${result.assertion.detail}`);
+      log(`  observed: ${firstLine(result.assertion.observed ?? "(nothing)")}`);
+    }
+    log(
+      `  evidence: ${result.consoleErrors.length} console error(s), ${result.pageErrors.length} page error(s), ${result.networkFailures.length} network failure(s), ${result.apiResponses.length} api response(s), ${result.screenshots.length} screenshot(s)`,
+    );
 
     let claudeAnalysis: unknown = null;
 
@@ -168,7 +261,7 @@ app.post("/investigations", async (req, res) => {
         fileTree: repoContext.fileTree,
         packageJson: repoContext.packageJson,
         readme: repoContext.readme,
-        sourceFiles: repoContext.sourceFiles,
+        sourceFiles: contextSourceFiles,
         sandboxResult: sandboxSession.result,
         browserResult: result,
       }).catch((error: unknown) => {
@@ -184,6 +277,32 @@ app.post("/investigations", async (req, res) => {
 
     if (result.outcome === "reproduced") {
       try {
+        // Re-select the graph around reproduction evidence (docs/fable/09):
+        // by now we know which elements were touched and what failed.
+        const refineTerms = collectRefineTerms(plan, result);
+        log(
+          `Refine inputs (${refineTerms.length}): ${refineTerms.slice(0, 10).join(" | ").slice(0, 400)}`,
+        );
+
+        const refinedContext = await buildGraphContext({
+          repoPath: repoContext.repoPath,
+          repoUrl: payload.repoUrl,
+          commitSha: repoContext.commit,
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          boostFiles: pastEntries.flatMap((entry) => entry.patchedFiles),
+          extraTerms: refineTerms,
+        });
+
+        log(`Refined graph context: ${refinedContext.notes}`);
+        await store.writeJson("repo-context-refined.json", {
+          available: refinedContext.available,
+          notes: refinedContext.notes,
+          nodes: refinedContext.graphNodes,
+          edges: refinedContext.graphEdges,
+          hydratedFiles: refinedContext.relevantFiles.map((file) => file.path),
+        });
+
         const generatedFix = await generateFixProposal({
           issueTitle: payload.issueTitle,
           issueBody: payload.issueBody ?? "",
@@ -192,11 +311,14 @@ app.post("/investigations", async (req, res) => {
           fileTree: repoContext.fileTree,
           packageJson: repoContext.packageJson,
           readme: repoContext.readme,
-          sourceFiles: repoContext.sourceFiles,
+          sourceFiles: refinedContext.available
+            ? refinedContext.relevantFiles
+            : contextSourceFiles,
           sandboxResult: sandboxSession.result,
           commit: repoContext.commit,
           plan,
           reproductionResult: result,
+          graphContext: refinedContext,
         });
 
         // Sanitized raw model responses (every attempt) kept for debugging
@@ -209,6 +331,32 @@ app.post("/investigations", async (req, res) => {
             error: attempt.error,
           })),
         });
+
+        for (const [index, attempt] of (generatedFix.attempts ?? []).entries()) {
+          log(
+            `Fix proposal attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+          );
+        }
+
+        if (generatedFix.parseError !== null) {
+          log(`Fix proposal failed after all attempts: ${generatedFix.parseError}`);
+          log(
+            `Raw model response (first 600 chars):\n${redactSecrets(generatedFix.rawText.slice(0, 600))}`,
+          );
+        } else {
+          const proposal = generatedFix.parsed as Record<string, unknown>;
+          log(`Fix proposal parsed:`);
+          log(`  summary: ${String(proposal.summary ?? "(none)")}`);
+          log(`  rootCause: ${String(proposal.rootCause ?? "(none)")}`);
+          log(
+            `  confidence: ${String(proposal.confidence ?? "?")} | risk: ${String(proposal.risk ?? "?")}`,
+          );
+          if (Array.isArray(proposal.files)) {
+            for (const file of proposal.files as { path?: string; edits?: unknown[] }[]) {
+              log(`  file: ${file.path ?? "?"} (${file.edits?.length ?? 0} edit(s))`);
+            }
+          }
+        }
 
         const repoPath = repoContext.repoPath;
         const restart = async () => {
@@ -244,6 +392,21 @@ app.post("/investigations", async (req, res) => {
         });
 
         log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+        for (const item of fixAttempt.checks) {
+          log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
+        }
+        if (fixAttempt.reason) {
+          log(`  reason: ${fixAttempt.reason}`);
+        }
+        if (fixAttempt.changedFiles.length > 0) {
+          log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
+        }
+        if (fixAttempt.postPatchOutcome) {
+          log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+        }
+        for (const run of fixAttempt.testRuns) {
+          log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+        }
       } catch (error) {
         log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
       }
@@ -294,6 +457,51 @@ app.post("/investigations", async (req, res) => {
       }
     }
 
+    // --- Memory recording (docs/fable/08): always learn from the run ------
+    try {
+      const outcome = mapMemoryOutcome(result, fixAttempt);
+      const patchedFiles = fixAttempt?.changedFiles ?? [];
+      const reflection = await generateMemoryReflection({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        outcome,
+        intentPlanJson: JSON.stringify(plan),
+        browserErrors: [
+          result.outcomeReason,
+          ...(result.assertion ? [result.assertion.detail] : []),
+          ...result.consoleErrors,
+          ...result.pageErrors,
+        ],
+        analysisText: extractAnalysisText(claudeAnalysis),
+        patchedFiles,
+      });
+
+      await appendMemory(payload.repoUrl, {
+        issueTitle: payload.issueTitle,
+        issueTerms: reflection.issueTerms,
+        commitSha: repoContext.commit,
+        outcome,
+        rootCause: fixAttempt?.rootCause ?? reflection.rootCause,
+        patchedFiles,
+        fileHashes: await hashRepoFiles(repoContext.repoPath, patchedFiles),
+        whatWorked: reflection.whatWorked,
+        whatFailed: reflection.whatFailed,
+        createdAt: new Date().toISOString(),
+      });
+
+      log(`Memory entry recorded (outcome: ${outcome}).`);
+      log(`  terms: ${reflection.issueTerms.join(", ")}`);
+      log(`  rootCause: ${fixAttempt?.rootCause ?? reflection.rootCause}`);
+      if (reflection.whatWorked) {
+        log(`  whatWorked: ${reflection.whatWorked}`);
+      }
+      if (reflection.whatFailed) {
+        log(`  whatFailed: ${reflection.whatFailed}`);
+      }
+    } catch (error) {
+      log(`Could not record memory entry: ${formatError(error)}`);
+    }
+
     const fixComment = fixAttempt
       ? formatFixComment({
           investigationId,
@@ -329,7 +537,14 @@ app.post("/investigations", async (req, res) => {
       store,
       investigationRecord,
       buildExecutionSummary(investigationId, plan.expectedBehavior, result),
-      { result, claudeAnalysis, fixAttempt, pullRequest },
+      {
+        result,
+        claudeAnalysis,
+        fixAttempt,
+        pullRequest,
+        graphContextNotes: graphContext.notes,
+        memoryMatches: pastEntries.length,
+      },
       extraComment,
     );
   } catch (error) {
@@ -361,6 +576,112 @@ app.post("/investigations", async (req, res) => {
     }
   }
 });
+
+// --- Terminal logging helpers ---------------------------------------------
+
+function describePlanStep(step: ReproductionPlan["steps"][number]): string {
+  switch (step.action) {
+    case "goto":
+      return `goto ${step.path}`;
+    case "click":
+    case "waitForSelector":
+      return `${step.action} ${"selector" in step ? step.selector : JSON.stringify(step.target)}`;
+    case "fill":
+      return `fill ${"selector" in step ? step.selector : JSON.stringify(step.target)} = "${step.value}"`;
+    case "screenshot":
+      return "screenshot";
+    case "wait":
+      return `wait ${step.ms}ms`;
+    case "request":
+      return `${step.method} ${step.path}${step.body ? ` body=${JSON.stringify(step.body)}` : ""}`;
+  }
+}
+
+function firstLine(text: string): string {
+  const line = text.split("\n")[0] ?? "";
+
+  return line.length > 200 ? `${line.slice(0, 200)}...` : line;
+}
+
+function durationMs(startedAt: string, finishedAt: string): number {
+  return Math.max(0, new Date(finishedAt).getTime() - new Date(startedAt).getTime());
+}
+
+// Memory outcome mapping (docs/fable/10):
+// verified fix -> verified; failed/rejected fix attempt -> failed;
+// reproduced but no usable fix attempt -> blocked; otherwise analysis only.
+function mapMemoryOutcome(
+  result: ReproductionResult,
+  fixAttempt: FixAttemptResult | null,
+): MemoryOutcome {
+  if (fixAttempt?.outcome === "verified") {
+    return "verified";
+  }
+
+  if (fixAttempt) {
+    return "failed";
+  }
+
+  if (
+    result.outcome === "reproduced" ||
+    result.outcome === "execution_failed" ||
+    result.outcome === "environment_failed"
+  ) {
+    return "blocked";
+  }
+
+  return "analysis_complete";
+}
+
+function extractAnalysisText(claudeAnalysis: unknown): string {
+  if (
+    claudeAnalysis &&
+    typeof claudeAnalysis === "object" &&
+    "type" in claudeAnalysis &&
+    claudeAnalysis.type === "text" &&
+    "text" in claudeAnalysis &&
+    typeof claudeAnalysis.text === "string"
+  ) {
+    return claudeAnalysis.text;
+  }
+
+  return "";
+}
+
+// Refine terms for the fixer's graph re-selection (docs/fable/09): step
+// target/selector strings, expected/failure text, assertion detail, and
+// runtime error evidence.
+function collectRefineTerms(
+  plan: ReproductionPlan,
+  result: ReproductionResult,
+): string[] {
+  const stepStrings = plan.steps.flatMap((step) => {
+    if ("target" in step) {
+      return Object.values(step.target).filter(
+        (value): value is string => typeof value === "string",
+      );
+    }
+
+    if ("selector" in step) {
+      return [step.selector];
+    }
+
+    return [];
+  });
+
+  return [
+    ...stepStrings,
+    plan.expectedBehavior,
+    plan.failureCondition,
+    ...(result.assertion ? [result.assertion.detail] : []),
+    ...result.steps
+      .filter((step) => step.error)
+      .map((step) => step.error as string),
+    ...result.consoleErrors,
+    ...result.pageErrors,
+    ...result.networkFailures.map((failure) => failure.url),
+  ];
+}
 
 function buildExecutionSummary(
   investigationId: string,

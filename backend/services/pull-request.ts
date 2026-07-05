@@ -511,11 +511,11 @@ function describeStep(step: ReproductionPlan["steps"][number]) {
     case "goto":
       return `goto ${step.path}`;
     case "click":
-      return `click ${step.selector}`;
+      return `click ${describeStepTarget(step)}`;
     case "fill":
-      return `fill ${step.selector}`;
+      return `fill ${describeStepTarget(step)}`;
     case "waitForSelector":
-      return `wait for ${step.selector}`;
+      return `wait for ${describeStepTarget(step)}`;
     case "screenshot":
       return "screenshot";
     case "wait":
@@ -523,6 +523,20 @@ function describeStep(step: ReproductionPlan["steps"][number]) {
     case "request":
       return `${step.method} ${step.path}`;
   }
+}
+
+// Steps identify their element by a raw selector or an intent target object.
+function describeStepTarget(
+  step: { selector: string } | { target: Record<string, string | undefined> },
+) {
+  if ("selector" in step) {
+    return step.selector;
+  }
+
+  return Object.entries(step.target)
+    .filter(([, value]) => typeof value === "string")
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(" ");
 }
 
 async function readPreviousResult(

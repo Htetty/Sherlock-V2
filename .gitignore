@@ -6,7 +6,7 @@ npm-debug.log
 .env
 coverage
 lib
-
+fable
 dist
 .DS_Store
 
