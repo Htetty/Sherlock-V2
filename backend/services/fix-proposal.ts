@@ -55,6 +55,84 @@ const PROTECTED_EXTENSIONS = [".pem", ".key"];
 
 const SAFE_TEST_COMMAND = /^(npm|npx|node)(\s+[A-Za-z0-9_@./:=,\- ]+)?$/;
 
+export type ProposalExtractionResult =
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; error: string };
+
+// Extracts the top-level JSON object from a raw model response. Accepts the
+// bare object or one wrapped in a fenced code block; rejects prose, arrays,
+// primitives, and double-encoded JSON strings.
+export function extractFixProposalJson(rawText: string): ProposalExtractionResult {
+  const trimmed = rawText.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced ? fenced[1] : trimmed).trim();
+
+  if (!candidate.startsWith("{")) {
+    return {
+      ok: false,
+      error:
+        'Response must be a single top-level JSON object starting with "{" — not prose, an array, a primitive, or a JSON-encoded string.',
+    };
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(candidate);
+  } catch (error) {
+    return {
+      ok: false,
+      error: `Response is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return {
+      ok: false,
+      error: "Parsed JSON must be a top-level object, not an array or primitive.",
+    };
+  }
+
+  return { ok: true, value: parsed as Record<string, unknown> };
+}
+
+export type ProposalAttempt = {
+  rawText: string;
+  error: string | null;
+};
+
+export type ProposalRequestResult = {
+  proposal: Record<string, unknown> | null;
+  attempts: ProposalAttempt[];
+  parseError: string | null;
+};
+
+// Asks the model for a proposal and, if the response is not a valid JSON
+// object, retries exactly once passing the extraction error back so the
+// model can correct its output format. Pure orchestration: the model call is
+// injected, so this stays testable without any Claude dependency.
+export async function requestValidProposal(
+  callModel: (retryError: string | null) => Promise<string>,
+): Promise<ProposalRequestResult> {
+  const attempts: ProposalAttempt[] = [];
+  let lastError: string | null = null;
+
+  for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
+    const rawText = await callModel(lastError);
+    const extracted = extractFixProposalJson(rawText);
+
+    if (extracted.ok) {
+      attempts.push({ rawText, error: null });
+      return { proposal: extracted.value, attempts, parseError: null };
+    }
+
+    lastError = extracted.error;
+    attempts.push({ rawText, error: extracted.error });
+  }
+
+  return { proposal: null, attempts, parseError: lastError };
+}
+
 // Structural validation of the proposal JSON shape.
 export function validateFixProposalShape(value: unknown): ProposalValidationResult {
   const errors: string[] = [];

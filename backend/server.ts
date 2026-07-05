@@ -36,6 +36,7 @@ import {
   formatFixComment,
   formatPullRequestComment,
   formatResultComment,
+  redactSecrets,
   type InvestigationSummary,
 } from "./services/report.js";
 
@@ -198,9 +199,15 @@ app.post("/investigations", async (req, res) => {
           reproductionResult: result,
         });
 
+        // Sanitized raw model responses (every attempt) kept for debugging
+        // rejected proposals.
         await store.writeJson("fix-proposal-raw.json", {
-          rawText: generatedFix.rawText,
+          rawText: redactSecrets(generatedFix.rawText),
           parseError: generatedFix.parseError,
+          attempts: (generatedFix.attempts ?? []).map((attempt) => ({
+            rawText: redactSecrets(attempt.rawText),
+            error: attempt.error,
+          })),
         });
 
         const repoPath = repoContext.repoPath;

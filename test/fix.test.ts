@@ -16,6 +16,8 @@ import { afterEach, describe, expect, test } from "vitest";
 import { createArtifactStore, createInvestigationId } from "../backend/services/artifacts.js";
 import {
   FIX_PROPOSAL_VERSION,
+  extractFixProposalJson,
+  requestValidProposal,
   validatePatchSafety,
   validateFixProposalShape,
   type FixProposal,
@@ -546,6 +548,114 @@ describe("verified fix loop", () => {
     expect(attempt.reason).toContain("Precondition failed");
     expect(await readFile(path.join(repoPath, "server.mjs"), "utf8")).toBe(serverBefore);
   });
+});
+
+describe("fix proposal extraction and retry", () => {
+  const validProposalJson = JSON.stringify(correctProposal());
+
+  test("a valid direct JSON object succeeds on the first attempt", async () => {
+    const direct = extractFixProposalJson(validProposalJson);
+    expect(direct.ok).toBe(true);
+
+    let calls = 0;
+    const result = await requestValidProposal(async () => {
+      calls += 1;
+      return validProposalJson;
+    });
+
+    expect(calls).toBe(1);
+    expect(result.parseError).toBeNull();
+    expect(result.proposal).toMatchObject({ version: FIX_PROPOSAL_VERSION });
+    expect(result.attempts).toHaveLength(1);
+  });
+
+  test("a fenced JSON object is extracted", () => {
+    const fencedWithTag = extractFixProposalJson(
+      `Looking at the bug, here is the fix:\n\n\`\`\`json\n${validProposalJson}\n\`\`\`\n`,
+    );
+    expect(fencedWithTag.ok).toBe(true);
+
+    if (fencedWithTag.ok) {
+      expect(fencedWithTag.value.version).toBe(FIX_PROPOSAL_VERSION);
+    }
+
+    const fencedPlain = extractFixProposalJson(`\`\`\`\n${validProposalJson}\n\`\`\``);
+    expect(fencedPlain.ok).toBe(true);
+  });
+
+  test("prose, arrays, and JSON-encoded strings trigger exactly one retry", async () => {
+    // Prose, a JSON array, and a double-encoded object are all rejected.
+    for (const invalid of [
+      "I suggest changing the login handler to return 401.",
+      `[${validProposalJson}]`,
+      JSON.stringify(validProposalJson),
+    ]) {
+      expect(extractFixProposalJson(invalid).ok).toBe(false);
+    }
+
+    const retryFeedback: (string | null)[] = [];
+    const result = await requestValidProposal(async (retryError) => {
+      retryFeedback.push(retryError);
+      return retryFeedback.length === 1
+        ? "Looking at the bug: the archive job has a circular reference."
+        : validProposalJson;
+    });
+
+    expect(retryFeedback).toHaveLength(2);
+    expect(retryFeedback[0]).toBeNull();
+    expect(retryFeedback[1]).toContain("JSON object");
+    expect(result.proposal).toMatchObject({ version: FIX_PROPOSAL_VERSION });
+    expect(result.attempts).toHaveLength(2);
+    expect(result.attempts[0].error).not.toBeNull();
+    expect(result.attempts[1].error).toBeNull();
+  });
+
+  test(
+    "an invalid retry stays rejected and no patch is applied",
+    { timeout: 60_000 },
+    async () => {
+      let calls = 0;
+      const result = await requestValidProposal(async () => {
+        calls += 1;
+        return "Still prose, not JSON.";
+      });
+
+      expect(calls).toBe(2);
+      expect(result.proposal).toBeNull();
+      expect(result.parseError).not.toBeNull();
+      expect(result.attempts).toHaveLength(2);
+
+      // Feeding the failed result into the fix loop rejects before any
+      // patch or restart happens and leaves the workspace untouched.
+      const { repoPath, commit } = await createFixtureRepo();
+      const investigationId = createInvestigationId();
+      const artifactsRoot = await mkdtemp(path.join(tmpdir(), "sherlock-fix-artifacts-"));
+      const store = await createArtifactStore(
+        investigationId,
+        path.join(artifactsRoot, investigationId),
+      );
+      const serverBefore = await readFile(path.join(repoPath, "server.mjs"), "utf8");
+      let restartCalled = false;
+
+      const attempt = await runFixAttempt({
+        investigationId,
+        investigationDir: store.dir,
+        repoPath,
+        sourceCommit: commit,
+        plan: buildLoginPlan("http://localhost:39999"),
+        originalOutcome: "reproduced",
+        proposal: result.proposal,
+        restart: async () => {
+          restartCalled = true;
+          return { ok: true };
+        },
+      });
+
+      expect(attempt.outcome).toBe("rejected_patch_invalid");
+      expect(restartCalled).toBe(false);
+      expect(await readFile(path.join(repoPath, "server.mjs"), "utf8")).toBe(serverBefore);
+    },
+  );
 });
 
 describe("fix GitHub comments", () => {

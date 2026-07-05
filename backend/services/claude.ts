@@ -1,7 +1,11 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
 import { REPRODUCTION_PLAN_VERSION, type ReproductionPlan } from "./plan.js";
-import { FIX_PROPOSAL_VERSION, PATCH_LIMITS } from "./fix-proposal.js";
+import {
+  FIX_PROPOSAL_VERSION,
+  PATCH_LIMITS,
+  requestValidProposal,
+} from "./fix-proposal.js";
 import type { ReproductionResult } from "./playwright.js";
 
 const client = new Anthropic();
@@ -33,6 +37,9 @@ export type GeneratedPlan = {
   rawText: string;
   parsed: unknown | null;
   parseError: string | null;
+  // Present for fix proposals: every model response, including rejected
+  // format attempts, for artifact debugging.
+  attempts?: { rawText: string; error: string | null }[];
 };
 
 export async function generateReproductionPlan(
@@ -168,28 +175,41 @@ ${input.reproductionResult.apiResponses.map((response) => `${response.method} ${
 ${formatRepoEvidence(input)}
 `;
 
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 2_000,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
+  // One retry on format failure: the extraction error is fed back together
+  // with the schema (already part of the base prompt) and a bare-JSON
+  // instruction.
+  const result = await requestValidProposal(async (retryError) => {
+    const finalPrompt =
+      retryError === null
+        ? prompt
+        : `${prompt}
+
+Your previous response was rejected because it was not a valid fix proposal: ${retryError}
+
+Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, explanations, or any text before or after the JSON object.`;
+
+    const message = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2_000,
+      messages: [
+        {
+          role: "user",
+          content: finalPrompt,
+        },
+      ],
+    });
+
+    return getTextContent(message.content);
   });
 
-  const rawText = getTextContent(message.content);
+  const lastAttempt = result.attempts[result.attempts.length - 1];
 
-  try {
-    return { rawText, parsed: JSON.parse(rawText) as unknown, parseError: null };
-  } catch (error) {
-    return {
-      rawText,
-      parsed: null,
-      parseError: `Claude did not return valid JSON: ${error instanceof Error ? error.message : String(error)}`,
-    };
-  }
+  return {
+    rawText: lastAttempt?.rawText ?? "",
+    parsed: result.proposal,
+    parseError: result.parseError,
+    attempts: result.attempts,
+  };
 }
 
 export async function analyzeIssue(input: AnalyzeIssueInput) {
