@@ -179,9 +179,19 @@ app.post("/investigations", async (req, res) => {
     await store.writeJson("reproduction-plan-raw.json", {
       rawText: generated.rawText,
       parseError: generated.parseError,
+      attempts: generated.attempts ?? [],
     });
 
+    for (const [index, attempt] of (generated.attempts ?? []).entries()) {
+      log(
+        `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+      );
+    }
+
     if (generated.parseError !== null) {
+      log(`Plan generation failed after all attempts: ${generated.parseError}`);
+      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+
       return await finishInvestigation(res, store, investigationRecord, {
         investigationId,
         outcome: "plan_failed",
@@ -192,7 +202,11 @@ app.post("/investigations", async (req, res) => {
     const validation = validateReproductionPlan(generated.parsed);
 
     if (!validation.ok) {
-      log(`Plan rejected: ${validation.errors.join(" | ")}`);
+      log(`Plan rejected by validator:`);
+      for (const validationError of validation.errors) {
+        log(`  - ${validationError}`);
+      }
+      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
 
       return await finishInvestigation(res, store, investigationRecord, {
         investigationId,
@@ -203,11 +217,38 @@ app.post("/investigations", async (req, res) => {
 
     const plan = validation.plan;
     await store.writeJson("reproduction-plan.json", plan);
-    log("Validated reproduction plan saved.");
+    log(`Validated plan: ${plan.steps.length} step(s), assertion ${plan.assertion.type}`);
+    for (const step of plan.steps) {
+      log(`  ${step.id}: ${describePlanStep(step)}`);
+    }
+    log(`  expectedBehavior: ${plan.expectedBehavior}`);
+    log(`  failureCondition: ${plan.failureCondition}`);
+    log(`  assertion: ${JSON.stringify(plan.assertion)}`);
 
     const result = await executeReproductionPlan(plan, store);
     await writeExecutionArtifacts(store, result);
-    log(`Plan executed with outcome: ${result.outcome}`);
+
+    log(`Plan executed with outcome: ${result.outcome} (${durationMs(result.startedAt, result.finishedAt)}ms)`);
+    for (const step of result.steps) {
+      const timing =
+        step.startedAt && step.finishedAt
+          ? ` ${durationMs(step.startedAt, step.finishedAt)}ms`
+          : "";
+      const detail = step.error
+        ? ` - ${step.ambiguous ? "AMBIGUOUS: " : ""}${firstLine(step.error)}`
+        : "";
+      log(`  ${step.id} [${step.outcome}${timing}]${detail}`);
+    }
+    if (result.assertion) {
+      log(
+        `  assertion: matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected}`,
+      );
+      log(`  assertion detail: ${result.assertion.detail}`);
+      log(`  observed: ${firstLine(result.assertion.observed ?? "(nothing)")}`);
+    }
+    log(
+      `  evidence: ${result.consoleErrors.length} console error(s), ${result.pageErrors.length} page error(s), ${result.networkFailures.length} network failure(s), ${result.apiResponses.length} api response(s), ${result.screenshots.length} screenshot(s)`,
+    );
 
     let claudeAnalysis: unknown = null;
 
@@ -291,6 +332,32 @@ app.post("/investigations", async (req, res) => {
           })),
         });
 
+        for (const [index, attempt] of (generatedFix.attempts ?? []).entries()) {
+          log(
+            `Fix proposal attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+          );
+        }
+
+        if (generatedFix.parseError !== null) {
+          log(`Fix proposal failed after all attempts: ${generatedFix.parseError}`);
+          log(
+            `Raw model response (first 600 chars):\n${redactSecrets(generatedFix.rawText.slice(0, 600))}`,
+          );
+        } else {
+          const proposal = generatedFix.parsed as Record<string, unknown>;
+          log(`Fix proposal parsed:`);
+          log(`  summary: ${String(proposal.summary ?? "(none)")}`);
+          log(`  rootCause: ${String(proposal.rootCause ?? "(none)")}`);
+          log(
+            `  confidence: ${String(proposal.confidence ?? "?")} | risk: ${String(proposal.risk ?? "?")}`,
+          );
+          if (Array.isArray(proposal.files)) {
+            for (const file of proposal.files as { path?: string; edits?: unknown[] }[]) {
+              log(`  file: ${file.path ?? "?"} (${file.edits?.length ?? 0} edit(s))`);
+            }
+          }
+        }
+
         const repoPath = repoContext.repoPath;
         const restart = async () => {
           if (sandboxSession) {
@@ -325,6 +392,21 @@ app.post("/investigations", async (req, res) => {
         });
 
         log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+        for (const item of fixAttempt.checks) {
+          log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
+        }
+        if (fixAttempt.reason) {
+          log(`  reason: ${fixAttempt.reason}`);
+        }
+        if (fixAttempt.changedFiles.length > 0) {
+          log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
+        }
+        if (fixAttempt.postPatchOutcome) {
+          log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+        }
+        for (const run of fixAttempt.testRuns) {
+          log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+        }
       } catch (error) {
         log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
       }
@@ -408,6 +490,14 @@ app.post("/investigations", async (req, res) => {
       });
 
       log(`Memory entry recorded (outcome: ${outcome}).`);
+      log(`  terms: ${reflection.issueTerms.join(", ")}`);
+      log(`  rootCause: ${fixAttempt?.rootCause ?? reflection.rootCause}`);
+      if (reflection.whatWorked) {
+        log(`  whatWorked: ${reflection.whatWorked}`);
+      }
+      if (reflection.whatFailed) {
+        log(`  whatFailed: ${reflection.whatFailed}`);
+      }
     } catch (error) {
       log(`Could not record memory entry: ${formatError(error)}`);
     }
@@ -486,6 +576,36 @@ app.post("/investigations", async (req, res) => {
     }
   }
 });
+
+// --- Terminal logging helpers ---------------------------------------------
+
+function describePlanStep(step: ReproductionPlan["steps"][number]): string {
+  switch (step.action) {
+    case "goto":
+      return `goto ${step.path}`;
+    case "click":
+    case "waitForSelector":
+      return `${step.action} ${"selector" in step ? step.selector : JSON.stringify(step.target)}`;
+    case "fill":
+      return `fill ${"selector" in step ? step.selector : JSON.stringify(step.target)} = "${step.value}"`;
+    case "screenshot":
+      return "screenshot";
+    case "wait":
+      return `wait ${step.ms}ms`;
+    case "request":
+      return `${step.method} ${step.path}${step.body ? ` body=${JSON.stringify(step.body)}` : ""}`;
+  }
+}
+
+function firstLine(text: string): string {
+  const line = text.split("\n")[0] ?? "";
+
+  return line.length > 200 ? `${line.slice(0, 200)}...` : line;
+}
+
+function durationMs(startedAt: string, finishedAt: string): number {
+  return Math.max(0, new Date(finishedAt).getTime() - new Date(startedAt).getTime());
+}
 
 // Memory outcome mapping (docs/fable/10):
 // verified fix -> verified; failed/rejected fix attempt -> failed;

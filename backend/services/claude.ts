@@ -125,26 +125,41 @@ Grounding rules:
 ${formatRepoEvidence(input)}
 `;
 
-  const message = await client.messages.create({
-    model: MODEL,
-    max_tokens: 1_500,
-    temperature: 0,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
+  // Same retry-once contract as fix proposals: a malformed response is fed
+  // back with the extraction error so the model can correct its format.
+  const result = await requestValidProposal(async (retryError) => {
+    const finalPrompt =
+      retryError === null
+        ? prompt
+        : `${prompt}
+
+Your previous response was rejected because it was not a valid reproduction plan: ${retryError}
+
+Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, reasoning, or any text before or after the JSON object.`;
+
+    const message = await client.messages.create({
+      model: MODEL,
+      max_tokens: 2_500,
+      temperature: 0,
+      messages: [
+        {
+          role: "user",
+          content: finalPrompt,
+        },
+      ],
+    });
+
+    return getTextContent(message.content);
   });
 
-  const rawText = getTextContent(message.content);
-  const extracted = extractFixProposalJson(rawText);
+  const lastAttempt = result.attempts[result.attempts.length - 1];
 
-  if (!extracted.ok) {
-    return { rawText, parsed: null, parseError: extracted.error };
-  }
-
-  return { rawText, parsed: extracted.value, parseError: null };
+  return {
+    rawText: lastAttempt?.rawText ?? "",
+    parsed: result.proposal,
+    parseError: result.parseError,
+    attempts: result.attempts,
+  };
 }
 
 export type FixProposalInput = RepoEvidenceInput & {
