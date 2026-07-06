@@ -294,6 +294,91 @@ async function selectContext(
   };
 }
 
+// Direct neighborhood lookup for the fixer agent (docs/fable/10, optional
+// tools). Reads the already-extracted graph from <repoPath>/graphify-out —
+// buildGraphContext has always run (and cached/copied the graph) before the
+// fixer starts, so this is a pure local lookup. The reference may be a node
+// label exactly as shown in NODE lines (e.g. "writeTaskList()") or a node id.
+const MAX_NEIGHBOR_MATCHES = 5;
+const MAX_NEIGHBOR_EDGES = 40;
+
+export async function queryGraphNeighbors(
+  repoPath: string,
+  nodeRef: string,
+): Promise<{ ok: boolean; text: string }> {
+  let graph: Graph;
+
+  try {
+    graph = await readGraph(repoPath);
+  } catch (error) {
+    return { ok: false, text: `Graph unavailable: ${formatError(error)}` };
+  }
+
+  const ref = nodeRef.trim().toLowerCase();
+
+  if (!ref) {
+    return { ok: false, text: "get_graph_neighbors requires a non-empty node reference." };
+  }
+
+  const exact = graph.nodes.filter(
+    (node) => (node.label ?? "").toLowerCase() === ref || node.id.toLowerCase() === ref,
+  );
+  const pool =
+    exact.length > 0
+      ? exact
+      : graph.nodes.filter((node) =>
+          (node.label ?? node.id).toLowerCase().includes(ref),
+        );
+
+  if (pool.length === 0) {
+    return { ok: false, text: `No graph node matches "${nodeRef}".` };
+  }
+
+  if (pool.length > MAX_NEIGHBOR_MATCHES) {
+    const sample = pool
+      .slice(0, MAX_NEIGHBOR_MATCHES)
+      .map((node) => node.label ?? node.id)
+      .join(", ");
+
+    return {
+      ok: false,
+      text: `"${nodeRef}" matches ${pool.length} nodes; be more specific. First matches: ${sample}`,
+    };
+  }
+
+  const labelById = new Map(
+    graph.nodes.map((node) => [node.id, node.label ?? node.id]),
+  );
+  const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+
+  const blocks = pool.map((node) => {
+    const edges = graph.links
+      .filter((edge) => edge.source === node.id || edge.target === node.id)
+      .slice(0, MAX_NEIGHBOR_EDGES);
+    const neighborIds = [
+      ...new Set(
+        edges.map((edge) => (edge.source === node.id ? edge.target : edge.source)),
+      ),
+    ];
+    const lines = [
+      renderNode(node),
+      ...neighborIds
+        .map((id) => nodeById.get(id))
+        .filter((neighbor): neighbor is GraphNode => neighbor !== undefined)
+        .map((neighbor) => renderNode(neighbor)),
+      ...edges.map((edge) => renderEdge(edge, labelById)),
+    ];
+
+    if (edges.length === 0) {
+      lines.push("(no edges recorded for this node)");
+    }
+
+    return lines.join("\n");
+  });
+
+  return { ok: true, text: blocks.join("\n\n") };
+}
+
 export function tokenize(text: string): string[] {
   const tokens = text
     .toLowerCase()

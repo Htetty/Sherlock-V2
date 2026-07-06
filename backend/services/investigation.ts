@@ -7,11 +7,11 @@
 
 import {
   analyzeIssue,
-  generateFixProposal,
   generateMemoryReflection,
   generateReproductionPlan,
 } from "./claude.js";
-import { runFixAttempt, type FixAttemptResult } from "./fix.js";
+import { runFixerAgent, type FixerAgentStatus } from "../agents/fixer.js";
+import type { FixAttemptResult } from "./fix.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -51,7 +51,6 @@ import {
   formatFixComment,
   formatPullRequestComment,
   formatResultComment,
-  redactSecrets,
   type InvestigationSummary,
 } from "./report.js";
 
@@ -323,8 +322,10 @@ export async function runInvestigationPipeline(
       await store.writeJson("claude-analysis.json", claudeAnalysis);
     }
 
-    // Verified fix loop: only for a confirmed reproduction, one attempt.
+    // Verified fix loop: only for a confirmed reproduction. The bounded
+    // fixer agent may make several verifier-judged attempts internally.
     let fixAttempt: FixAttemptResult | null = null;
+    let fixerStatus: FixerAgentStatus | null = null;
 
     if (result.outcome === "reproduced") {
       try {
@@ -356,61 +357,6 @@ export async function runInvestigationPipeline(
           hydratedFiles: refinedContext.relevantFiles.map((file) => file.path),
         });
 
-        const generatedFix = await generateFixProposal({
-          issueTitle: payload.issueTitle,
-          issueBody: payload.issueBody ?? "",
-          repoUrl: payload.repoUrl,
-          defaultBranch: payload.defaultBranch,
-          fileTree: repoContext.fileTree,
-          packageJson: repoContext.packageJson,
-          readme: repoContext.readme,
-          sourceFiles: refinedContext.available
-            ? refinedContext.relevantFiles
-            : contextSourceFiles,
-          sandboxResult: sandboxSession.result,
-          commit: repoContext.commit,
-          plan,
-          reproductionResult: result,
-          graphContext: refinedContext,
-        });
-
-        // Sanitized raw model responses (every attempt) kept for debugging
-        // rejected proposals.
-        await store.writeJson("fix-proposal-raw.json", {
-          rawText: redactSecrets(generatedFix.rawText),
-          parseError: generatedFix.parseError,
-          attempts: (generatedFix.attempts ?? []).map((attempt) => ({
-            rawText: redactSecrets(attempt.rawText),
-            error: attempt.error,
-          })),
-        });
-
-        for (const [index, attempt] of (generatedFix.attempts ?? []).entries()) {
-          log(
-            `Fix proposal attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
-          );
-        }
-
-        if (generatedFix.parseError !== null) {
-          log(`Fix proposal failed after all attempts: ${generatedFix.parseError}`);
-          log(
-            `Raw model response (first 600 chars):\n${redactSecrets(generatedFix.rawText.slice(0, 600))}`,
-          );
-        } else {
-          const proposal = generatedFix.parsed as Record<string, unknown>;
-          log(`Fix proposal parsed:`);
-          log(`  summary: ${String(proposal.summary ?? "(none)")}`);
-          log(`  rootCause: ${String(proposal.rootCause ?? "(none)")}`);
-          log(
-            `  confidence: ${String(proposal.confidence ?? "?")} | risk: ${String(proposal.risk ?? "?")}`,
-          );
-          if (Array.isArray(proposal.files)) {
-            for (const file of proposal.files as { path?: string; edits?: unknown[] }[]) {
-              log(`  file: ${file.path ?? "?"} (${file.edits?.length ?? 0} edit(s))`);
-            }
-          }
-        }
-
         const repoPath = repoContext.repoPath;
         const restart = async () => {
           if (sandboxSession) {
@@ -435,32 +381,57 @@ export async function runInvestigationPipeline(
 
         await reportStage("verifying");
 
-        fixAttempt = await runFixAttempt({
+        // Bounded fixer agent (docs/fable/10): explores the repo, proposes
+        // patches, and revises using deterministic verification evidence.
+        // Only runFixAttempt() inside the agent can mark an attempt verified.
+        const agentResult = await runFixerAgent({
           investigationId,
           investigationDir: store.dir,
           repoPath,
           sourceCommit: repoContext.commit,
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext.fileTree,
+          packageJson: repoContext.packageJson,
+          readme: repoContext.readme,
+          sandboxResult: sandboxSession.result,
           plan,
-          originalOutcome: result.outcome,
-          proposal: generatedFix.parsed,
+          reproductionResult: result,
+          graphContext: refinedContext,
+          initialSourceFiles: refinedContext.available
+            ? refinedContext.relevantFiles
+            : contextSourceFiles,
           restart,
         });
 
-        log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
-        for (const item of fixAttempt.checks) {
-          log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
+        fixAttempt = agentResult.fixAttempt;
+        fixerStatus = agentResult.status;
+        log(`Fixer agent finished: ${agentResult.status} — ${agentResult.reason}`);
+        for (const attempt of agentResult.attempts) {
+          log(
+            `  attempt ${attempt.index} (${attempt.fixAttemptId ?? "?"}): ${attempt.outcome ?? "?"}${attempt.reason ? ` - ${firstLine(attempt.reason)}` : ""}`,
+          );
         }
-        if (fixAttempt.reason) {
-          log(`  reason: ${fixAttempt.reason}`);
-        }
-        if (fixAttempt.changedFiles.length > 0) {
-          log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
-        }
-        if (fixAttempt.postPatchOutcome) {
-          log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
-        }
-        for (const run of fixAttempt.testRuns) {
-          log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+
+        if (fixAttempt) {
+          log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+          for (const item of fixAttempt.checks) {
+            log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
+          }
+          if (fixAttempt.reason) {
+            log(`  reason: ${fixAttempt.reason}`);
+          }
+          if (fixAttempt.changedFiles.length > 0) {
+            log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
+          }
+          if (fixAttempt.postPatchOutcome) {
+            log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+          }
+          for (const run of fixAttempt.testRuns) {
+            log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+          }
         }
       } catch (error) {
         log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
@@ -516,7 +487,7 @@ export async function runInvestigationPipeline(
 
     // --- Memory recording (docs/fable/08): always learn from the run ------
     try {
-      const outcome = mapMemoryOutcome(result, fixAttempt);
+      const outcome = mapMemoryOutcome(result, fixAttempt, fixerStatus);
       const patchedFiles = fixAttempt?.changedFiles ?? [];
       const reflection = await generateMemoryReflection({
         issueTitle: payload.issueTitle,
@@ -664,14 +635,24 @@ function durationMs(startedAt: string, finishedAt: string): number {
 }
 
 // Memory outcome mapping (docs/fable/10):
-// verified fix -> verified; failed/rejected fix attempt -> failed;
-// reproduced but no usable fix attempt -> blocked; otherwise analysis only.
+// agent status verified -> verified, blocked -> blocked, exhausted/failed ->
+// failed. Without an agent run: reproduced but no usable fix attempt ->
+// blocked; otherwise analysis only.
 function mapMemoryOutcome(
   result: ReproductionResult,
   fixAttempt: FixAttemptResult | null,
+  fixerStatus: FixerAgentStatus | null,
 ): MemoryOutcome {
-  if (fixAttempt?.outcome === "verified") {
+  if (fixerStatus === "verified" || fixAttempt?.outcome === "verified") {
     return "verified";
+  }
+
+  if (fixerStatus === "blocked") {
+    return "blocked";
+  }
+
+  if (fixerStatus === "exhausted" || fixerStatus === "failed") {
+    return "failed";
   }
 
   if (fixAttempt) {
