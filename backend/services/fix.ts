@@ -11,17 +11,8 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  createArtifactStore,
-  createFixAttemptId,
-  type ArtifactStore,
-} from "./artifacts.js";
-import {
-  buildTargetEnv,
-  realDockerAdapter,
-  runContainerCommand,
-  type DockerAdapter,
-} from "./container.js";
+import { createArtifactStore, createFixAttemptId } from "./artifacts.js";
+import { realDockerAdapter, type DockerAdapter } from "./container.js";
 import {
   renderProposedPatch,
   validateFixProposalShape,
@@ -30,10 +21,15 @@ import {
 } from "./fix-proposal.js";
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
+import {
+  formatValidationLine,
+  runRepositoryValidation,
+  type RepositoryValidation,
+  type ValidationCategory,
+  type ValidationStatus,
+} from "./repo-validation.js";
 
 const execFileAsync = promisify(execFile);
-
-const TEST_COMMAND_TIMEOUT_MS = 180_000;
 
 export type FixOutcome =
   | "verified"
@@ -79,6 +75,14 @@ export type FixAttemptInput = {
   // Verification commands run in restricted containers through this
   // adapter; injectable so tests run without a Docker daemon.
   docker?: DockerAdapter;
+  // "owner/name" used in the validation artifact; never a URL or secret.
+  repositoryLabel?: string;
+  validationTimeoutMs?: number;
+};
+
+export type RepositoryValidationSummary = {
+  aggregate: RepositoryValidation["aggregate"];
+  categories: { category: ValidationCategory; status: ValidationStatus }[];
 };
 
 export type FixAttemptResult = {
@@ -94,6 +98,8 @@ export type FixAttemptResult = {
   rootCause: string | null;
   postPatchOutcome: string | null;
   testRuns: TestRunRecord[];
+  // Truthful repository validation summary (null until validation runs).
+  repositoryValidation: RepositoryValidationSummary | null;
   startedAt: string;
   finishedAt: string;
 };
@@ -118,6 +124,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     rootCause: null,
     postPatchOutcome: null,
     testRuns: [],
+    repositoryValidation: null,
     startedAt: new Date().toISOString(),
     finishedAt: new Date().toISOString(),
   };
@@ -354,55 +361,104 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     );
   }
 
-  // --- Relevant tests --------------------------------------------------------
-  const { commands, targeted } = resolveTestCommands(proposal);
-  let testsPassed = true;
+  // --- Repository validation --------------------------------------------------
+  // Discovered from package.json (test/typecheck/lint/build), executed in
+  // restricted containers. Unavailable categories run nothing and are
+  // reported truthfully — never as a fake pass.
+  const validation = await runRepositoryValidation(input.docker ?? realDockerAdapter, {
+    repoPath: input.repoPath,
+    timeoutMs: input.validationTimeoutMs,
+  });
 
-  for (const [index, command] of commands.entries()) {
-    const run = await runTestCommand(
-      command,
-      input.repoPath,
-      store,
-      index,
-      targeted,
-      input.docker ?? realDockerAdapter,
-    );
-    result.testRuns.push(run);
+  result.repositoryValidation = {
+    aggregate: validation.aggregate,
+    categories: validation.results.map((item) => ({
+      category: item.category,
+      status: item.status,
+    })),
+  };
 
-    if (run.exitCode !== 0) {
-      testsPassed = false;
+  for (const item of validation.results) {
+    if (item.argv === null) {
+      continue;
     }
+
+    const stdoutFile = path.join(store.dir, `validation-${item.category}-stdout.log`);
+    const stderrFile = path.join(store.dir, `validation-${item.category}-stderr.log`);
+    await writeFile(stdoutFile, item.stdout, "utf8");
+    await writeFile(stderrFile, item.stderr, "utf8");
+
+    result.testRuns.push({
+      command: item.argv.join(" "),
+      exitCode: item.exitCode ?? 1,
+      durationMs: item.durationMs ?? 0,
+      targeted: false,
+      timedOut: item.status === "timed_out",
+      stdoutFile,
+      stderrFile,
+    });
   }
 
+  // Structured artifact; the large bounded logs live in the per-category
+  // files above, not duplicated here.
+  await store.writeJson("repository-validation.json", {
+    investigationId: input.investigationId,
+    fixAttemptId,
+    repository: input.repositoryLabel ?? null,
+    sourceCommit: input.sourceCommit,
+    workspaceState: { patched: true, changedFiles: result.changedFiles },
+    packageManager: validation.packageManager,
+    aggregate: validation.aggregate,
+    results: validation.results.map(({ stdout, stderr, ...rest }) => ({
+      ...rest,
+      stdoutChars: stdout.length,
+      stderrChars: stderr.length,
+    })),
+    startedAt: validation.startedAt,
+    finishedAt: validation.finishedAt,
+  });
+
   await store.writeJson("test-results.json", {
-    commands,
-    targeted,
+    source: "repository-validation",
     runs: result.testRuns,
   });
 
-  if (
-    !check(
-      "relevant_tests_passed",
-      testsPassed,
-      commands.length === 0
-        ? "No relevant test command was available; recorded as passed with no coverage."
-        : result.testRuns
-            .map((run) => `${run.command} -> exit ${run.exitCode}`)
-            .join(" | "),
-    )
-  ) {
+  const validationLines = validation.results
+    .map((item) => formatValidationLine(item))
+    .join(" | ");
+
+  if (validation.aggregate === "failed") {
+    check("repository_validation", false, validationLines);
+
+    const failures = validation.results
+      .filter((item) => item.status === "failed" || item.status === "timed_out")
+      .map((item) => `${item.argv?.join(" ")} (${item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`})`)
+      .join(", ");
+
     return finish(
       "rejected_tests_failed",
-      `The original failure disappeared, but relevant tests failed: ${result.testRuns
-        .filter((run) => run.exitCode !== 0)
-        .map((run) => run.command)
-        .join(", ")}`,
+      `The original failure disappeared, but repository validation failed: ${failures}`,
     );
   }
 
+  if (validation.aggregate === "not_available") {
+    check(
+      "repository_validation",
+      true,
+      "Repository validation was unavailable: package.json declares no test, typecheck, lint, or build scripts. Verification relies on the exact reproduction replay.",
+    );
+
+    return finish(
+      "verified",
+      "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay.",
+    );
+  }
+
+  check("repository_validation", true, validationLines);
+
   return finish(
     "verified",
-    "The patch was applied, the application restarted, the exact saved reproduction no longer fails, and relevant tests passed.",
+    "The patch was applied, the application restarted, the exact saved reproduction no longer fails, and all available repository validation commands passed.",
   );
 }
 
@@ -417,57 +473,6 @@ async function applyProposal(proposal: FixProposal, repoPath: string) {
 
     await writeFile(absolutePath, contents, "utf8");
   }
-}
-
-function resolveTestCommands(proposal: FixProposal) {
-  if (proposal.relevantTests.length > 0) {
-    return { commands: proposal.relevantTests, targeted: true };
-  }
-
-  return { commands: [] as string[], targeted: false };
-}
-
-// Model-proposed test commands never run on the host: each executes in its
-// own short-lived restricted container (same image, workspace mount, env
-// policy, and limits as the app container) so it cannot contaminate the
-// running application. The command was already validated by
-// validateFixProposalShape to be a plain npm/npx/node command with no shell
-// operators, so whitespace-splitting into argv is exact — no shell anywhere.
-async function runTestCommand(
-  command: string,
-  repoPath: string,
-  store: ArtifactStore,
-  index: number,
-  targeted: boolean,
-  docker: DockerAdapter,
-): Promise<TestRunRecord> {
-  const stdoutFile = path.join(store.dir, `test-${index + 1}-stdout.log`);
-  const stderrFile = path.join(store.dir, `test-${index + 1}-stderr.log`);
-
-  const run = await runContainerCommand(docker, {
-    purpose: "test",
-    workspacePath: repoPath,
-    env: buildTargetEnv(),
-    command: command.trim().split(/\s+/),
-    timeoutMs: TEST_COMMAND_TIMEOUT_MS,
-  });
-
-  const stderr = run.timedOut
-    ? `${run.stderr}\nTest command timed out after ${TEST_COMMAND_TIMEOUT_MS}ms and its container was force-removed.`
-    : run.stderr;
-
-  await writeFile(stdoutFile, run.stdout, "utf8");
-  await writeFile(stderrFile, stderr, "utf8");
-
-  return {
-    command,
-    exitCode: run.exitCode,
-    durationMs: run.durationMs,
-    targeted,
-    timedOut: run.timedOut,
-    stdoutFile,
-    stderrFile,
-  };
 }
 
 // Hash of the plan's behavior (steps + assertion, excluding baseUrl) proving

@@ -26,7 +26,7 @@ const REQUIRED_CHECKS = [
   "application_restarted",
   "exact_plan_replayed",
   "failure_no_longer_observed",
-  "relevant_tests_passed",
+  "repository_validation",
 ];
 
 const SECRET_FILE_PATTERN = /(^\.env|\.pem$|\.key$)/i;
