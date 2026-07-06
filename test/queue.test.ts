@@ -58,7 +58,10 @@ describe("investigation worker processing", () => {
       },
       getInstallationToken: async (installationId) => {
         expect(installationId).toBe(2);
-        return "short-lived-token";
+        return {
+          token: "short-lived-token",
+          permissions: { contents: "write", issues: "write" },
+        };
       },
       postIssueComment: async ({ issueNumber, body }) => {
         comments.push({ issueNumber, body });
@@ -84,6 +87,7 @@ describe("investigation worker processing", () => {
       issueNumber: 1,
       issueTitle: "Example bug",
       installationToken: "short-lived-token",
+      installationPermissions: { contents: "write", issues: "write" },
     });
     expect(comments).toEqual([{ issueNumber: 1, body: "RESULT COMMENT" }]);
     expect(stages).toEqual(["running", "reproducing", "completed"]);
@@ -123,7 +127,10 @@ describe("investigation worker processing", () => {
       runPipeline: async () => {
         throw error;
       },
-      getInstallationToken: async () => "token",
+      getInstallationToken: async () => ({
+        token: "token",
+        permissions: { contents: "write" },
+      }),
       postIssueComment: async ({ body }) => {
         comments.push(body);
       },

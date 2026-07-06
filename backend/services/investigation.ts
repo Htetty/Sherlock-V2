@@ -31,6 +31,7 @@ import {
   cloneRepoForInvestigation,
   type RepoContext,
 } from "./repo.js";
+import { RepositoryError } from "./repo-auth.js";
 import {
   runSandboxInvestigation,
   type SandboxSession,
@@ -78,6 +79,8 @@ export type InvestigationPipelineInput = {
   triggerComment?: string;
   triggeredBy?: string;
   installationToken?: string | null;
+  // Permission metadata from the installation access-token response.
+  installationPermissions?: Record<string, string> | null;
 };
 
 export type InvestigationPipelineResult = {
@@ -96,6 +99,9 @@ export type InvestigationPipelineResult = {
 
 export type PipelineOptions = {
   onStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Injectable for tests; production always uses the real authenticated
+  // clone flow.
+  cloneRepo?: typeof cloneRepoForInvestigation;
 };
 
 export async function runInvestigationPipeline(
@@ -142,11 +148,25 @@ export async function runInvestigationPipeline(
     await store.writeJson("investigation.json", investigationRecord);
 
     try {
-      repoContext = await cloneRepoForInvestigation({
-        repoUrl: payload.repoUrl,
+      // Clone target is derived from the validated owner/name, never the
+      // webhook-supplied URL; the short-lived installation token (minted by
+      // the worker for this installation) authenticates private clones.
+      repoContext = await (options.cloneRepo ?? cloneRepoForInvestigation)({
+        repoOwner: payload.repoOwner,
+        repoName: payload.repoName,
         defaultBranch: payload.defaultBranch,
+        installationToken: payload.installationToken ?? null,
+        installationPermissions: payload.installationPermissions ?? null,
       });
     } catch (error) {
+      // Transient repository failures (GitHub 5xx/rate limits, network or
+      // transport blips) must reach the worker so BullMQ retries with
+      // backoff — they are never converted into a completed
+      // environment_failed result.
+      if (error instanceof RepositoryError && error.retryable) {
+        throw error;
+      }
+
       return await finishInvestigation(store, investigationRecord, {
         investigationId,
         outcome: "environment_failed",
@@ -604,6 +624,12 @@ export async function runInvestigationPipeline(
       extraComment,
     );
   } catch (error) {
+    // Typed transient repository errors propagate to the worker retry
+    // classifier instead of becoming a completed execution_failed result.
+    if (error instanceof RepositoryError && error.retryable) {
+      throw error;
+    }
+
     console.error(`[${investigationId}] Investigation failed:`, error);
 
     const summary: InvestigationSummary = {
