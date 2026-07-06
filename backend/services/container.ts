@@ -39,6 +39,46 @@ export const CONTAINER_DEFAULTS = {
   user: "node",
 };
 
+// --- Sandbox outbound network policy -----------------------------------------
+//
+// Phases differ in what network they legitimately need:
+// - dependency install: outbound network (package registries) — always.
+// - app runtime: stays on the default bridge because localhost-only port
+//   publishing (-p 127.0.0.1:...) does not work without it. Its outbound
+//   access is a DOCUMENTED LIMITATION of the strict policy.
+// - repository-validation commands: no network at all under strict.
+// - generated regression tests: under strict they either get no network
+//   (no app access needed) or join the app container's network namespace
+//   (--network=container:<app>), which lets them reach the target app at
+//   localhost:<internal port> without a network path of their own.
+//
+// permissive preserves the previous behavior everywhere for local debugging
+// or environments where these Docker options are unsupported.
+
+export type SandboxNetworkPolicy = "strict" | "permissive";
+
+export function getSandboxNetworkPolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): SandboxNetworkPolicy {
+  const value = env.SHERLOCK_SANDBOX_NETWORK_POLICY ?? "strict";
+
+  if (value === "strict" || value === "permissive") {
+    return value;
+  }
+
+  // Fail safe: an unknown value falls back to the SECURE default.
+  console.warn(
+    `Unknown SHERLOCK_SANDBOX_NETWORK_POLICY "${value}"; falling back to "strict".`,
+  );
+  return "strict";
+}
+
+// Explicit network configuration for a container. Absent means the Docker
+// default (bridge) — required for installs and the published app port.
+export type ContainerNetwork =
+  | "none"
+  | { joinContainer: string };
+
 // --- Target environment construction ----------------------------------------
 //
 // The worker's process.env is NEVER passed through. Only the variables built
@@ -137,7 +177,11 @@ export type ContainerRunSpec = {
   // Adds the Docker host-gateway alias so a verification container can reach
   // the sandbox application published on the host's localhost. Adds a DNS
   // name only — no host networking, and the restriction set is unchanged.
+  // Mutually exclusive with `network` (a container-mode netns rejects
+  // --add-host, and none needs no gateway).
   addHostGateway?: boolean;
+  // Outbound network restriction; absent = Docker default bridge.
+  network?: ContainerNetwork;
 };
 
 export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
@@ -168,7 +212,15 @@ export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
     );
   }
 
-  if (spec.addHostGateway) {
+  if (spec.network === "none") {
+    args.push("--network=none");
+  } else if (spec.network) {
+    args.push(`--network=container:${spec.network.joinContainer}`);
+  }
+
+  // --add-host is invalid with a container-mode netns and pointless with
+  // none; only emit it on the default bridge.
+  if (spec.addHostGateway && !spec.network) {
     args.push("--add-host=host.docker.internal:host-gateway");
   }
 

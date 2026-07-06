@@ -156,6 +156,17 @@ describe("container-only sandbox", () => {
       }
     }
 
+    // Network policy: the dependency install MUST keep outbound network
+    // (package registries), and the app container stays on the default
+    // bridge because the localhost-only published port requires it.
+    expect(install.join(" ")).not.toContain("--network");
+    expect(app.join(" ")).not.toContain("--network");
+    expect(app[app.indexOf("-p") + 1]).toMatch(/^127\.0\.0\.1:/);
+
+    // The app container's identity is exposed for strict-network regression
+    // containers to join.
+    expect(session.result.containerName).toMatch(/^sherlock-app-/);
+
     // Probing and the base URL use the allocated host port only.
     expect(probedUrls[0]).toBe(`http://localhost:${hostPort}`);
     expect(session.result.baseUrl).toBe(`http://localhost:${hostPort}`);
