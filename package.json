@@ -19,6 +19,7 @@
     "replay": "node ./lib/backend/replay.js",
     "test": "vitest",
     "worker": "node ./lib/backend/worker.js",
+    "worker:check": "node ./lib/backend/worker-preflight.js",
     "redis:up": "docker compose up -d redis",
     "redis:down": "docker compose down"
   },
