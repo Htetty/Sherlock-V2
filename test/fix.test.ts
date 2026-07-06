@@ -15,6 +15,10 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import { createArtifactStore, createInvestigationId } from "../backend/services/artifacts.js";
 import {
+  CONTAINER_DEFAULTS,
+  type DockerAdapter,
+} from "../backend/services/container.js";
+import {
   FIX_PROPOSAL_VERSION,
   extractFixProposalJson,
   requestValidProposal,
@@ -122,6 +126,43 @@ while (Date.now() < deadline) {
 app.kill("SIGKILL");
 process.exit(status === 401 ? 0 : 1);
 `;
+
+// Emulates the restricted-container adapter by executing the in-container
+// argv directly on the host inside the mounted workspace. This keeps the fix
+// loop's verification path end-to-end (real processes, real exit codes)
+// without requiring a Docker daemon, while still exercising the exact argv
+// and lifecycle the real adapter would receive.
+function createHostEmulatingDocker() {
+  const containerNames: string[] = [];
+  const removed: string[] = [];
+
+  const adapter: DockerAdapter = {
+    isAvailable: async () => true,
+    spawnContainer: (args) => {
+      containerNames.push(args[args.indexOf("--name") + 1]);
+      const volume = args[args.indexOf("-v") + 1];
+      const cwd = volume.slice(0, volume.lastIndexOf(":"));
+      const imageIndex = args.indexOf(CONTAINER_DEFAULTS.image);
+      const argv = args.slice(imageIndex + 1);
+
+      const child = spawn(argv[0], argv.slice(1), {
+        cwd,
+        env: { ...process.env },
+      });
+      runningApps.push(child);
+      return child as ChildProcess & {
+        stdout: NonNullable<ChildProcess["stdout"]>;
+        stderr: NonNullable<ChildProcess["stderr"]>;
+        stdin: NonNullable<ChildProcess["stdin"]>;
+      };
+    },
+    removeContainer: async (name) => {
+      removed.push(name);
+    },
+  };
+
+  return { adapter, containerNames, removed };
+}
 
 let runningApps: ChildProcess[] = [];
 
@@ -303,6 +344,7 @@ describe("verified fix loop", () => {
     async () => {
       const setup = await setupReproducedInvestigation();
       const before = await readOriginalArtifacts(setup.store.dir);
+      const docker = createHostEmulatingDocker();
 
       const attempt = await runFixAttempt({
         investigationId: setup.investigationId,
@@ -313,6 +355,7 @@ describe("verified fix loop", () => {
         originalOutcome: setup.original.outcome,
         proposal: correctProposal(),
         restart: setup.restart,
+        docker: docker.adapter,
       });
 
       expect(attempt.outcome).toBe("verified");
@@ -321,6 +364,13 @@ describe("verified fix loop", () => {
       expect(attempt.fixAttemptId).toMatch(/^fix_[0-9A-Z]{10,}$/);
       expect(attempt.testRuns).toHaveLength(1);
       expect(attempt.testRuns[0].exitCode).toBe(0);
+      expect(attempt.testRuns[0].timedOut).toBe(false);
+
+      // The test command ran in its own short-lived container (not the app
+      // container) and was force-removed afterwards.
+      expect(docker.containerNames).toHaveLength(1);
+      expect(docker.containerNames[0]).toMatch(/^sherlock-test-/);
+      expect(docker.removed).toContain(docker.containerNames[0]);
 
       // The exact saved plan was replayed (hash recorded, steps untouched).
       const replayCheck = attempt.checks.find((c) => c.name === "exact_plan_replayed");
@@ -394,6 +444,7 @@ describe("verified fix loop", () => {
     { timeout: 120_000 },
     async () => {
       const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
 
       const attempt = await runFixAttempt({
         investigationId: setup.investigationId,
@@ -402,14 +453,27 @@ describe("verified fix loop", () => {
         sourceCommit: setup.commit,
         plan: setup.plan,
         originalOutcome: setup.original.outcome,
-        proposal: correctProposal({ relevantTests: ["node failing-test.mjs"] }),
+        proposal: correctProposal({
+          relevantTests: ["node failing-test.mjs", "node check-login.mjs"],
+        }),
         restart: setup.restart,
+        docker: docker.adapter,
       });
 
       expect(attempt.outcome).toBe("rejected_tests_failed");
       // The reproduction itself did pass post-patch.
       expect(attempt.postPatchOutcome).toBe("not_reproduced");
       expect(attempt.testRuns[0].exitCode).not.toBe(0);
+      expect(attempt.testRuns[1].exitCode).toBe(0);
+
+      // Each verification command got its own uniquely named short-lived
+      // container, and both were cleaned up.
+      expect(docker.containerNames).toHaveLength(2);
+      expect(new Set(docker.containerNames).size).toBe(2);
+
+      for (const name of docker.containerNames) {
+        expect(docker.removed).toContain(name);
+      }
     },
   );
 

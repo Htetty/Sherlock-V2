@@ -7,7 +7,6 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { buildLaunchConfig } from "../backend/services/launch.js";
-import { runSandboxInvestigation } from "../backend/services/sandbox.js";
 
 async function createFixture(packageJson: Record<string, unknown>) {
   const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-launch-"));
@@ -38,7 +37,7 @@ describe("framework-aware launch configuration", () => {
       "dev",
       "--",
       "--host",
-      "127.0.0.1",
+      "0.0.0.0",
       "--port",
       "51234",
     ]);
@@ -57,7 +56,7 @@ describe("framework-aware launch configuration", () => {
       "start",
       "--",
       "--host",
-      "127.0.0.1",
+      "0.0.0.0",
       "--port",
       "51240",
     ]);
@@ -93,35 +92,4 @@ describe("framework-aware launch configuration", () => {
     expect(launch.baseUrl).toBe("http://localhost:51236");
   });
 
-  test(
-    "an application that ignores the selected port returns an environment failure with the attempted command",
-    { timeout: 15_000 },
-    async () => {
-      const repoPath = await createFixture({
-        name: "stubborn-fixture",
-        scripts: { start: "node server.js" },
-      });
-      await writeFile(
-        path.join(repoPath, "server.js"),
-        `
-          const http = require("http");
-          // Ignores process.env.PORT entirely.
-          http.createServer((req, res) => res.end("wrong-port")).listen(59999);
-        `,
-        "utf8",
-      );
-
-      let caught: Error | null = null;
-
-      try {
-        await runSandboxInvestigation({ repoPath, startupTimeoutMs: 2_000 });
-      } catch (error) {
-        caught = error as Error;
-      }
-
-      expect(caught?.message).toMatch(/did not become reachable/);
-      expect(caught?.message).toMatch(/Attempted command: PORT=\d+ npm start/);
-      expect(caught?.message).toContain("stdout (tail)");
-    },
-  );
 });

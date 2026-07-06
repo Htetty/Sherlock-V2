@@ -40,8 +40,10 @@ export async function buildLaunchConfig(
       framework: "vite",
       command: "npm",
       args: buildNpmArgs(scripts, [
+        // 0.0.0.0 because the app runs inside a container: it must bind all
+        // interfaces for the (localhost-only) host port mapping to reach it.
         "--host",
-        "127.0.0.1",
+        "0.0.0.0",
         "--port",
         String(port),
       ]),

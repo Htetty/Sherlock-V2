@@ -23,6 +23,7 @@ import {
   processInvestigationJob,
   type WorkerDeps,
 } from "./queue/process-investigation.js";
+import { cleanupAllContainers } from "./services/container.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 
 const concurrency = Math.max(
@@ -105,6 +106,14 @@ async function shutdown(signal: string) {
     await connection.quit();
   } catch (error) {
     console.error("Error during shutdown:", error);
+  }
+
+  // Force-remove any target containers still alive (pipeline finally-blocks
+  // normally stop them; this sweep covers interrupted jobs).
+  const cleaned = await cleanupAllContainers();
+
+  if (cleaned.length > 0) {
+    console.log(`Force-removed ${cleaned.length} leftover target container(s).`);
   }
 
   process.exit(0);

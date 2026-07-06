@@ -1,19 +1,26 @@
-import {
-  exec,
-  spawn,
-  type ChildProcessWithoutNullStreams,
-} from "child_process";
-import { randomUUID } from "crypto";
-import { createServer } from "net";
-import { promisify } from "util";
+// Container-only sandbox for target applications.
+//
+// Security rule: no command from a target repository ever executes on the
+// Sherlock host. Installation and application startup always run inside
+// restricted Docker containers (see container.ts for the restriction set).
+// If Docker is unavailable the sandbox fails as environment_failed — there
+// is no host fallback.
+
+import { createServer } from "node:net";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { buildLaunchConfig, formatSanitizedCommand } from "./launch.js";
+import {
+  buildTargetEnv,
+  realDockerAdapter,
+  runContainerCommand,
+  startAppContainer,
+  type DockerAdapter,
+} from "./container.js";
 
-const execAsync = promisify(exec);
+export type { DockerAdapter } from "./container.js";
 
-// stop the sandbox if the app keeps running instead of exiting
-const SANDBOX_TIMEOUT_MS = 8_000;
 const SANDBOX_STARTUP_TIMEOUT_MS = 30_000;
-const DOCKER_CHECK_TIMEOUT_MS = 5_000;
+const INSTALL_TIMEOUT_MS = 180_000;
 
 // Probot (3000) and the Sherlock backend (4000) must never be handed out as a
 // target-application sandbox port: a collision makes reproduction silently
@@ -21,15 +28,7 @@ const DOCKER_CHECK_TIMEOUT_MS = 5_000;
 const RESERVED_PORTS = new Set([3000, 4000]);
 const MAX_PORT_ALLOCATION_ATTEMPTS = 10;
 
-type SandboxExecError = Error & {
-  stdout?: string | Buffer;
-  stderr?: string | Buffer;
-  code?: string | number | null;
-  signal?: NodeJS.Signals | null;
-  killed?: boolean;
-};
-
-export type SandboxStrategy = "direct" | "docker-fixed-port";
+export type SandboxStrategy = "container-dynamic-port" | "container-fixed-port";
 
 export type SandboxResult = {
   baseUrl: string;
@@ -46,9 +45,9 @@ export type SandboxSession = {
   stop: () => Promise<void>;
 };
 
-// Thrown when the target application never becomes reachable on its
-// allocated port (it crashed, hung, or ignored PORT). Callers must classify
-// this as an environment failure, never as part of the reproduction result.
+// Thrown when the target application environment cannot be started or never
+// becomes reachable. Callers must classify this as an environment failure,
+// never as part of the reproduction result.
 export class SandboxUnreachableError extends Error {
   constructor(
     message: string,
@@ -62,231 +61,209 @@ export class SandboxUnreachableError extends Error {
   }
 }
 
-// All Docker interactions go through this adapter so tests can simulate
-// container behavior without a running Docker daemon.
-export type DockerAdapter = {
-  isAvailable: () => Promise<boolean>;
-  spawnContainer: (args: string[]) => ChildProcessWithoutNullStreams;
-  removeContainer: (containerName: string) => Promise<void>;
-};
+// Readiness probe is injectable so unit tests can simulate container
+// reachability without a Docker daemon.
+export type UrlProbe = (baseUrl: string, timeoutMs: number) => Promise<boolean>;
 
-const defaultDockerAdapter: DockerAdapter = {
-  isAvailable: async () => {
+const defaultProbe: UrlProbe = async (baseUrl, timeoutMs) => {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
     try {
-      await execAsync("docker info", { timeout: DOCKER_CHECK_TIMEOUT_MS });
+      await fetch(baseUrl, { signal: AbortSignal.timeout(2_000) });
       return true;
     } catch {
-      return false;
+      await wait(500);
     }
-  },
-  spawnContainer: (args) => spawn("docker", args),
-  removeContainer: async (containerName) => {
-    await execAsync(`docker rm -f ${containerName}`);
-  },
+  }
+
+  return false;
 };
 
 export async function runSandboxInvestigation({
   repoPath,
   startupTimeoutMs = SANDBOX_STARTUP_TIMEOUT_MS,
-  docker = defaultDockerAdapter,
+  docker = realDockerAdapter,
+  probe = defaultProbe,
 }: {
   repoPath: string;
   startupTimeoutMs?: number;
   docker?: DockerAdapter;
+  probe?: UrlProbe;
 }): Promise<SandboxSession> {
-  // 1) Normal startup: run the framework-appropriate command directly with
-  // the allocated dynamic port.
-  let directError: SandboxUnreachableError;
-  let details: NonNullable<SandboxUnreachableError["details"]>;
-
-  try {
-    return await runLocalSandbox(repoPath, startupTimeoutMs);
-  } catch (error) {
-    if (!(error instanceof SandboxUnreachableError) || !error.details) {
-      throw error;
-    }
-
-    directError = error;
-    details = error.details;
-  }
-
-  // 2) The app never bound the allocated port. Inspect its startup output
-  // for evidence of a fixed internal port (e.g. "running on
-  // http://localhost:3000" while PORT pointed elsewhere). The logged port is
-  // only ever used as a container-internal port, never as the base URL.
-  const internalPort = detectFixedInternalPort(
-    `${details.stdout}\n${details.stderr}`,
-    details.allocatedPort,
-  );
-
-  if (internalPort === null) {
-    throw directError;
-  }
-
-  // 3) A fixed-port app must never run directly on the host: its hardcoded
-  // port could collide with Probot (3000) or the Sherlock backend (4000).
-  // Docker port mapping exposes it on the safe allocated host port instead.
+  // Container-only policy: without Docker there is no safe way to run the
+  // target repository's code, so the environment fails outright.
   if (!(await docker.isAvailable())) {
     throw new SandboxUnreachableError(
       [
-        directError.message,
-        `The application appears to ignore PORT and listen on fixed internal port ${internalPort}.`,
-        "Docker is not available, so Sherlock cannot isolate the fixed port behind a safe host port mapping.",
-        "Start Docker (or make the application honor PORT) and retry.",
+        "Docker is not available on the Sherlock worker host.",
+        "Target repositories only ever run inside isolated containers, so the application environment could not be started.",
+        "Start the Docker daemon and retry the investigation.",
       ].join("\n"),
-      details,
     );
   }
 
-  return runFixedPortContainerSandbox(
+  const hostPort = await getAvailablePort();
+  const baseUrl = `http://localhost:${hostPort}`;
+
+  // Dependency installation runs in its own short-lived restricted
+  // container, never on the host.
+  const install = await runContainerCommand(docker, {
+    purpose: "install",
+    workspacePath: repoPath,
+    env: buildTargetEnv({ port: hostPort }),
+    command: ["npm", "install"],
+    timeoutMs: INSTALL_TIMEOUT_MS,
+  });
+
+  if (install.exitCode !== 0) {
+    throw new SandboxUnreachableError(
+      [
+        `Dependency installation failed in the target container (exit ${install.exitCode}${install.timedOut ? ", timed out" : ""}).`,
+        `Attempted command: ${install.sanitizedCommand}`,
+        `stdout (tail): ${tail(install.stdout)}`,
+        `stderr (tail): ${tail(install.stderr)}`,
+      ].join("\n"),
+      { stdout: install.stdout, stderr: install.stderr, allocatedPort: hostPort },
+    );
+  }
+
+  // First attempt: the allocated host port doubles as the container-internal
+  // PORT, mapped 1:1.
+  const first = await startApplicationAttempt({
     repoPath,
-    details.allocatedPort,
-    internalPort,
-    startupTimeoutMs,
     docker,
+    probe,
+    startupTimeoutMs,
+    hostPort,
+    internalPort: hostPort,
+    strategy: "container-dynamic-port",
+    installOutput: install,
+  });
+
+  if (first.session) {
+    return first.session;
+  }
+
+  // Hardcoded-port fallback: the app ignored PORT. Look for the fixed
+  // internal port it logged (bounded detection rules); that port is only
+  // ever used as the container-internal side of the mapping — the public
+  // base URL stays on the allocated host port.
+  const internalPort = detectFixedInternalPort(
+    `${first.stdout}\n${first.stderr}`,
+    hostPort,
+  );
+
+  if (internalPort === null) {
+    throw new SandboxUnreachableError(
+      [
+        `Target application did not become reachable at ${baseUrl} and no fixed internal port could be detected from its startup output.`,
+        `Attempted command: ${first.sanitizedCommand}`,
+        `stdout (tail): ${tail(first.stdout)}`,
+        `stderr (tail): ${tail(first.stderr)}`,
+      ].join("\n"),
+      { stdout: first.stdout, stderr: first.stderr, allocatedPort: hostPort },
+    );
+  }
+
+  const second = await startApplicationAttempt({
+    repoPath,
+    docker,
+    probe,
+    startupTimeoutMs,
+    hostPort,
+    internalPort,
+    strategy: "container-fixed-port",
+    installOutput: install,
+  });
+
+  if (second.session) {
+    return second.session;
+  }
+
+  throw new SandboxUnreachableError(
+    [
+      `Target application (fixed internal port ${internalPort}) did not become reachable at ${baseUrl} through container port mapping ${hostPort}:${internalPort}.`,
+      `Attempted command: ${second.sanitizedCommand}`,
+      `stdout (tail): ${tail(second.stdout)}`,
+      `stderr (tail): ${tail(second.stderr)}`,
+    ].join("\n"),
+    { stdout: second.stdout, stderr: second.stderr, allocatedPort: hostPort },
   );
 }
 
-async function runLocalSandbox(
-  repoPath: string,
-  startupTimeoutMs: number,
-): Promise<SandboxSession> {
-  const port = await getAvailablePort();
-  const launch = await buildLaunchConfig(repoPath, port);
-  const installResult = await runCommand("npm install", repoPath);
-  const appProcess = spawn(launch.command, launch.args, {
-    cwd: repoPath,
-    env: {
-      ...process.env,
-      ...launch.env,
-    },
-    shell: true,
+type AttemptResult = {
+  session: SandboxSession | null;
+  stdout: string;
+  stderr: string;
+  sanitizedCommand: string;
+};
+
+async function startApplicationAttempt(input: {
+  repoPath: string;
+  docker: DockerAdapter;
+  probe: UrlProbe;
+  startupTimeoutMs: number;
+  hostPort: number;
+  internalPort: number;
+  strategy: SandboxStrategy;
+  installOutput: { stdout: string; stderr: string };
+}): Promise<AttemptResult> {
+  const baseUrl = `http://localhost:${input.hostPort}`;
+  // Launch flags/env are built against the container-internal port; the
+  // public base URL always stays on the allocated host port.
+  const launch = await buildLaunchConfig(input.repoPath, input.internalPort);
+
+  const app = startAppContainer(input.docker, {
+    workspacePath: input.repoPath,
+    env: buildTargetEnv({ port: input.internalPort }),
+    command: [launch.command, ...launch.args],
+    portMapping: { hostPort: input.hostPort, containerPort: input.internalPort },
   });
 
   const output: SandboxResult = {
-    baseUrl: launch.baseUrl,
-    stdout: installResult.stdout,
-    stderr: installResult.stderr,
-    strategy: "direct",
-    hostPort: port,
-    internalPort: null,
-    command: formatSanitizedCommand(launch),
+    baseUrl,
+    stdout: input.installOutput.stdout,
+    stderr:
+      input.strategy === "container-fixed-port"
+        ? `${input.installOutput.stderr}\nApplication ignored PORT; retried with container port mapping ${input.hostPort}:${input.internalPort}.\n`
+        : input.installOutput.stderr,
+    strategy: input.strategy,
+    hostPort: input.hostPort,
+    internalPort: input.internalPort,
+    command: app.sanitizedCommand,
   };
 
-  // keep collecting app logs while playwright reproduces the issue
-  collectProcessOutput(appProcess, output);
+  collectProcessOutput(app.process, output);
 
-  // The base URL is always the port Sherlock allocated, launched with a
-  // framework-appropriate command (see launch.ts), never a value scraped
-  // from the app's own log output: apps often print a hardcoded default
-  // port in their boilerplate startup message regardless of what they
-  // actually bind to, which previously caused Sherlock to trust a stale or
-  // incorrect URL instead of the real one.
-  try {
-    await Promise.race([
-      waitForSandboxUrl(launch.baseUrl, output, startupTimeoutMs),
-      waitForProcessSpawnError(appProcess),
-    ]);
-  } catch (error) {
-    await stopSandboxApp(appProcess, output);
-    throw new SandboxUnreachableError(
-      [
-        `Target application (${launch.framework}) did not become reachable at ${launch.baseUrl}: ${formatError(error)}`,
-        `Attempted command: ${formatSanitizedCommand(launch)}`,
-        `stdout (tail): ${tail(output.stdout)}`,
-        `stderr (tail): ${tail(output.stderr)}`,
-      ].join("\n"),
-      { stdout: output.stdout, stderr: output.stderr, allocatedPort: port },
-    );
+  const reachable = await Promise.race([
+    input.probe(baseUrl, input.startupTimeoutMs),
+    waitForProcessSpawnError(app.process),
+  ]).catch(() => false);
+
+  if (!reachable) {
+    // The base URL is never replaced by anything the app logs; a failed
+    // attempt is stopped and force-removed before any fallback.
+    await app.stop();
+
+    return {
+      session: null,
+      stdout: output.stdout,
+      stderr: output.stderr,
+      sanitizedCommand: app.sanitizedCommand,
+    };
   }
+
+  // The framework-appropriate startup command (see launch.ts) is recorded in
+  // sanitized form; formatSanitizedCommand covers the in-container argv.
+  output.command = `${app.sanitizedCommand} (launch: ${formatSanitizedCommand(launch)})`;
 
   return {
-    result: output,
-    stop: async () => {
-      await stopSandboxApp(appProcess, output);
-    },
+    session: { result: output, stop: app.stop },
+    stdout: output.stdout,
+    stderr: output.stderr,
+    sanitizedCommand: app.sanitizedCommand,
   };
-}
-
-// Runs an app that ignores PORT inside an isolated container, mapping the
-// safe allocated host port onto the app's fixed internal port. The
-// reproduction base URL stays http://localhost:<allocated-host-port>.
-async function runFixedPortContainerSandbox(
-  repoPath: string,
-  hostPort: number,
-  internalPort: number,
-  startupTimeoutMs: number,
-  docker: DockerAdapter,
-): Promise<SandboxSession> {
-  const baseUrl = `http://localhost:${hostPort}`;
-  const containerName = `bugfixbot-sandbox-${randomUUID()}`;
-  const args = [
-    "run",
-    "--rm",
-    "--name",
-    containerName,
-    "-p",
-    `${hostPort}:${internalPort}`,
-    "-e",
-    `PORT=${internalPort}`,
-    "-v",
-    `${repoPath}:/app`,
-    "-w",
-    "/app",
-    "node:20-slim",
-    "sh",
-    "-lc",
-    "npm install && npm start",
-  ];
-  // Local absolute workspace paths must not leak into diagnostics that can
-  // end up in public GitHub comments.
-  const sanitizedCommand = `docker ${args.join(" ")}`.replace(
-    repoPath,
-    "<workspace>",
-  );
-  const appProcess = docker.spawnContainer(args);
-
-  const output: SandboxResult = {
-    baseUrl,
-    stdout: "",
-    stderr: `Application ignored PORT; retried in a container with host port mapping ${hostPort}:${internalPort}.\n`,
-    strategy: "docker-fixed-port",
-    hostPort,
-    internalPort,
-    command: sanitizedCommand,
-  };
-
-  collectProcessOutput(appProcess, output);
-
-  const stop = async () => {
-    await docker.removeContainer(containerName).catch((error: unknown) => {
-      output.stderr += `\nCould not remove sandbox container: ${formatError(error)}`;
-    });
-
-    if (appProcess.exitCode === null) {
-      appProcess.kill("SIGTERM");
-    }
-  };
-
-  try {
-    await Promise.race([
-      waitForSandboxUrl(baseUrl, output, startupTimeoutMs),
-      waitForProcessSpawnError(appProcess),
-    ]);
-  } catch (error) {
-    await stop();
-    throw new SandboxUnreachableError(
-      [
-        `Target application (fixed internal port ${internalPort}) did not become reachable at ${baseUrl} through container port mapping: ${formatError(error)}`,
-        `Attempted command: ${sanitizedCommand}`,
-        `stdout (tail): ${tail(output.stdout)}`,
-        `stderr (tail): ${tail(output.stderr)}`,
-      ].join("\n"),
-      { stdout: output.stdout, stderr: output.stderr, allocatedPort: hostPort },
-    );
-  }
-
-  return { result: output, stop };
 }
 
 // Ports the app itself claims to be listening on in its startup output.
@@ -323,77 +300,6 @@ function collectProcessOutput(
   appProcess.stderr.on("data", (chunk) => {
     output.stderr += chunk.toString();
   });
-}
-
-async function runCommand(
-  command: string,
-  repoPath: string,
-): Promise<SandboxResult> {
-  try {
-    // run setup commands and collect their output for claude
-    const { stdout, stderr } = await execAsync(command, {
-      cwd: repoPath,
-      timeout: SANDBOX_TIMEOUT_MS,
-      maxBuffer: 1024 * 1024,
-    });
-
-    return {
-      baseUrl: "",
-      stdout,
-      stderr,
-    };
-  } catch (error) {
-    const execError = error as SandboxExecError;
-
-    // return failed command output so claude can use it as evidence
-    return {
-      baseUrl: "",
-      stdout: formatCommandOutput(execError.stdout),
-      stderr: [
-        formatCommandOutput(execError.stderr),
-        formatSandboxError(execError),
-      ]
-        .filter(Boolean)
-        .join("\n"),
-    };
-  }
-}
-
-async function stopSandboxApp(
-  appProcess: ChildProcessWithoutNullStreams,
-  output: SandboxResult,
-) {
-  if (appProcess.exitCode !== null) {
-    return;
-  }
-
-  appProcess.kill("SIGTERM");
-  await wait(500);
-
-  if (appProcess.exitCode === null) {
-    appProcess.kill("SIGKILL");
-    output.stderr += "\nSandbox app was force killed after investigation.";
-  }
-}
-
-async function waitForSandboxUrl(
-  baseUrl: string,
-  output: SandboxResult,
-  timeoutMs: number,
-) {
-  const startedAt = Date.now();
-
-  while (Date.now() - startedAt < timeoutMs) {
-    try {
-      await fetch(baseUrl);
-      return;
-    } catch {
-      await wait(500);
-    }
-  }
-
-  output.stderr += `\nSandbox did not respond at ${baseUrl} within ${timeoutMs}ms.`;
-  throw new Error(`Sandbox did not respond at ${baseUrl} within ${timeoutMs}ms.`);
 }
 
 function waitForProcessSpawnError(appProcess: ChildProcessWithoutNullStreams) {
@@ -442,37 +348,6 @@ function allocateEphemeralPort() {
       });
     });
   });
-}
-
-// convert command output into text that can be added to the claude prompt
-function formatCommandOutput(output: string | Buffer | undefined) {
-  if (!output) {
-    return "";
-  }
-
-  return output.toString();
-}
-
-// include why the sandbox stopped, especially timeout and exit code info
-function formatSandboxError(error: SandboxExecError) {
-  const details = [
-    `Sandbox command failed: ${error.message}`,
-    error.code === undefined || error.code === null
-      ? null
-      : `Exit code: ${error.code}`,
-    error.signal ? `Signal: ${error.signal}` : null,
-    error.killed ? "Process was killed after sandbox timeout." : null,
-  ];
-
-  return details.filter(Boolean).join("\n");
-}
-
-function formatError(error: unknown) {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  return String(error);
 }
 
 const MAX_DIAGNOSTIC_TAIL_CHARS = 600;

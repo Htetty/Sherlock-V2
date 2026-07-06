@@ -6,7 +6,7 @@
 // passed in (Claude-generated in production, stubbed in tests) and the
 // restart behavior is injected so the loop is independent of the sandbox.
 
-import { exec, execFile } from "node:child_process";
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -17,6 +17,12 @@ import {
   type ArtifactStore,
 } from "./artifacts.js";
 import {
+  buildTargetEnv,
+  realDockerAdapter,
+  runContainerCommand,
+  type DockerAdapter,
+} from "./container.js";
+import {
   renderProposedPatch,
   validateFixProposalShape,
   validatePatchSafety,
@@ -25,7 +31,6 @@ import {
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
 
-const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const TEST_COMMAND_TIMEOUT_MS = 180_000;
@@ -50,6 +55,7 @@ export type TestRunRecord = {
   exitCode: number;
   durationMs: number;
   targeted: boolean;
+  timedOut: boolean;
   stdoutFile: string;
   stderrFile: string;
 };
@@ -70,6 +76,9 @@ export type FixAttemptInput = {
   proposal: unknown;
   restart: () => Promise<RestartResult>;
   probeTimeoutMs?: number;
+  // Verification commands run in restricted containers through this
+  // adapter; injectable so tests run without a Docker daemon.
+  docker?: DockerAdapter;
 };
 
 export type FixAttemptResult = {
@@ -350,7 +359,14 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
   let testsPassed = true;
 
   for (const [index, command] of commands.entries()) {
-    const run = await runTestCommand(command, input.repoPath, store, index, targeted);
+    const run = await runTestCommand(
+      command,
+      input.repoPath,
+      store,
+      index,
+      targeted,
+      input.docker ?? realDockerAdapter,
+    );
     result.testRuns.push(run);
 
     if (run.exitCode !== 0) {
@@ -411,48 +427,44 @@ function resolveTestCommands(proposal: FixProposal) {
   return { commands: [] as string[], targeted: false };
 }
 
+// Model-proposed test commands never run on the host: each executes in its
+// own short-lived restricted container (same image, workspace mount, env
+// policy, and limits as the app container) so it cannot contaminate the
+// running application. The command was already validated by
+// validateFixProposalShape to be a plain npm/npx/node command with no shell
+// operators, so whitespace-splitting into argv is exact — no shell anywhere.
 async function runTestCommand(
   command: string,
   repoPath: string,
   store: ArtifactStore,
   index: number,
   targeted: boolean,
+  docker: DockerAdapter,
 ): Promise<TestRunRecord> {
-  const startedAt = Date.now();
   const stdoutFile = path.join(store.dir, `test-${index + 1}-stdout.log`);
   const stderrFile = path.join(store.dir, `test-${index + 1}-stderr.log`);
 
-  let exitCode = 0;
-  let stdout = "";
-  let stderr = "";
+  const run = await runContainerCommand(docker, {
+    purpose: "test",
+    workspacePath: repoPath,
+    env: buildTargetEnv(),
+    command: command.trim().split(/\s+/),
+    timeoutMs: TEST_COMMAND_TIMEOUT_MS,
+  });
 
-  try {
-    const output = await execAsync(command, {
-      cwd: repoPath,
-      timeout: TEST_COMMAND_TIMEOUT_MS,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    stdout = output.stdout;
-    stderr = output.stderr;
-  } catch (error) {
-    const execError = error as Error & {
-      code?: number | string | null;
-      stdout?: string;
-      stderr?: string;
-    };
-    exitCode = typeof execError.code === "number" ? execError.code : 1;
-    stdout = execError.stdout ?? "";
-    stderr = [execError.stderr ?? "", execError.message].filter(Boolean).join("\n");
-  }
+  const stderr = run.timedOut
+    ? `${run.stderr}\nTest command timed out after ${TEST_COMMAND_TIMEOUT_MS}ms and its container was force-removed.`
+    : run.stderr;
 
-  await writeFile(stdoutFile, stdout, "utf8");
+  await writeFile(stdoutFile, run.stdout, "utf8");
   await writeFile(stderrFile, stderr, "utf8");
 
   return {
     command,
-    exitCode,
-    durationMs: Date.now() - startedAt,
+    exitCode: run.exitCode,
+    durationMs: run.durationMs,
     targeted,
+    timedOut: run.timedOut,
     stdoutFile,
     stderrFile,
   };
