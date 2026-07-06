@@ -385,6 +385,11 @@ describe("verified fix loop", () => {
       expect(attempt.testRuns[0].command).toBe("npm run test");
       expect(attempt.testRuns[0].exitCode).toBe(0);
       expect(attempt.testRuns[0].timedOut).toBe(false);
+      // No generator injected: regression testing is truthfully unavailable
+      // and never a fake pass, while replay + validation still verify.
+      expect(attempt.regressionTest?.status).toBe("unavailable");
+      expect(attempt.regressionTest?.prePatch).toBeNull();
+
       expect(attempt.repositoryValidation).toEqual({
         aggregate: "passed",
         categories: [
@@ -414,6 +419,7 @@ describe("verified fix loop", () => {
         "build-result.json",
         "post-patch-reproduction-result.json",
         "repository-validation.json",
+        "regression-test.json",
         "test-results.json",
         "verification-result.json",
       ]) {
@@ -731,6 +737,310 @@ describe("verified fix loop", () => {
     expect(attempt.reason).toContain("Precondition failed");
     expect(await readFile(path.join(repoPath, "server.mjs"), "utf8")).toBe(serverBefore);
   });
+});
+
+// Regression-test lifecycle against the real fixture workspace: generated
+// tests are injected (Claude is mocked) and executed through the
+// host-emulating container adapter.
+describe("regression-test verification loop", () => {
+  const regressionProposal = (contents: string, name = "login-does-not-return-500") => ({
+    version: 1,
+    testName: name,
+    purpose: "Prove the login handler behavior.",
+    relativePath: "sherlock-regression.test.mjs",
+    runner: "node",
+    contents,
+    expectedPrePatchFailure: "The assertion fails on the buggy source.",
+    expectedPostPatchBehavior: "The assertion passes after the fix.",
+  });
+
+  const FAILS_ON_BUGGY = `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(!source.includes("res.writeHead(500"), "REGRESSION_EXPECTED_FAILURE: login handler must not respond 500");
+`;
+
+  test(
+    "fail-before/pass-after with identical bytes permits verification",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      let generatorCalls = 0;
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () => {
+          generatorCalls += 1;
+          return regressionProposal(FAILS_ON_BUGGY);
+        },
+      });
+
+      expect(attempt.outcome).toBe("verified");
+      expect(generatorCalls).toBe(1);
+      expect(attempt.regressionTest).toMatchObject({
+        status: "proven",
+        testName: "login-does-not-return-500",
+        prePatch: "failed_as_expected",
+        postPatch: "passed",
+        hashMatched: true,
+        generationAttempts: 1,
+      });
+      expect(attempt.regressionTest?.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+      // Both runs happened in their own regression containers.
+      const regressionContainers = docker.containerNames.filter((name) =>
+        name.startsWith("sherlock-regression-"),
+      );
+      expect(regressionContainers).toHaveLength(2);
+
+      // The generated test is evidence only: gone from the workspace, with
+      // only the intended patch file changed — it can never reach the PR.
+      await expect(
+        stat(path.join(setup.repoPath, "sherlock-regression.test.mjs")),
+      ).rejects.toThrow();
+      const status = await execFileAsync("git", ["status", "--short"], {
+        cwd: setup.repoPath,
+      });
+      expect(status.stdout.trim()).toBe("M server.mjs");
+
+      // The intended production patch is intact.
+      const patched = await readFile(path.join(setup.repoPath, "server.mjs"), "utf8");
+      expect(patched).toContain("res.writeHead(401");
+
+      // Structured artifacts exist, with the exact source bytes preserved.
+      for (const fileName of [
+        "regression-test.json",
+        "regression-test-source.mjs",
+        "regression-prepatch-result.json",
+        "regression-postpatch-result.json",
+      ]) {
+        const info = await stat(path.join(attempt.attemptDir, fileName));
+        expect(info.isFile()).toBe(true);
+      }
+      expect(
+        await readFile(path.join(attempt.attemptDir, "regression-test-source.mjs"), "utf8"),
+      ).toBe(FAILS_ON_BUGGY);
+      const artifact = JSON.parse(
+        await readFile(path.join(attempt.attemptDir, "regression-test.json"), "utf8"),
+      );
+      expect(artifact.status).toBe("proven");
+      expect(JSON.stringify(artifact)).not.toContain("SECRET_TOKEN");
+    },
+  );
+
+  test(
+    "a test that unexpectedly passes on the original source rejects the fix before patching",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () =>
+          regressionProposal(
+            `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(source.includes("http"), "REGRESSION_EXPECTED_FAILURE: trivially true on the buggy source");
+`,
+            "trivially-passing-test",
+          ),
+      });
+
+      expect(attempt.outcome).toBe("rejected_regression_test_failed");
+      expect(attempt.regressionTest?.status).toBe("blocked");
+      expect(attempt.regressionTest?.prePatch).toBe("unexpectedly_passed");
+
+      // The patch was never applied: the buggy source is untouched.
+      const source = await readFile(path.join(setup.repoPath, "server.mjs"), "utf8");
+      expect(source).toContain("res.writeHead(500");
+    },
+  );
+
+  test(
+    "one invalid proposal permits exactly one refinement, and invalid twice is truthfully unavailable",
+    { timeout: 120_000 },
+    async () => {
+      // Invalid (syntax error) then valid: refinement succeeds.
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      const feedbackSeen: (string | null)[] = [];
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async (feedback) => {
+          feedbackSeen.push(feedback);
+          return feedbackSeen.length === 1
+            ? regressionProposal(
+                'const assert = ; // REGRESSION_EXPECTED_FAILURE: broken\n',
+                "broken-syntax-test",
+              )
+            : regressionProposal(FAILS_ON_BUGGY);
+        },
+      });
+
+      expect(attempt.outcome).toBe("verified");
+      expect(attempt.regressionTest?.status).toBe("proven");
+      expect(attempt.regressionTest?.generationAttempts).toBe(2);
+      expect(feedbackSeen).toHaveLength(2);
+      expect(feedbackSeen[0]).toBeNull();
+      expect(feedbackSeen[1]).toContain("invalid_test");
+
+      // Invalid twice: bounded at two attempts, no third call, neutral and
+      // truthful — verification still succeeds via replay, never a fake pass.
+      const setup2 = await setupReproducedInvestigation();
+      const docker2 = createHostEmulatingDocker();
+      let calls = 0;
+
+      const attempt2 = await runFixAttempt({
+        investigationId: setup2.investigationId,
+        investigationDir: setup2.store.dir,
+        repoPath: setup2.repoPath,
+        sourceCommit: setup2.commit,
+        plan: setup2.plan,
+        originalOutcome: setup2.original.outcome,
+        proposal: correctProposal(),
+        restart: setup2.restart,
+        docker: docker2.adapter,
+        generateRegressionTest: async () => {
+          calls += 1;
+          return regressionProposal(
+            'const assert = ; // REGRESSION_EXPECTED_FAILURE: still broken\n',
+            "still-broken-test",
+          );
+        },
+      });
+
+      expect(calls).toBe(2);
+      expect(attempt2.outcome).toBe("verified");
+      expect(attempt2.regressionTest?.status).toBe("unavailable");
+      expect(attempt2.regressionTest?.prePatch).toBe("invalid_test");
+      const regressionCheck = attempt2.checks.find((c) => c.name === "regression_test");
+      expect(regressionCheck?.passed).toBe(true);
+      expect(regressionCheck?.detail).toContain("No generated regression test was available");
+    },
+  );
+
+  test(
+    "a wrong-route setup failure is never accepted as behavioral proof and does not block a replay-verified patch",
+    { timeout: 120_000 },
+    async () => {
+      // Reproduces live inv_1JSR0AM8Q8T19Z3: the generated test hit an
+      // invented endpoint, its SETUP assertion failed (404-style), and that
+      // must classify as invalid_test — not failed_as_expected — leaving
+      // the replay-verified patch verifiable once generation is exhausted.
+      const WRONG_ROUTE_TEST = `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+let body = null;
+try {
+  body = await readFile("this-route-does-not-exist.json", "utf8");
+} catch {
+  assert.fail("Archive request should succeed, got 404");
+}
+assert.ok(!body.includes("nope"), "REGRESSION_EXPECTED_FAILURE: archived task reappeared");
+`;
+
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      const feedbackSeen: (string | null)[] = [];
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async (feedback) => {
+          feedbackSeen.push(feedback);
+          return regressionProposal(WRONG_ROUTE_TEST, "wrong-route-test");
+        },
+      });
+
+      // Setup failure without the marker: invalid, refined once, then
+      // truthfully unavailable — never blocking the replay-verified patch.
+      expect(attempt.regressionTest?.prePatch).toBe("invalid_test");
+      expect(attempt.regressionTest?.status).toBe("unavailable");
+      expect(attempt.regressionTest?.generationAttempts).toBe(2);
+      expect(attempt.outcome).toBe("verified");
+
+      // The refinement feedback teaches the model what went wrong.
+      expect(feedbackSeen).toHaveLength(2);
+      expect(feedbackSeen[1]).toContain("invalid_test");
+      expect(feedbackSeen[1]).toContain("REGRESSION_EXPECTED_FAILURE");
+      expect(feedbackSeen[1]).toContain("not behavioral proof");
+    },
+  );
+
+  test(
+    "a regression test that still fails after the patch blocks verification",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () =>
+          regressionProposal(
+            `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(source.includes("unicorn"), "REGRESSION_EXPECTED_FAILURE: fails before AND after the patch");
+`,
+            "fails-both-sides-test",
+          ),
+      });
+
+      expect(attempt.outcome).toBe("rejected_regression_test_failed");
+      expect(attempt.regressionTest?.status).toBe("blocked");
+      expect(attempt.regressionTest?.prePatch).toBe("failed_as_expected");
+      expect(attempt.regressionTest?.postPatch).toBe("failed");
+      expect(attempt.regressionTest?.hashMatched).toBe(true);
+
+      // The generated test never remains in the workspace, even on rejection.
+      await expect(
+        stat(path.join(setup.repoPath, "sherlock-regression.test.mjs")),
+      ).rejects.toThrow();
+    },
+  );
 });
 
 describe("fix proposal extraction and retry", () => {
