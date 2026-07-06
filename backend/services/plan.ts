@@ -176,7 +176,10 @@ export function validateReproductionPlan(value: unknown): PlanValidationResult {
   return { ok: true, plan: plan as unknown as ReproductionPlan };
 }
 
-function validateStep(value: unknown, index: number): string[] {
+// Exported for the reproducer agent (docs/fable/11): live tool actions are
+// validated with the exact same rules as frozen plan steps, so nothing the
+// agent does interactively could be illegal in the submitted plan.
+export function validateStep(value: unknown, index: number): string[] {
   const label = `Step ${index + 1}`;
 
   if (!value || typeof value !== "object") {
@@ -350,6 +353,37 @@ function validateAssertion(value: unknown): string[] {
     default:
       return [`Unsupported assertion type ${JSON.stringify(assertion.type)}.`];
   }
+}
+
+// --- Plan mode (docs/fable/11 observability) --------------------------------
+// Distinguishes API-only, browser, and mixed reproductions so visual
+// artifacts are only produced when a browser page was actually driven.
+
+export type PlanMode = "api-only" | "browser" | "mixed";
+
+// Steps that drive a real browser page. "wait" is neutral: it belongs to
+// whichever kind of plan it appears in.
+const PAGE_ACTIONS = new Set([
+  "goto",
+  "click",
+  "fill",
+  "waitForSelector",
+  "screenshot",
+]);
+
+export function getPlanMode(plan: ReproductionPlan): PlanMode {
+  const hasBrowser = plan.steps.some((step) => PAGE_ACTIONS.has(step.action));
+  const hasRequest = plan.steps.some((step) => step.action === "request");
+
+  if (hasBrowser && hasRequest) {
+    return "mixed";
+  }
+
+  if (hasBrowser) {
+    return "browser";
+  }
+
+  return "api-only";
 }
 
 const TARGET_KEYS = [

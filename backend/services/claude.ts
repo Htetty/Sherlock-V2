@@ -356,7 +356,7 @@ ${graphContext.graphEdges || "(none)"}
 `;
 }
 
-function formatPastSection(pastInvestigations: string | undefined): string {
+export function formatPastSection(pastInvestigations: string | undefined): string {
   if (!pastInvestigations) {
     return "";
   }

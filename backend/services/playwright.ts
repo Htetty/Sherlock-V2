@@ -10,10 +10,12 @@
 
 import path from "node:path";
 import { chromium, type Locator, type Page } from "playwright";
-import type {
-  DomTargetIntent,
-  PlanAssertion,
-  ReproductionPlan,
+import {
+  getPlanMode,
+  type DomTargetIntent,
+  type PlanAssertion,
+  type ReproductionPlan,
+  type ReproductionStep,
 } from "./plan.js";
 import type { ArtifactStore } from "./artifacts.js";
 
@@ -94,6 +96,222 @@ export type ReproductionResult = {
   html: string;
 };
 
+// Rolling evidence sink shared by the plan executor and live sessions
+// (docs/fable/11). The plan executor's ReproductionResult holds references to
+// these same arrays, so behavior is unchanged; the reproducer agent reads
+// them incrementally between actions.
+export type SessionEvidence = {
+  consoleErrors: string[];
+  pageErrors: string[];
+  networkFailures: NetworkFailure[];
+  httpResponses: HttpResponseRecord[];
+  apiResponses: ApiResponseRecord[];
+  events: PlaywrightEvent[];
+  screenshots: string[];
+};
+
+function createSessionEvidence(): SessionEvidence {
+  return {
+    consoleErrors: [],
+    pageErrors: [],
+    networkFailures: [],
+    httpResponses: [],
+    apiResponses: [],
+    events: [],
+    screenshots: [],
+  };
+}
+
+// The exact listeners the plan executor has always installed, extracted so a
+// live session captures identical evidence.
+function attachEvidenceListeners(page: Page, evidence: SessionEvidence) {
+  const recordEvent = (type: PlaywrightEvent["type"], detail: string) => {
+    if (evidence.events.length < MAX_EVENTS) {
+      evidence.events.push({ timestamp: new Date().toISOString(), type, detail });
+    }
+  };
+
+  page.on("console", (message) => {
+    recordEvent("console", `[${message.type()}] ${message.text()}`);
+
+    if (message.type() === "error") {
+      evidence.consoleErrors.push(message.text());
+    }
+  });
+
+  page.on("pageerror", (error) => {
+    recordEvent("pageerror", error.message);
+    evidence.pageErrors.push(error.message);
+  });
+
+  page.on("requestfailed", (request) => {
+    const failure = request.failure()?.errorText ?? "unknown failure";
+    recordEvent("requestfailed", `${request.method()} ${request.url()} ${failure}`);
+    evidence.networkFailures.push({
+      method: request.method(),
+      url: request.url(),
+      status: null,
+      statusText: "",
+      failure,
+    });
+  });
+
+  page.on("response", (response) => {
+    const method = response.request().method();
+    recordEvent(
+      "response",
+      `${method} ${response.url()} ${response.status()} ${response.statusText()}`,
+    );
+
+    if (evidence.httpResponses.length < MAX_HTTP_RESPONSES) {
+      evidence.httpResponses.push({
+        method,
+        url: response.url(),
+        status: response.status(),
+        statusText: response.statusText(),
+      });
+    }
+
+    if (!response.ok()) {
+      evidence.networkFailures.push({
+        method,
+        url: response.url(),
+        status: response.status(),
+        statusText: response.statusText(),
+        failure: `HTTP ${response.status()}`,
+      });
+    }
+  });
+}
+
+// Performs one step's action. Shared verbatim between executeReproductionPlan
+// and live sessions - a step that succeeded interactively must have IDENTICAL
+// semantics when the frozen plan replays (docs/fable/11).
+async function performStepAction(
+  page: Page,
+  baseUrl: string,
+  step: ReproductionStep,
+  evidence: SessionEvidence,
+  screenshot: (name: string) => Promise<string | null>,
+): Promise<string | null> {
+  switch (step.action) {
+    case "goto":
+      await page.goto(new URL(step.path, baseUrl).toString(), {
+        waitUntil: "domcontentloaded",
+      });
+      return null;
+    case "click":
+      if ("selector" in step) {
+        await page.click(step.selector);
+      } else {
+        await resolveTarget(page, step.target).click({
+          timeout: STEP_TIMEOUT_MS,
+        });
+      }
+      await waitForPageToSettle(page);
+      return null;
+    case "fill":
+      if ("selector" in step) {
+        await page.fill(step.selector, step.value);
+      } else {
+        await resolveTarget(page, step.target).fill(step.value, {
+          timeout: STEP_TIMEOUT_MS,
+        });
+      }
+      return null;
+    case "waitForSelector":
+      if ("selector" in step) {
+        await page.waitForSelector(step.selector);
+      } else {
+        await resolveTarget(page, step.target).waitFor({
+          state: "visible",
+          timeout: STEP_TIMEOUT_MS,
+        });
+      }
+      return null;
+    case "screenshot":
+      return screenshot(step.id);
+    case "wait":
+      // Bounded by plan validation; lets async server work settle.
+      await page.waitForTimeout(step.ms);
+      return null;
+    case "request": {
+      const url = new URL(step.path, baseUrl).toString();
+      const response = await page.request.fetch(url, {
+        method: step.method,
+        data: step.body,
+      });
+
+      const apiRecord: ApiResponseRecord = {
+        method: step.method,
+        url,
+        status: response.status(),
+        statusText: response.statusText(),
+        body: await response.text(),
+      };
+
+      evidence.apiResponses.push(apiRecord);
+
+      if (evidence.httpResponses.length < MAX_HTTP_RESPONSES) {
+        evidence.httpResponses.push({
+          method: apiRecord.method,
+          url: apiRecord.url,
+          status: apiRecord.status,
+          statusText: apiRecord.statusText,
+        });
+      }
+      return null;
+    }
+  }
+}
+
+// Full step execution with the executor's error handling: strict-mode
+// ambiguity detection, target diagnostics, and a failure screenshot.
+export async function executeSessionStep(
+  page: Page,
+  baseUrl: string,
+  step: ReproductionStep,
+  evidence: SessionEvidence,
+  screenshot: (name: string) => Promise<string | null>,
+): Promise<StepRecord> {
+  const record: StepRecord = {
+    id: step.id,
+    action: step.action,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    outcome: "skipped",
+    error: null,
+    ambiguous: false,
+    screenshot: null,
+  };
+
+  try {
+    record.screenshot = await performStepAction(page, baseUrl, step, evidence, screenshot);
+    record.outcome = "passed";
+  } catch (error) {
+    record.outcome = "failed";
+    record.error = formatError(error);
+    record.ambiguous = record.error.includes("strict mode violation");
+
+    // Explain WHY an intent target failed: per-key match counts plus
+    // hints for common mistakes (e.g. HTML id passed as testId).
+    if ("target" in step) {
+      const diagnostics = await describeTargetDiagnostics(page, step.target).catch(
+        () => "",
+      );
+
+      if (diagnostics) {
+        record.error = `${record.error}\nTarget diagnostics: ${diagnostics}`;
+      }
+    }
+
+    record.screenshot = await screenshot(`${step.id}-failure`).catch(() => null);
+  }
+
+  record.finishedAt = new Date().toISOString();
+  return record;
+}
+
 export type ExecuteOptions = {
   probeTimeoutMs?: number;
 };
@@ -115,6 +333,10 @@ export async function executeReproductionPlan(
     screenshot: null,
   }));
 
+  // The result holds references to the evidence arrays, so listener pushes
+  // are visible in the result exactly as before the extraction.
+  const evidence = createSessionEvidence();
+
   const result: ReproductionResult = {
     planVersion: plan.version,
     baseUrl: plan.baseUrl,
@@ -123,14 +345,14 @@ export async function executeReproductionPlan(
     outcome: "execution_failed",
     outcomeReason: "",
     steps,
-    consoleErrors: [],
-    pageErrors: [],
-    networkFailures: [],
-    httpResponses: [],
-    apiResponses: [],
-    screenshots: [],
+    consoleErrors: evidence.consoleErrors,
+    pageErrors: evidence.pageErrors,
+    networkFailures: evidence.networkFailures,
+    httpResponses: evidence.httpResponses,
+    apiResponses: evidence.apiResponses,
+    screenshots: evidence.screenshots,
     assertion: null,
-    events: [],
+    events: evidence.events,
     html: "",
   };
 
@@ -148,181 +370,52 @@ export async function executeReproductionPlan(
   page.setDefaultTimeout(STEP_TIMEOUT_MS);
   page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
 
-  const recordEvent = (type: PlaywrightEvent["type"], detail: string) => {
-    if (result.events.length < MAX_EVENTS) {
-      result.events.push({ timestamp: new Date().toISOString(), type, detail });
+  attachEvidenceListeners(page, evidence);
+
+  // API-only plans never open a page: screenshots would be blank white
+  // frames that make the run look broken. Skip them and record why
+  // (docs/fable/11 observability); browser/mixed plans keep today's behavior.
+  const planMode = getPlanMode(plan);
+  const visualEvidence =
+    planMode === "api-only"
+      ? {
+          available: false,
+          reason: "API-only reproduction plan; no browser page was opened.",
+        }
+      : { available: true, reason: `Plan mode: ${planMode}.` };
+
+  await store
+    .writeJson("visual-evidence.json", { planMode, ...visualEvidence })
+    .catch(() => {});
+
+  const screenshot = async (name: string) => {
+    if (planMode === "api-only") {
+      return null;
     }
+
+    return saveScreenshot(page, store, evidence, name);
   };
-
-  page.on("console", (message) => {
-    recordEvent("console", `[${message.type()}] ${message.text()}`);
-
-    if (message.type() === "error") {
-      result.consoleErrors.push(message.text());
-    }
-  });
-
-  page.on("pageerror", (error) => {
-    recordEvent("pageerror", error.message);
-    result.pageErrors.push(error.message);
-  });
-
-  page.on("requestfailed", (request) => {
-    const failure = request.failure()?.errorText ?? "unknown failure";
-    recordEvent("requestfailed", `${request.method()} ${request.url()} ${failure}`);
-    result.networkFailures.push({
-      method: request.method(),
-      url: request.url(),
-      status: null,
-      statusText: "",
-      failure,
-    });
-  });
-
-  page.on("response", (response) => {
-    const method = response.request().method();
-    recordEvent(
-      "response",
-      `${method} ${response.url()} ${response.status()} ${response.statusText()}`,
-    );
-
-    if (result.httpResponses.length < MAX_HTTP_RESPONSES) {
-      result.httpResponses.push({
-        method,
-        url: response.url(),
-        status: response.status(),
-        statusText: response.statusText(),
-      });
-    }
-
-    if (!response.ok()) {
-      result.networkFailures.push({
-        method,
-        url: response.url(),
-        status: response.status(),
-        statusText: response.statusText(),
-        failure: `HTTP ${response.status()}`,
-      });
-    }
-  });
 
   try {
     let failedStep: StepRecord | null = null;
 
     for (const [index, step] of plan.steps.entries()) {
       const record = steps[index];
-      record.startedAt = new Date().toISOString();
+      const executed = await executeSessionStep(page, plan.baseUrl, step, evidence, (name) =>
+        screenshot(name).catch(() => null),
+      );
 
-      try {
-        switch (step.action) {
-          case "goto":
-            await page.goto(new URL(step.path, plan.baseUrl).toString(), {
-              waitUntil: "domcontentloaded",
-            });
-            break;
-          case "click":
-            if ("selector" in step) {
-              await page.click(step.selector);
-            } else {
-              await resolveTarget(page, step.target).click({
-                timeout: STEP_TIMEOUT_MS,
-              });
-            }
-            await waitForPageToSettle(page);
-            break;
-          case "fill":
-            if ("selector" in step) {
-              await page.fill(step.selector, step.value);
-            } else {
-              await resolveTarget(page, step.target).fill(step.value, {
-                timeout: STEP_TIMEOUT_MS,
-              });
-            }
-            break;
-          case "waitForSelector":
-            if ("selector" in step) {
-              await page.waitForSelector(step.selector);
-            } else {
-              await resolveTarget(page, step.target).waitFor({
-                state: "visible",
-                timeout: STEP_TIMEOUT_MS,
-              });
-            }
-            break;
-          case "screenshot":
-            record.screenshot = await saveScreenshot(page, store, result, step.id);
-            break;
-          case "wait":
-            // Bounded by plan validation; lets async server work settle.
-            await page.waitForTimeout(step.ms);
-            break;
-          case "request": {
-            const url = new URL(step.path, plan.baseUrl).toString();
-            const response = await page.request.fetch(url, {
-              method: step.method,
-              data: step.body,
-            });
+      Object.assign(record, executed);
 
-            const apiRecord: ApiResponseRecord = {
-              method: step.method,
-              url,
-              status: response.status(),
-              statusText: response.statusText(),
-              body: await response.text(),
-            };
-
-            result.apiResponses.push(apiRecord);
-
-            if (result.httpResponses.length < MAX_HTTP_RESPONSES) {
-              result.httpResponses.push({
-                method: apiRecord.method,
-                url: apiRecord.url,
-                status: apiRecord.status,
-                statusText: apiRecord.statusText,
-              });
-            }
-            break;
-          }
-        }
-
-        record.outcome = "passed";
-      } catch (error) {
-        record.outcome = "failed";
-        record.error = formatError(error);
-        record.ambiguous = record.error.includes("strict mode violation");
-
-        // Explain WHY an intent target failed: per-key match counts plus
-        // hints for common mistakes (e.g. HTML id passed as testId).
-        if ("target" in step) {
-          const diagnostics = await describeTargetDiagnostics(
-            page,
-            step.target,
-          ).catch(() => "");
-
-          if (diagnostics) {
-            record.error = `${record.error}\nTarget diagnostics: ${diagnostics}`;
-          }
-        }
-
-        record.screenshot = await saveScreenshot(
-          page,
-          store,
-          result,
-          `${step.id}-failure`,
-        ).catch(() => null);
+      if (record.outcome === "failed") {
         failedStep = record;
-      }
-
-      record.finishedAt = new Date().toISOString();
-
-      if (failedStep) {
         break;
       }
     }
 
     await waitForPageToSettle(page);
     result.html = await page.content().catch(() => "");
-    await saveScreenshot(page, store, result, "final").catch(() => null);
+    await screenshot("final").catch(() => null);
 
     if (failedStep) {
       result.outcome = "execution_failed";
@@ -602,7 +695,7 @@ async function evaluateAssertion(
 async function saveScreenshot(
   page: Page,
   store: ArtifactStore,
-  result: ReproductionResult,
+  evidence: SessionEvidence,
   name: string,
 ) {
   const fileName = `${name}.png`;
@@ -613,8 +706,145 @@ async function saveScreenshot(
   });
 
   const reference = path.join("screenshots", fileName);
-  result.screenshots.push(reference);
+  evidence.screenshots.push(reference);
   return reference;
+}
+
+// --- Live session (docs/fable/11) -------------------------------------------
+// Interactive browser/API session for the reproducer agent. Steps execute
+// through the SAME executeSessionStep the plan executor uses, so a step that
+// succeeded live has identical semantics when the frozen plan replays.
+
+export type LiveSession = {
+  page: Page;
+  baseUrl: string;
+  evidence: SessionEvidence;
+  executeStep: (step: ReproductionStep) => Promise<StepRecord>;
+  readPageDigest: () => Promise<string>;
+  // Save a screenshot of the current page into the session store (null when
+  // no store was provided or the capture fails). Used by the reproducer for
+  // exploration traces after browser actions.
+  captureScreenshot: (name: string) => Promise<string | null>;
+  close: () => Promise<void>;
+};
+
+export type OpenLiveSessionOptions = {
+  // Store for exploration screenshots (failure shots, screenshot steps).
+  store?: ArtifactStore | null;
+  probeTimeoutMs?: number;
+};
+
+export async function openLiveSession(
+  baseUrl: string,
+  options: OpenLiveSessionOptions = {},
+): Promise<LiveSession> {
+  const probeTimeoutMs = options.probeTimeoutMs ?? BASE_URL_PROBE_TIMEOUT_MS;
+
+  if (!(await isBaseUrlReachable(baseUrl, probeTimeoutMs))) {
+    throw new Error(`Application base URL ${baseUrl} was not reachable.`);
+  }
+
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  page.setDefaultTimeout(STEP_TIMEOUT_MS);
+  page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
+
+  const evidence = createSessionEvidence();
+  attachEvidenceListeners(page, evidence);
+
+  const screenshot = async (name: string) => {
+    if (!options.store) {
+      return null;
+    }
+
+    return saveScreenshot(page, options.store, evidence, name).catch(() => null);
+  };
+
+  return {
+    page,
+    baseUrl,
+    evidence,
+    executeStep: (step) => executeSessionStep(page, baseUrl, step, evidence, screenshot),
+    readPageDigest: () => buildPageDigest(page),
+    captureScreenshot: screenshot,
+    close: async () => {
+      await browser.close().catch(() => {});
+    },
+  };
+}
+
+const MAX_DIGEST_ELEMENTS = 200;
+
+// Interactive elements described in the exact vocabulary DomTargetIntent
+// accepts (role, name, label, placeholder, testId, id, text) - what the agent
+// sees is what it can target. Capping/truncation is the caller's job.
+async function buildPageDigest(page: Page): Promise<string> {
+  const url = page.url();
+  const title = await page.title().catch(() => "");
+
+  const elements = await page
+    .evaluate((maxElements: number) => {
+      const lines: string[] = [];
+      const nodes = document.querySelectorAll(
+        "a, button, input, select, textarea, form, [role], [data-testid], [onclick]",
+      );
+
+      for (const el of Array.from(nodes)) {
+        if (lines.length >= maxElements) {
+          break;
+        }
+
+        const tag = el.tagName.toLowerCase();
+        const type = el.getAttribute("type");
+
+        if (tag === "input" && type === "hidden") {
+          continue;
+        }
+
+        const parts: string[] = [tag + (type ? `[type=${type}]` : "")];
+        const role = el.getAttribute("role");
+        const testId = el.getAttribute("data-testid");
+        const placeholder = el.getAttribute("placeholder");
+        const ariaLabel = el.getAttribute("aria-label");
+
+        if (role) parts.push(`role="${role}"`);
+        if (testId) parts.push(`testId="${testId}"`);
+        if (el.id) parts.push(`id="${el.id}"`);
+        if (placeholder) parts.push(`placeholder="${placeholder}"`);
+
+        let label = ariaLabel ?? "";
+
+        if (!label && el.id) {
+          const forLabel = document.querySelector(`label[for="${el.id}"]`);
+          label = forLabel?.textContent?.trim() ?? "";
+        }
+
+        if (!label) {
+          const parentLabel = el.closest("label");
+          label = parentLabel?.textContent?.trim() ?? "";
+        }
+
+        if (label) parts.push(`label="${label.replace(/\s+/g, " ").slice(0, 80)}"`);
+
+        const text = (el.textContent ?? "").trim().replace(/\s+/g, " ").slice(0, 80);
+
+        if (text && tag !== "form" && tag !== "select") {
+          parts.push(`text="${text}"`);
+        }
+
+        lines.push(`- ${parts.join(" ")}`);
+      }
+
+      return lines;
+    }, MAX_DIGEST_ELEMENTS)
+    .catch(() => ["(page digest unavailable)"]);
+
+  return [
+    `URL: ${url}`,
+    `Title: ${title || "(none)"}`,
+    "Interactive elements:",
+    ...(elements.length > 0 ? elements : ["(none found)"]),
+  ].join("\n");
 }
 
 async function isBaseUrlReachable(baseUrl: string, timeoutMs: number) {

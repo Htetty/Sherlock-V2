@@ -16,6 +16,11 @@ export type InvestigationSummary = {
   stage?: string | null;
   error?: string | null;
   planErrors?: string[];
+  // Mode of the accepted reproduction plan ("api-only" | "browser" |
+  // "mixed"), set by the reproducer-agent path so a reader can immediately
+  // tell whether the fixer evidence is browser-level or API-level.
+  // Optional: absent on the one-shot path and on failures.
+  reproductionMode?: string | null;
   evidence?: {
     screenshots: number;
     consoleErrors: number;
@@ -50,6 +55,10 @@ export function formatResultComment(summary: InvestigationSummary): string {
     `Investigation: ${summary.investigationId}`,
     `Outcome: ${summary.outcome}`,
   ];
+
+  if (summary.reproductionMode) {
+    lines.push(`Reproduction evidence: ${summary.reproductionMode} (official replay)`);
+  }
 
   if (summary.observed) {
     lines.push(`Observed: ${truncate(summary.observed, MAX_ERROR_CHARS)}`);

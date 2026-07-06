@@ -11,6 +11,7 @@ import {
   generateReproductionPlan,
 } from "./claude.js";
 import { runFixerAgent, type FixerAgentStatus } from "../agents/fixer.js";
+import { runReproducerAgent } from "../agents/reproducer.js";
 import type { FixAttemptResult } from "./fix.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
@@ -39,7 +40,11 @@ import {
   executeReproductionPlan,
   type ReproductionResult,
 } from "./playwright.js";
-import { validateReproductionPlan, type ReproductionPlan } from "./plan.js";
+import {
+  getPlanMode,
+  validateReproductionPlan,
+  type ReproductionPlan,
+} from "./plan.js";
 import {
   createArtifactStore,
   createInvestigationId,
@@ -212,61 +217,169 @@ export async function runInvestigationPipeline(
       ? graphContext.relevantFiles
       : repoContext.sourceFiles;
 
-    const generated = await generateReproductionPlan({
-      issueTitle: payload.issueTitle,
-      issueBody: payload.issueBody ?? "",
-      repoUrl: payload.repoUrl,
-      defaultBranch: payload.defaultBranch,
-      fileTree: repoContext.fileTree,
-      packageJson: repoContext.packageJson,
-      readme: repoContext.readme,
-      sourceFiles: contextSourceFiles,
-      sandboxResult: sandboxSession.result,
-      graphContext,
-      pastInvestigations,
-    });
-
-    await store.writeJson("reproduction-plan-raw.json", {
-      rawText: generated.rawText,
-      parseError: generated.parseError,
-      attempts: generated.attempts ?? [],
-    });
-
-    for (const [index, attempt] of (generated.attempts ?? []).entries()) {
-      log(
-        `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
-      );
-    }
-
-    if (generated.parseError !== null) {
-      log(`Plan generation failed after all attempts: ${generated.parseError}`);
-      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
-
-      return await finishInvestigation(store, investigationRecord, {
-        investigationId,
-        outcome: "plan_failed",
-        planErrors: [generated.parseError],
-      });
-    }
-
-    const validation = validateReproductionPlan(generated.parsed);
-
-    if (!validation.ok) {
-      log(`Plan rejected by validator:`);
-      for (const validationError of validation.errors) {
-        log(`  - ${validationError}`);
+    // Sandbox restart used by both the reproducer agent (pristine official
+    // replays) and the fix loop (post-patch verification).
+    const repoPath = repoContext.repoPath;
+    const restart = async () => {
+      if (sandboxSession) {
+        await sandboxSession.stop();
+        sandboxSession = null;
       }
-      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
 
-      return await finishInvestigation(store, investigationRecord, {
+      try {
+        sandboxSession = await runSandboxInvestigation({ repoPath });
+      } catch (error) {
+        return { ok: false, log: formatError(error) };
+      }
+
+      return {
+        ok: true,
+        baseUrl: sandboxSession.result.baseUrl,
+        log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
+          .filter(Boolean)
+          .join("\n"),
+      };
+    };
+
+    // Reproduction: agentic (docs/fable/11) behind a feature flag while old
+    // vs new are compared on the same issues; one-shot generation otherwise.
+    const useReproducerAgent = process.env.REPRODUCER_AGENT_ENABLED === "true";
+
+    let plan: ReproductionPlan;
+    let result: ReproductionResult;
+    // Mode of the accepted plan (agent path only): surfaces in the summary
+    // and result comment so a reader can tell what evidence drove the fixer.
+    let reproductionMode: string | null = null;
+
+    if (useReproducerAgent) {
+      log("Reproducer agent enabled (REPRODUCER_AGENT_ENABLED=true).");
+
+      const reproResult = await runReproducerAgent({
         investigationId,
-        outcome: "plan_failed",
-        planErrors: validation.errors,
+        investigationDir: store.dir,
+        repoPath,
+        sourceCommit: repoContext.commit,
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        repoUrl: payload.repoUrl,
+        defaultBranch: payload.defaultBranch,
+        fileTree: repoContext.fileTree,
+        packageJson: repoContext.packageJson,
+        readme: repoContext.readme,
+        sandboxResult: sandboxSession.result,
+        graphContext,
+        initialSourceFiles: contextSourceFiles,
+        pastInvestigations,
+        restart,
       });
+
+      log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
+      for (const submission of reproResult.submissions) {
+        log(
+          `  submission ${submission.index}: ${submission.valid ? (submission.replayOutcome ?? "valid") : `invalid - ${(submission.validationErrors ?? []).join(" | ")}`}`,
+        );
+      }
+
+      if (reproResult.status === "plan_failed" || reproResult.status === "exhausted") {
+        return await finishInvestigation(store, investigationRecord, {
+          investigationId,
+          outcome: "plan_failed",
+          planErrors: [reproResult.reason],
+        });
+      }
+
+      if (reproResult.status === "environment_failed") {
+        return await finishInvestigation(store, investigationRecord, {
+          investigationId,
+          outcome: "environment_failed",
+          stage: "reproduction replay",
+          error: reproResult.reason,
+        });
+      }
+
+      if (reproResult.status === "failed" || !reproResult.plan || !reproResult.result) {
+        return await finishInvestigation(store, investigationRecord, {
+          investigationId,
+          outcome: "execution_failed",
+          error: reproResult.reason,
+        });
+      }
+
+      plan = reproResult.plan;
+      result = reproResult.result;
+      reproductionMode = getPlanMode(plan);
+      investigationRecord.reproduction = {
+        explorationMode: reproResult.explorationMode,
+        planMode: reproductionMode,
+      };
+
+      // Exploration can be broader than the frozen proof (e.g. mixed
+      // exploration, api-only plan) - make the split explicit.
+      log(`Exploration mode: ${reproResult.explorationMode}`);
+      log(`Submitted plan mode: ${reproductionMode}`);
+      log(`Fixer evidence mode: ${reproductionMode} official replay result`);
+
+      await store.writeJson("reproduction-plan.json", plan);
+    } else {
+      const generated = await generateReproductionPlan({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        repoUrl: payload.repoUrl,
+        defaultBranch: payload.defaultBranch,
+        fileTree: repoContext.fileTree,
+        packageJson: repoContext.packageJson,
+        readme: repoContext.readme,
+        sourceFiles: contextSourceFiles,
+        sandboxResult: sandboxSession.result,
+        graphContext,
+        pastInvestigations,
+      });
+
+      await store.writeJson("reproduction-plan-raw.json", {
+        rawText: generated.rawText,
+        parseError: generated.parseError,
+        attempts: generated.attempts ?? [],
+      });
+
+      for (const [index, attempt] of (generated.attempts ?? []).entries()) {
+        log(
+          `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+        );
+      }
+
+      if (generated.parseError !== null) {
+        log(`Plan generation failed after all attempts: ${generated.parseError}`);
+        log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+
+        return await finishInvestigation(store, investigationRecord, {
+          investigationId,
+          outcome: "plan_failed",
+          planErrors: [generated.parseError],
+        });
+      }
+
+      const validation = validateReproductionPlan(generated.parsed);
+
+      if (!validation.ok) {
+        log(`Plan rejected by validator:`);
+        for (const validationError of validation.errors) {
+          log(`  - ${validationError}`);
+        }
+        log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+
+        return await finishInvestigation(store, investigationRecord, {
+          investigationId,
+          outcome: "plan_failed",
+          planErrors: validation.errors,
+        });
+      }
+
+      plan = validation.plan;
+      await store.writeJson("reproduction-plan.json", plan);
+
+      result = await executeReproductionPlan(plan, store);
     }
 
-    const plan = validation.plan;
-    await store.writeJson("reproduction-plan.json", plan);
     log(`Validated plan: ${plan.steps.length} step(s), assertion ${plan.assertion.type}`);
     for (const step of plan.steps) {
       log(`  ${step.id}: ${describePlanStep(step)}`);
@@ -275,7 +388,6 @@ export async function runInvestigationPipeline(
     log(`  failureCondition: ${plan.failureCondition}`);
     log(`  assertion: ${JSON.stringify(plan.assertion)}`);
 
-    const result = await executeReproductionPlan(plan, store);
     await writeExecutionArtifacts(store, result);
 
     log(`Plan executed with outcome: ${result.outcome} (${durationMs(result.startedAt, result.finishedAt)}ms)`);
@@ -356,28 +468,6 @@ export async function runInvestigationPipeline(
           edges: refinedContext.graphEdges,
           hydratedFiles: refinedContext.relevantFiles.map((file) => file.path),
         });
-
-        const repoPath = repoContext.repoPath;
-        const restart = async () => {
-          if (sandboxSession) {
-            await sandboxSession.stop();
-            sandboxSession = null;
-          }
-
-          try {
-            sandboxSession = await runSandboxInvestigation({ repoPath });
-          } catch (error) {
-            return { ok: false, log: formatError(error) };
-          }
-
-          return {
-            ok: true,
-            baseUrl: sandboxSession.result.baseUrl,
-            log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
-              .filter(Boolean)
-              .join("\n"),
-          };
-        };
 
         await reportStage("verifying");
 
@@ -563,7 +653,10 @@ export async function runInvestigationPipeline(
     return await finishInvestigation(
       store,
       investigationRecord,
-      buildExecutionSummary(investigationId, plan.expectedBehavior, result),
+      {
+        ...buildExecutionSummary(investigationId, plan.expectedBehavior, result),
+        ...(reproductionMode ? { reproductionMode } : {}),
+      },
       {
         result,
         claudeAnalysis,
