@@ -146,6 +146,8 @@ export type FixCommentSummary = {
   verification?: string[];
   // Truthful per-category repository validation lines, e.g. "Tests: passed".
   repositoryValidation?: string[];
+  // Truthful regression-test lines, e.g. "Before patch: failed as expected".
+  regressionTest?: string[];
 };
 
 const FIX_OUTCOME_HEADLINES: Record<string, string> = {
@@ -161,6 +163,8 @@ const FIX_OUTCOME_HEADLINES: Record<string, string> = {
     "Sherlock generated a fix, but the application environment failed during verification.",
   rejected_verification_inconclusive:
     "Sherlock generated a fix, but could not conclusively verify it.",
+  rejected_regression_test_failed:
+    "Sherlock generated a fix, but the generated regression test did not prove it.",
 };
 
 export function formatFixComment(summary: FixCommentSummary): string {
@@ -197,6 +201,14 @@ export function formatFixComment(summary: FixCommentSummary): string {
     lines.push("Repository validation:");
 
     for (const item of summary.repositoryValidation) {
+      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
+    }
+  }
+
+  if (summary.regressionTest && summary.regressionTest.length > 0) {
+    lines.push("Regression test:");
+
+    for (const item of summary.regressionTest) {
       lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
     }
   }

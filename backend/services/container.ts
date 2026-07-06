@@ -134,6 +134,10 @@ export type ContainerRunSpec = {
   command: string[]; // argv executed in the container, e.g. ["npm", "install"]
   portMapping?: { hostPort: number; containerPort: number };
   image?: string;
+  // Adds the Docker host-gateway alias so a verification container can reach
+  // the sandbox application published on the host's localhost. Adds a DNS
+  // name only — no host networking, and the restriction set is unchanged.
+  addHostGateway?: boolean;
 };
 
 export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
@@ -162,6 +166,10 @@ export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
       "-p",
       `127.0.0.1:${spec.portMapping.hostPort}:${spec.portMapping.containerPort}`,
     );
+  }
+
+  if (spec.addHostGateway) {
+    args.push("--add-host=host.docker.internal:host-gateway");
   }
 
   for (const [name, value] of Object.entries(spec.env)) {

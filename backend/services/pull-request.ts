@@ -27,6 +27,10 @@ const REQUIRED_CHECKS = [
   "exact_plan_replayed",
   "failure_no_longer_observed",
   "repository_validation",
+  // Passed when the generated test proved fail-before/pass-after OR when
+  // generation was truthfully unavailable; failed regression contracts
+  // never reach the PR stage (the fix outcome is already rejected).
+  "regression_test",
 ];
 
 const SECRET_FILE_PATTERN = /(^\.env|\.pem$|\.key$)/i;

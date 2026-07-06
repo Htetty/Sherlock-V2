@@ -9,10 +9,12 @@ import {
   analyzeIssue,
   generateFixProposal,
   generateMemoryReflection,
+  generateRegressionTestProposal,
   generateReproductionPlan,
 } from "./claude.js";
 import { runFixAttempt, type FixAttemptResult, type FixOutcome } from "./fix.js";
 import { formatValidationLine } from "./repo-validation.js";
+import { formatRegressionCommentLines } from "./regression-test.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -456,6 +458,12 @@ export async function runInvestigationPipeline(
 
         await reportStage("verifying");
 
+        // One regression test per fix attempt: Claude-backed generator with
+        // bounded refinement handled inside the fix loop.
+        const regressionSourceFiles = (
+          refinedContext.available ? refinedContext.relevantFiles : contextSourceFiles
+        ).map((file) => ({ path: file.path, contents: file.contents }));
+
         fixAttempt = await runFixAttempt({
           investigationId,
           investigationDir: store.dir,
@@ -466,6 +474,18 @@ export async function runInvestigationPipeline(
           proposal: generatedFix.parsed,
           restart,
           repositoryLabel: `${payload.repoOwner}/${payload.repoName}`,
+          generateRegressionTest: async (feedback) =>
+            generateRegressionTestProposal(
+              {
+                issueTitle: payload.issueTitle,
+                issueBody: payload.issueBody ?? "",
+                plan,
+                reproductionResult: result,
+                fixProposal: generatedFix.parsed,
+                sourceFiles: regressionSourceFiles,
+              },
+              feedback,
+            ),
         });
 
         log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
@@ -480,6 +500,25 @@ export async function runInvestigationPipeline(
         }
         if (fixAttempt.postPatchOutcome) {
           log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+        }
+        if (fixAttempt.regressionTest) {
+          const regression = fixAttempt.regressionTest;
+
+          if (regression.testName) {
+            log(`Regression test generated: ${regression.testName}`);
+          }
+          if (regression.prePatch) {
+            log(`Pre-patch regression result: ${regression.prePatch}`);
+          }
+          if (regression.postPatch) {
+            log(`Post-patch regression result: ${regression.postPatch}`);
+          }
+          if (regression.hashMatched !== null) {
+            log(`Regression test hash matched: ${regression.hashMatched}`);
+          }
+          if (regression.status === "unavailable") {
+            log(`Regression test unavailable: ${regression.reason ?? "(no reason recorded)"}`);
+          }
         }
         for (const run of fixAttempt.testRuns) {
           log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
@@ -555,6 +594,27 @@ export async function runInvestigationPipeline(
         patchedFiles,
       });
 
+      // Truthful memory for rejected regression proofs: when the exact
+      // replay DID pass after the patch, the record must say so — the
+      // failure was the generated-test proof, not the reproduction.
+      let memoryWhatWorked = reflection.whatWorked;
+      let memoryWhatFailed = reflection.whatFailed;
+
+      if (
+        fixAttempt?.outcome === "rejected_regression_test_failed" &&
+        fixAttempt.postPatchOutcome === "not_reproduced"
+      ) {
+        memoryWhatWorked = [
+          "The exact reproduction replay passed after the patch.",
+          memoryWhatWorked,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        memoryWhatFailed = `The generated regression test did not prove the fix (${
+          fixAttempt.regressionTest?.reason ?? "regression proof failed"
+        }), so the patch was rejected despite the passing replay.`;
+      }
+
       await appendMemory(payload.repoUrl, {
         issueTitle: payload.issueTitle,
         issueTerms: reflection.issueTerms,
@@ -563,8 +623,8 @@ export async function runInvestigationPipeline(
         rootCause: fixAttempt?.rootCause ?? reflection.rootCause,
         patchedFiles,
         fileHashes: await hashRepoFiles(repoContext.repoPath, patchedFiles),
-        whatWorked: reflection.whatWorked,
-        whatFailed: reflection.whatFailed,
+        whatWorked: memoryWhatWorked,
+        whatFailed: memoryWhatFailed,
         createdAt: new Date().toISOString(),
       });
 
@@ -596,6 +656,9 @@ export async function runInvestigationPipeline(
             ? fixAttempt.repositoryValidation.categories.map((item) =>
                 formatValidationLine(item),
               )
+            : undefined,
+          regressionTest: fixAttempt.regressionTest
+            ? formatRegressionCommentLines(fixAttempt.regressionTest)
             : undefined,
         })
       : null;
