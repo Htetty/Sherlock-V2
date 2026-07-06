@@ -6,7 +6,11 @@ export type InvestigationOutcome =
   | "not_reproduced"
   | "plan_failed"
   | "environment_failed"
-  | "execution_failed";
+  | "execution_failed"
+  // Bug reproduced AND the patch was verified (replay + repository
+  // validation). The original reproduction outcome is preserved separately
+  // in originalOutcome.
+  | "verified_fix";
 
 export type InvestigationSummary = {
   investigationId: string;
@@ -16,6 +20,9 @@ export type InvestigationSummary = {
   stage?: string | null;
   error?: string | null;
   planErrors?: string[];
+  originalOutcome?: string | null;
+  verification?: string | null;
+  pullRequestStatus?: string | null;
   evidence?: {
     screenshots: number;
     consoleErrors: number;
@@ -32,6 +39,8 @@ const MAX_DIAGNOSTIC_ERROR_CHARS = 1_600;
 const MAX_COMMENT_CHARS = 3_000;
 
 const OUTCOME_HEADLINES: Record<InvestigationOutcome, string> = {
+  verified_fix:
+    "Sherlock reproduced the reported failure and verified a fix for it.",
   reproduced: "Sherlock reproduced the reported failure.",
   not_reproduced:
     "Sherlock executed the reproduction plan but did not observe the reported failure.",
@@ -50,6 +59,18 @@ export function formatResultComment(summary: InvestigationSummary): string {
     `Investigation: ${summary.investigationId}`,
     `Outcome: ${summary.outcome}`,
   ];
+
+  if (summary.originalOutcome) {
+    lines.push(`Original reproduction: ${summary.originalOutcome}`);
+  }
+
+  if (summary.verification) {
+    lines.push(`Verification: ${summary.verification}`);
+  }
+
+  if (summary.pullRequestStatus) {
+    lines.push(`Pull request: ${summary.pullRequestStatus}`);
+  }
 
   if (summary.observed) {
     lines.push(`Observed: ${truncate(summary.observed, MAX_ERROR_CHARS)}`);
@@ -123,6 +144,8 @@ export type FixCommentSummary = {
   changedFiles?: string[];
   reason?: string | null;
   verification?: string[];
+  // Truthful per-category repository validation lines, e.g. "Tests: passed".
+  repositoryValidation?: string[];
 };
 
 const FIX_OUTCOME_HEADLINES: Record<string, string> = {
@@ -166,6 +189,14 @@ export function formatFixComment(summary: FixCommentSummary): string {
     lines.push("Verification:");
 
     for (const item of summary.verification) {
+      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
+    }
+  }
+
+  if (summary.repositoryValidation && summary.repositoryValidation.length > 0) {
+    lines.push("Repository validation:");
+
+    for (const item of summary.repositoryValidation) {
       lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
     }
   }

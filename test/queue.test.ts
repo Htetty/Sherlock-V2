@@ -51,8 +51,8 @@ describe("investigation worker processing", () => {
         await options.onStage?.("reproducing");
         return {
           investigationId: payload.investigationId!,
-          outcome: "reproduced",
-          summary: { investigationId: payload.investigationId!, outcome: "reproduced" },
+          outcome: "verified_fix",
+          summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
           githubComment: "RESULT COMMENT",
         };
       },
@@ -76,7 +76,7 @@ describe("investigation worker processing", () => {
       deps,
     );
 
-    expect(outcome).toEqual({ investigationId: "inv_0TEST123ABC", outcome: "reproduced" });
+    expect(outcome).toEqual({ investigationId: "inv_0TEST123ABC", outcome: "verified_fix" });
     expect(pipelineCalls).toHaveLength(1);
     expect(pipelineCalls[0]).toMatchObject({
       investigationId: "inv_0TEST123ABC",

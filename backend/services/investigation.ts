@@ -11,7 +11,8 @@ import {
   generateMemoryReflection,
   generateReproductionPlan,
 } from "./claude.js";
-import { runFixAttempt, type FixAttemptResult } from "./fix.js";
+import { runFixAttempt, type FixAttemptResult, type FixOutcome } from "./fix.js";
+import { formatValidationLine } from "./repo-validation.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -464,6 +465,7 @@ export async function runInvestigationPipeline(
           originalOutcome: result.outcome,
           proposal: generatedFix.parsed,
           restart,
+          repositoryLabel: `${payload.repoOwner}/${payload.repoName}`,
         });
 
         log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
@@ -590,6 +592,11 @@ export async function runInvestigationPipeline(
           verification: fixAttempt.checks
             .filter((item) => item.passed)
             .map((item) => item.detail),
+          repositoryValidation: fixAttempt.repositoryValidation
+            ? fixAttempt.repositoryValidation.categories.map((item) =>
+                formatValidationLine(item),
+              )
+            : undefined,
         })
       : null;
 
@@ -609,10 +616,27 @@ export async function runInvestigationPipeline(
     const extraComment =
       [fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
 
+    // Final outcome semantics: a reproduced bug whose patch was verified
+    // finishes as verified_fix. The original reproduction outcome is
+    // preserved in summary.originalOutcome and in the untouched
+    // reproduction-result.json artifact.
+    const summary = buildExecutionSummary(investigationId, plan.expectedBehavior, result);
+    const finalOutcome = resolveFinalOutcome(result.outcome, fixAttempt?.outcome ?? null);
+
+    if (finalOutcome === "verified_fix") {
+      summary.outcome = "verified_fix";
+      summary.originalOutcome = result.outcome;
+      summary.verification = "verified";
+      summary.pullRequestStatus = pullRequest?.status ?? "not_attempted";
+      log(
+        `Final outcome: verified_fix (original reproduction: ${result.outcome}, pull request: ${summary.pullRequestStatus})`,
+      );
+    }
+
     return await finishInvestigation(
       store,
       investigationRecord,
-      buildExecutionSummary(investigationId, plan.expectedBehavior, result),
+      summary,
       {
         result,
         claudeAnalysis,
@@ -657,6 +681,20 @@ export async function runInvestigationPipeline(
       await cleanupRepoContext(repoContext);
     }
   }
+}
+
+// Final investigation outcome semantics:
+// - environment/plan/execution failures and not_reproduced pass through
+// - reproduced with no verified patch stays "reproduced"
+// - reproduced AND a verified patch becomes "verified_fix"
+// PR creation status is a separate field, never part of the outcome.
+export function resolveFinalOutcome(
+  reproductionOutcome: ReproductionResult["outcome"],
+  fixOutcome: FixOutcome | null,
+): ReproductionResult["outcome"] | "verified_fix" {
+  return reproductionOutcome === "reproduced" && fixOutcome === "verified"
+    ? "verified_fix"
+    : reproductionOutcome;
 }
 
 // --- Terminal logging helpers ---------------------------------------------

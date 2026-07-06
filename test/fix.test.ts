@@ -179,13 +179,27 @@ async function git(repoPath: string, args: string[]) {
   return stdout;
 }
 
-async function createFixtureRepo() {
+async function createFixtureRepo(scripts?: Record<string, string>) {
   const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-fix-repo-"));
 
   await writeFile(path.join(repoPath, "server.mjs"), BUGGY_SERVER, "utf8");
   await writeFile(path.join(repoPath, "check-login.mjs"), CHECK_LOGIN_TEST, "utf8");
   await writeFile(path.join(repoPath, "failing-test.mjs"), "process.exit(1);\n", "utf8");
+  await writeFile(
+    path.join(repoPath, "never-exits.mjs"),
+    // Self-terminates as a leak guard; validation timeouts fire well before.
+    "setTimeout(() => process.exit(0), 15000);\nsetInterval(() => {}, 1000);\n",
+    "utf8",
+  );
   await writeFile(path.join(repoPath, ".env"), "SECRET_TOKEN=super-secret-value\n", "utf8");
+
+  if (scripts) {
+    await writeFile(
+      path.join(repoPath, "package.json"),
+      JSON.stringify({ name: "fixture-app", version: "1.0.0", scripts }),
+      "utf8",
+    );
+  }
 
   await git(repoPath, ["init", "--quiet"]);
   await git(repoPath, ["config", "user.email", "fixture@example.com"]);
@@ -298,8 +312,8 @@ function correctProposal(overrides: Partial<FixProposal> = {}): FixProposal {
 
 // Runs the seeded bug through reproduction, then a fix attempt with the given
 // proposal and restart behavior. Returns everything the assertions need.
-async function setupReproducedInvestigation() {
-  const { repoPath, commit } = await createFixtureRepo();
+async function setupReproducedInvestigation(scripts?: Record<string, string>) {
+  const { repoPath, commit } = await createFixtureRepo(scripts);
   const port = await getFreePort();
   let app = await startApp(repoPath, port);
   const baseUrl = `http://localhost:${port}`;
@@ -342,7 +356,12 @@ describe("verified fix loop", () => {
     "a correct patch is verified and original artifacts are preserved",
     { timeout: 120_000 },
     async () => {
-      const setup = await setupReproducedInvestigation();
+      // Fixture declares a real test script; validation must discover and
+      // run it in the container path (exact replay + all available checks
+      // passing allows verification).
+      const setup = await setupReproducedInvestigation({
+        test: "node check-login.mjs",
+      });
       const before = await readOriginalArtifacts(setup.store.dir);
       const docker = createHostEmulatingDocker();
 
@@ -363,13 +382,23 @@ describe("verified fix loop", () => {
       expect(attempt.changedFiles).toEqual(["server.mjs"]);
       expect(attempt.fixAttemptId).toMatch(/^fix_[0-9A-Z]{10,}$/);
       expect(attempt.testRuns).toHaveLength(1);
+      expect(attempt.testRuns[0].command).toBe("npm run test");
       expect(attempt.testRuns[0].exitCode).toBe(0);
       expect(attempt.testRuns[0].timedOut).toBe(false);
+      expect(attempt.repositoryValidation).toEqual({
+        aggregate: "passed",
+        categories: [
+          { category: "test", status: "passed" },
+          { category: "typecheck", status: "not_available" },
+          { category: "lint", status: "not_available" },
+          { category: "build", status: "not_available" },
+        ],
+      });
 
-      // The test command ran in its own short-lived container (not the app
-      // container) and was force-removed afterwards.
+      // The validation command ran in its own short-lived container (not
+      // the app container) and was force-removed afterwards.
       expect(docker.containerNames).toHaveLength(1);
-      expect(docker.containerNames[0]).toMatch(/^sherlock-test-/);
+      expect(docker.containerNames[0]).toMatch(/^sherlock-validate-test-/);
       expect(docker.removed).toContain(docker.containerNames[0]);
 
       // The exact saved plan was replayed (hash recorded, steps untouched).
@@ -384,6 +413,7 @@ describe("verified fix loop", () => {
         "git-diff.patch",
         "build-result.json",
         "post-patch-reproduction-result.json",
+        "repository-validation.json",
         "test-results.json",
         "verification-result.json",
       ]) {
@@ -440,9 +470,61 @@ describe("verified fix loop", () => {
   );
 
   test(
-    "a patch that fixes the bug but breaks relevant tests is rejected_tests_failed",
+    "a patch that fixes the bug but fails repository validation is rejected_tests_failed",
     { timeout: 120_000 },
     async () => {
+      // Discovered failing "test" script + passing "lint" script: any failed
+      // category prevents verification.
+      const setup = await setupReproducedInvestigation({
+        test: "node failing-test.mjs",
+        lint: "node check-login.mjs",
+      });
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+      });
+
+      expect(attempt.outcome).toBe("rejected_tests_failed");
+      // The reproduction itself did pass post-patch.
+      expect(attempt.postPatchOutcome).toBe("not_reproduced");
+      expect(attempt.repositoryValidation?.aggregate).toBe("failed");
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "test",
+        status: "failed",
+      });
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "lint",
+        status: "passed",
+      });
+      expect(attempt.testRuns[0].exitCode).not.toBe(0);
+      expect(attempt.testRuns[1].exitCode).toBe(0);
+
+      // Each validation command got its own uniquely named short-lived
+      // container, and both were cleaned up.
+      expect(docker.containerNames).toHaveLength(2);
+      expect(new Set(docker.containerNames).size).toBe(2);
+
+      for (const name of docker.containerNames) {
+        expect(docker.removed).toContain(name);
+      }
+    },
+  );
+
+  test(
+    "unavailable repository validation is reported truthfully and never faked as passing",
+    { timeout: 120_000 },
+    async () => {
+      // No package.json at all: the exact reproduction replay may still
+      // verify the fix, but nothing may claim tests passed.
       const setup = await setupReproducedInvestigation();
       const docker = createHostEmulatingDocker();
 
@@ -453,27 +535,64 @@ describe("verified fix loop", () => {
         sourceCommit: setup.commit,
         plan: setup.plan,
         originalOutcome: setup.original.outcome,
-        proposal: correctProposal({
-          relevantTests: ["node failing-test.mjs", "node check-login.mjs"],
-        }),
+        proposal: correctProposal(),
         restart: setup.restart,
         docker: docker.adapter,
       });
 
+      expect(attempt.outcome).toBe("verified");
+      expect(attempt.repositoryValidation?.aggregate).toBe("not_available");
+      expect(attempt.testRuns).toHaveLength(0);
+      // Unavailable categories execute nothing.
+      expect(docker.containerNames).toHaveLength(0);
+
+      // Truthful check: no fake relevant_tests_passed, no "passed with no
+      // coverage" wording anywhere.
+      const names = attempt.checks.map((item) => item.name);
+      expect(names).not.toContain("relevant_tests_passed");
+      const validationCheck = attempt.checks.find(
+        (item) => item.name === "repository_validation",
+      );
+      expect(validationCheck?.detail).toContain("unavailable");
+      const serialized = JSON.stringify(attempt);
+      expect(serialized).not.toContain("passed with no coverage");
+      expect(attempt.reason).toContain("Repository validation was unavailable");
+    },
+  );
+
+  test(
+    "a timed-out validation command prevents verified status",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation({
+        test: "node never-exits.mjs",
+      });
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        validationTimeoutMs: 800,
+      });
+
       expect(attempt.outcome).toBe("rejected_tests_failed");
-      // The reproduction itself did pass post-patch.
-      expect(attempt.postPatchOutcome).toBe("not_reproduced");
-      expect(attempt.testRuns[0].exitCode).not.toBe(0);
-      expect(attempt.testRuns[1].exitCode).toBe(0);
+      expect(attempt.repositoryValidation?.aggregate).toBe("failed");
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "test",
+        status: "timed_out",
+      });
+      expect(attempt.testRuns[0].timedOut).toBe(true);
+      expect(attempt.reason).toContain("timed out");
 
-      // Each verification command got its own uniquely named short-lived
-      // container, and both were cleaned up.
-      expect(docker.containerNames).toHaveLength(2);
-      expect(new Set(docker.containerNames).size).toBe(2);
-
-      for (const name of docker.containerNames) {
-        expect(docker.removed).toContain(name);
-      }
+      // Forced cleanup ran for the timed-out container.
+      expect(docker.removed).toContain(docker.containerNames[0]);
     },
   );
 
