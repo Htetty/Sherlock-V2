@@ -46,11 +46,19 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
   runPipeline: runInvestigationPipeline,
   getInstallationToken: async (installationId) => {
     const octokit = await getInstallationOctokit(installationId);
+    // Single token request: @octokit/auth-app's installation auth result
+    // already includes the token response's permission metadata, which is
+    // the authoritative record of the token's Contents access.
     const auth = (await octokit.auth({ type: "installation" })) as {
       token?: string;
+      permissions?: Record<string, string>;
     };
 
-    return auth.token ?? null;
+    if (!auth.token) {
+      return null;
+    }
+
+    return { token: auth.token, permissions: auth.permissions ?? null };
   },
   postIssueComment: async ({ installationId, owner, repo, issueNumber, body }) => {
     const octokit = await getInstallationOctokit(installationId);

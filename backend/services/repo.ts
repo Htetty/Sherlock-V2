@@ -12,8 +12,34 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import {
+  buildGitHubCloneUrl,
+  createGitAuthContext,
+  preflightRepositoryAccess,
+  redactGitFailure,
+  RepositoryError,
+  type GitHubApiClient,
+  type InstallationTokenPermissions,
+} from "./repo-auth.js";
 
 const execFileAsync = promisify(execFile);
+
+// Injectable Git-process boundary (argument arrays only — never a shell).
+export type GitRunner = (
+  args: string[],
+  options: { env?: Record<string, string>; cwd?: string },
+) => Promise<{ stdout: string }>;
+
+const defaultGitRunner: GitRunner = async (args, options) => {
+  const { stdout } = await execFileAsync("git", args, {
+    env: options.env,
+    cwd: options.cwd,
+    timeout: 120_000,
+    maxBuffer: 8 * 1024 * 1024,
+  });
+
+  return { stdout };
+};
 
 const MAX_TREE_ENTRIES = 120;
 const MAX_SOURCE_FILE_CHARS = 8_000;
@@ -77,16 +103,61 @@ export type SourceFile = {
   truncated: boolean;
 };
 
-// combine all functions and actually clone repo
+// Clones the repository identified by the VALIDATED owner/name (never a
+// webhook-supplied URL) and extracts bounded context. When an installation
+// token is provided, access is preflighted against the GitHub API first and
+// the clone authenticates through a temporary GIT_ASKPASS helper; the token
+// never appears in URLs, argv, configuration, metadata, or errors.
 export async function cloneRepoForInvestigation(input: {
-  repoUrl: string;
+  repoOwner: string;
+  repoName: string;
   defaultBranch?: string;
+  installationToken?: string | null;
+  // Permission metadata from the token-minting response (authoritative for
+  // the token's Contents access).
+  installationPermissions?: InstallationTokenPermissions;
+  github?: GitHubApiClient;
+  runGit?: GitRunner;
 }): Promise<RepoContext> {
+  // Throws a typed invalid_identity error for anything that is not a plain
+  // GitHub owner/repository pair (traversal, slashes, queries, schemes, ...).
+  const cloneUrl = buildGitHubCloneUrl(input.repoOwner, input.repoName);
+  const token = input.installationToken ?? null;
+
+  // Access preflight happens before any credential-helper file exists and
+  // before Git starts.
+  if (token) {
+    await preflightRepositoryAccess(
+      input.repoOwner,
+      input.repoName,
+      token,
+      input.github,
+      input.installationPermissions ?? null,
+    );
+  }
+
+  const runGit = input.runGit ?? defaultGitRunner;
   const workspacePath = await mkdtemp(path.join(tmpdir(), "handoff-"));
   const repoPath = path.join(workspacePath, "repo");
 
   try {
-    await cloneRepo(input.repoUrl, repoPath, input.defaultBranch);
+    await cloneRepo(cloneUrl, repoPath, input.defaultBranch, token, runGit);
+
+    // The origin remote must contain only the clean unauthenticated GitHub
+    // URL; the askpass mechanism never touches the URL, and this pins it.
+    await runGit(["remote", "set-url", "origin", cloneUrl], { cwd: repoPath });
+    const origin = (
+      await runGit(["remote", "get-url", "origin"], { cwd: repoPath })
+    ).stdout.trim();
+
+    if (origin !== cloneUrl) {
+      throw new RepositoryError(
+        "transient_clone",
+        "The cloned repository's origin URL did not match the expected GitHub URL.",
+        true,
+      );
+    }
+
     await writeRepoExcludes(repoPath);
 
     return {
@@ -169,32 +240,97 @@ async function collectSourceFiles(repoPath: string) {
   return files;
 }
 
+// Base flags for every clone: no credential forwarding across redirects and
+// no configured credential helpers, passed per-process (never persisted).
+const CLONE_CONFIG_ARGS = [
+  "-c",
+  "http.followRedirects=false",
+  "-c",
+  "credential.helper=",
+];
+
 async function cloneRepo(
-  repoUrl: string,
+  cloneUrl: string,
   repoPath: string,
-  defaultBranch?: string,
+  defaultBranch: string | undefined,
+  token: string | null,
+  runGit: GitRunner,
 ) {
-  if (defaultBranch) {
-    try {
-      await runGitClone([
-        "clone",
-        "--depth",
-        "1",
-        "--single-branch",
-        "--branch",
-        defaultBranch,
-        repoUrl,
-        repoPath,
-      ]);
-      return;
-    } catch {
-      console.warn(
-        `Could not clone branch "${defaultBranch}". Falling back to repository default branch.`,
-      );
+  // Authentication lives ONLY in the Git child-process environment: an
+  // askpass helper (containing no token) plus the token variable. The URL
+  // and argv stay credential-free.
+  const auth = token ? await createGitAuthContext(token) : null;
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? "",
+    GIT_TERMINAL_PROMPT: "0",
+    // Host git configuration is fully disabled for the clone child process:
+    // no global/system config means no host credential helpers, rewrites,
+    // or redirect settings can participate in an authenticated clone.
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    ...(auth?.env ?? {}),
+  };
+
+  try {
+    if (defaultBranch) {
+      try {
+        await runGit(
+          [
+            ...CLONE_CONFIG_ARGS,
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--branch",
+            defaultBranch,
+            cloneUrl,
+            repoPath,
+          ],
+          { env },
+        );
+        return;
+      } catch {
+        console.warn(
+          `Could not clone branch "${defaultBranch}". Falling back to repository default branch.`,
+        );
+      }
     }
+
+    try {
+      await runGit(
+        [...CLONE_CONFIG_ARGS, "clone", "--depth", "1", cloneUrl, repoPath],
+        { env },
+      );
+    } catch (error) {
+      throw classifyCloneFailure(error, token);
+    }
+  } finally {
+    // Credential-helper directory is removed on success and failure alike;
+    // after this, no reference to the auth environment remains.
+    await auth?.cleanup();
+  }
+}
+
+// Post-preflight clone failures are treated as transient transport failures
+// (retryable via BullMQ): identity, access, permission, and credential
+// problems were already ruled out by the typed preflight. Diagnostics are
+// scrubbed of anything credential-adjacent before leaving this module.
+function classifyCloneFailure(error: unknown, token: string | null): RepositoryError {
+  if (error instanceof RepositoryError) {
+    return error;
   }
 
-  await runGitClone(["clone", "--depth", "1", repoUrl, repoPath]);
+  const raw = error as Error & { stderr?: string | Buffer };
+  const detail = [raw?.message ?? String(error), raw?.stderr?.toString() ?? ""]
+    .filter(Boolean)
+    .join("\n");
+
+  return new RepositoryError(
+    "transient_clone",
+    `git clone failed: ${redactGitFailure(detail, token).slice(0, 600)}`,
+    true,
+  );
 }
 
 // Sherlock's own tooling (graphify extract, npm install in the sandbox)
@@ -237,13 +373,6 @@ async function getHeadCommit(repoPath: string) {
   });
 
   return stdout.trim();
-}
-
-async function runGitClone(args: string[]) {
-  await execFileAsync("git", args, {
-    timeout: 60_000,
-    maxBuffer: 1024 * 1024,
-  });
 }
 
 // read files that claude will analyze, returning null if they don't exist or cant be read
