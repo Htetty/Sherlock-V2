@@ -97,7 +97,14 @@ describe("Sherlock webhook (queued investigations)", () => {
         throttle: { enabled: false },
       })),
     });
-    probot.load(createSherlockApp(fake.adapter));
+    probot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        // Authorization is covered in command-gate.test.ts; these tests
+        // focus on queueing behavior.
+        getRepositoryRole: async () => ({ roleName: "write" }),
+      }),
+    );
   });
 
   afterEach(() => {
