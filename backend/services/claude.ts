@@ -240,15 +240,45 @@ export type MemoryReflection = {
   whatFailed: string;
 };
 
-export async function generateMemoryReflection(input: {
+// Deliberately compact input (cost): a plan SUMMARY instead of the full plan
+// JSON, bounded error evidence instead of full logs/arrays, and short
+// structured fields. The reflection prompt stays small and bounded.
+export type MemoryReflectionInput = {
   issueTitle: string;
-  issueBody: string;
   outcome: string;
-  intentPlanJson: string;
+  // Compact official-plan summary: step count, assertion type, one-line intent.
+  planSummary: string;
+  // Assertion detail from the accepted reproduction result, if any.
+  assertionDetail: string;
+  // Bounded error evidence (first lines of outcomeReason / failed checks).
   browserErrors: string[];
-  analysisText: string;
-  patchedFiles: string[];
-}): Promise<MemoryReflection> {
+  // Fix detail when available (derived from the fix attempt).
+  fixRootCause: string;
+  fixSummary: string;
+  changedFiles: string[];
+  // Failed verification checks when no fix was verified.
+  failedChecks: string[];
+};
+
+const REFLECTION_MAX_EVIDENCE_LINES = 8;
+const REFLECTION_MAX_LINE_CHARS = 300;
+
+function boundLines(lines: string[], maxLines = REFLECTION_MAX_EVIDENCE_LINES): string {
+  return lines
+    .filter(Boolean)
+    .slice(0, maxLines)
+    .map((line) => {
+      const first = line.split("\n")[0] ?? "";
+      return first.length > REFLECTION_MAX_LINE_CHARS
+        ? `${first.slice(0, REFLECTION_MAX_LINE_CHARS)}...`
+        : first;
+    })
+    .join("\n");
+}
+
+export async function generateMemoryReflection(
+  input: MemoryReflectionInput,
+): Promise<MemoryReflection> {
   const prompt = `You are recording the outcome of an automated bug investigation so future
 investigations of this repository start smarter.
 
@@ -257,14 +287,16 @@ Return ONLY valid JSON matching the schema at the end.
 ## What happened
 
 Issue title: ${input.issueTitle}
-Issue body: ${input.issueBody || "(empty)"}
 Outcome: ${input.outcome}
-Reproduction plan executed: ${input.intentPlanJson}
-Browser errors/evidence:
-${input.browserErrors.join("\n") || "(none)"}
-Root cause analysis:
-${input.analysisText || "(none)"}
-Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
+Official reproduction plan: ${input.planSummary || "(none)"}
+Assertion detail: ${input.assertionDetail || "(none)"}
+Error evidence (bounded):
+${boundLines(input.browserErrors) || "(none)"}
+Fix root cause: ${input.fixRootCause || "(none)"}
+Fix summary: ${input.fixSummary || "(none)"}
+Failed verification checks (if no verified fix):
+${boundLines(input.failedChecks) || "(none)"}
+Patched files (if any): ${input.changedFiles.join(", ") || "(none)"}
 
 ## Rules
 

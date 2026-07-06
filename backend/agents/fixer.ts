@@ -16,6 +16,7 @@ import { lstat, mkdir, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type Anthropic from "@anthropic-ai/sdk";
+import { createCompactor } from "./compaction.js";
 import { createArtifactStore } from "../services/artifacts.js";
 import {
   MODEL,
@@ -38,13 +39,14 @@ import { redactSecrets } from "../services/report.js";
 const execFileAsync = promisify(execFile);
 
 // --- Budgets (docs/fable/10) ------------------------------------------------
+//
+// Two profiles: cost-conscious "standard" (default) and quality-oriented
+// "deep" behind SHERLOCK_DEEP_INVESTIGATION=true. Every tool call consumes a
+// model turn, so maxModelTurns must cover the plausible tool-call budget plus
+// terminal turns. First-pass numbers — tune from cost-shape.json.
 
-export const FIXER_BUDGETS = {
-  maxModelTurns: 30,
-  maxReadFileCalls: 20,
-  maxGrepCalls: 10,
-  maxGraphCalls: 10,
-  maxPatchAttempts: 3,
+// Limits shared by both profiles (safety caps, not cost knobs).
+const FIXER_SHARED_LIMITS = {
   maxWallTimeMs: 15 * 60_000,
   maxResponseTokens: 4_000,
   // Per read_file result.
@@ -56,6 +58,36 @@ export const FIXER_BUDGETS = {
   // Cumulative read_file/grep bytes returned to the model.
   maxEvidenceBytes: 300 * 1024,
 };
+
+export const STANDARD_FIXER_BUDGETS = {
+  ...FIXER_SHARED_LIMITS,
+  maxModelTurns: 16,
+  maxReadFileCalls: 8,
+  maxGrepCalls: 4,
+  maxGraphCalls: 4,
+  maxPatchAttempts: 2,
+};
+
+export const DEEP_FIXER_BUDGETS = {
+  ...FIXER_SHARED_LIMITS,
+  maxModelTurns: 30,
+  maxReadFileCalls: 20,
+  maxGrepCalls: 10,
+  maxGraphCalls: 10,
+  maxPatchAttempts: 3,
+};
+
+export type FixerBudgets = typeof STANDARD_FIXER_BUDGETS;
+
+// Stable alias for existing imports; the agent runtime selects a profile via
+// getFixerBudgets() at run start instead of using this directly.
+export const FIXER_BUDGETS = STANDARD_FIXER_BUDGETS;
+
+export function getFixerBudgets(): FixerBudgets {
+  return process.env.SHERLOCK_DEEP_INVESTIGATION === "true"
+    ? DEEP_FIXER_BUDGETS
+    : STANDARD_FIXER_BUDGETS;
+}
 
 const IGNORED_DIRS = new Set([
   ".git",
@@ -105,6 +137,9 @@ export type FixerAgentResult = {
   status: FixerAgentStatus;
   reason: string;
   attempts: FixerAgentAttempt[];
+  // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
+  turns: number;
+  compactionEvents: number;
 };
 
 export type CreateModelMessage = (
@@ -243,9 +278,16 @@ export async function runFixerAgent(
   const createMessage = deps.createMessage ?? createModelMessage;
   const verify = deps.runFixAttempt ?? runFixAttempt;
 
+  // Budget profile is selected once at run start and used for the whole run.
+  const budgetProfile =
+    process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard";
+  const budgets = getFixerBudgets();
+
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Fixer: ${message}`);
   };
+
+  log(`Fixer budget profile: ${budgetProfile}`);
 
   const agentDir = path.join(input.investigationDir, "fix-agent");
   const store = await createArtifactStore(input.investigationId, agentDir);
@@ -266,6 +308,34 @@ export async function runFixerAgent(
   let lastAttempt: FixAttemptResult | null = null;
   let nudged = false;
 
+  // Compaction (SHERLOCK_COMPACTION=true): locally tracked state used to
+  // rebuild a compact summary when old history is spliced out.
+  const compactor = createCompactor();
+  const factLog: string[] = [];
+  let lastVerifierFeedback = "";
+  let lastAssistantText = "";
+
+  const buildStateSummary = (): string => {
+    const sections = [
+      factLog.length > 0
+        ? `Facts learned (files/graph/grep inspected):\n${factLog.slice(-40).map((line) => `- ${line}`).join("\n")}`
+        : "No inspection tool calls yet.",
+      attempts.length > 0
+        ? `Patch attempts so far (all rolled back unless verified):\n${attempts
+            .map(
+              (attempt) =>
+                `- attempt ${attempt.index}: ${attempt.outcome ?? "?"} — ${(attempt.reason ?? "").slice(0, 300)} (changed: ${(attempt.changedFiles ?? []).join(", ") || "none"})`,
+            )
+            .join("\n")}`
+        : "No patch attempts yet.",
+      lastVerifierFeedback ? `Latest verifier feedback:\n${lastVerifierFeedback}` : "",
+      lastAssistantText ? `Your last stated reasoning:\n${lastAssistantText.slice(0, 600)}` : "",
+      `Remaining budgets: ${budgets.maxModelTurns - counters.turns} model turn(s), ${Math.max(0, budgets.maxReadFileCalls - counters.readFile)} read_file, ${Math.max(0, budgets.maxGrepCalls - counters.grep)} grep, ${Math.max(0, budgets.maxGraphCalls - counters.graph)} get_graph_neighbors, ${budgets.maxPatchAttempts - counters.patchAttempts} patch attempt(s).`,
+    ];
+
+    return sections.filter(Boolean).join("\n\n");
+  };
+
   const messages: Anthropic.Messages.MessageParam[] = [
     { role: "user", content: buildInitialMessage(input) },
   ];
@@ -275,7 +345,14 @@ export async function runFixerAgent(
     reason: string,
     fixAttempt: FixAttemptResult | null,
   ): Promise<FixerAgentResult> => {
-    const result: FixerAgentResult = { fixAttempt, status, reason, attempts };
+    const result: FixerAgentResult = {
+      fixAttempt,
+      status,
+      reason,
+      attempts,
+      turns: counters.turns,
+      compactionEvents: compactor.events,
+    };
     transcript.push({ type: "final_result", status, reason, attempts });
     await store.writeJson("transcript.json", transcript);
     await store.writeJson("summary.json", {
@@ -285,6 +362,7 @@ export async function runFixerAgent(
       fixAttemptId: fixAttempt?.fixAttemptId ?? null,
       fixOutcome: fixAttempt?.outcome ?? null,
       counters,
+      compactionEvents: compactor.events,
       durationMs: Date.now() - startedAt,
     });
     log(`finished: ${status} — ${reason}`);
@@ -304,11 +382,11 @@ export async function runFixerAgent(
 
   try {
     while (true) {
-      if (Date.now() - startedAt > FIXER_BUDGETS.maxWallTimeMs) {
+      if (Date.now() - startedAt > budgets.maxWallTimeMs) {
         return await finish("exhausted", "Wall-time budget exhausted.", lastAttempt);
       }
 
-      if (counters.turns >= FIXER_BUDGETS.maxModelTurns) {
+      if (counters.turns >= budgets.maxModelTurns) {
         return await finish("exhausted", "Model turn budget exhausted.", lastAttempt);
       }
 
@@ -318,9 +396,9 @@ export async function runFixerAgent(
       // recorded/injected createMessage implementations see a stable value.
       const message = await createMessage({
         model: MODEL,
-        max_tokens: FIXER_BUDGETS.maxResponseTokens,
+        max_tokens: budgets.maxResponseTokens,
         temperature: 0,
-        system: SYSTEM_PROMPT,
+        system: buildSystemPrompt(budgets),
         tools: TOOLS,
         tool_choice: { type: "any", disable_parallel_tool_use: true },
         messages: [...messages],
@@ -351,6 +429,14 @@ export async function runFixerAgent(
           { role: "user", content: "Respond with exactly one tool call." },
         );
         continue;
+      }
+
+      const textBlock = message.content.find(
+        (block): block is Anthropic.Messages.TextBlock => block.type === "text",
+      );
+
+      if (textBlock?.text.trim()) {
+        lastAssistantText = textBlock.text.trim();
       }
 
       transcript.push({
@@ -432,10 +518,10 @@ export async function runFixerAgent(
           );
         }
 
-        if (counters.patchAttempts >= FIXER_BUDGETS.maxPatchAttempts) {
+        if (counters.patchAttempts >= budgets.maxPatchAttempts) {
           return await finish(
             "exhausted",
-            `Patch attempt budget exhausted (${FIXER_BUDGETS.maxPatchAttempts} attempts, none verified).`,
+            `Patch attempt budget exhausted (${budgets.maxPatchAttempts} attempts, none verified).`,
             lastAttempt,
           );
         }
@@ -448,11 +534,20 @@ export async function runFixerAgent(
               {
                 type: "tool_result",
                 tool_use_id: toolUse.id,
-                content: `${feedback}\n\nThe workspace was rolled back to the source commit. ${FIXER_BUDGETS.maxPatchAttempts - counters.patchAttempts} patch attempt(s) remaining. Revise using this evidence, or call submit_blocked.`,
+                content: `${feedback}\n\nThe workspace was rolled back to the source commit. ${budgets.maxPatchAttempts - counters.patchAttempts} patch attempt(s) remaining. Revise using this evidence, or call submit_blocked.`,
               },
             ],
           },
         );
+
+        lastVerifierFeedback = feedback;
+        compactor.record(feedback.length);
+
+        if (compactor.maybeCompact(messages, buildStateSummary)) {
+          transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+          log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+        }
+
         continue;
       }
 
@@ -462,10 +557,10 @@ export async function runFixerAgent(
 
       if (toolUse.name === "read_file") {
         counters.readFile += 1;
-        if (counters.readFile > FIXER_BUDGETS.maxReadFileCalls) {
+        if (counters.readFile > budgets.maxReadFileCalls) {
           resultText = "read_file budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
-        } else if (counters.evidenceBytes >= FIXER_BUDGETS.maxEvidenceBytes) {
+        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
           resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
         } else {
@@ -486,10 +581,10 @@ export async function runFixerAgent(
         }
       } else if (toolUse.name === "get_graph_neighbors") {
         counters.graph += 1;
-        if (counters.graph > FIXER_BUDGETS.maxGraphCalls) {
+        if (counters.graph > budgets.maxGraphCalls) {
           resultText = "get_graph_neighbors budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
-        } else if (counters.evidenceBytes >= FIXER_BUDGETS.maxEvidenceBytes) {
+        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
           resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
         } else {
@@ -506,10 +601,10 @@ export async function runFixerAgent(
         }
       } else if (toolUse.name === "grep") {
         counters.grep += 1;
-        if (counters.grep > FIXER_BUDGETS.maxGrepCalls) {
+        if (counters.grep > budgets.maxGrepCalls) {
           resultText = "grep budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
-        } else if (counters.evidenceBytes >= FIXER_BUDGETS.maxEvidenceBytes) {
+        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
           resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
           isError = true;
         } else {
@@ -539,6 +634,10 @@ export async function runFixerAgent(
         bytes: resultText.length,
       });
 
+      factLog.push(
+        `${toolUse.name} ${JSON.stringify(toolUse.input).slice(0, 160)} -> ${isError ? `error: ${firstLine(resultText)}` : `ok (${resultText.length} bytes)`}`,
+      );
+
       messages.push(
         { role: "assistant", content: message.content },
         {
@@ -553,6 +652,13 @@ export async function runFixerAgent(
           ],
         },
       );
+
+      compactor.record(resultText.length);
+
+      if (compactor.maybeCompact(messages, buildStateSummary)) {
+        transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+        log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+      }
     }
   } catch (error) {
     return await finish(
@@ -821,7 +927,7 @@ function globToRegExp(glob: string): RegExp {
 
 // --- Prompt ----------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `You are Sherlock's fixer agent. A bug has already been deterministically reproduced in an isolated workspace; your job is to find the root cause and land the smallest safe fix.
+const buildSystemPrompt = (budgets: FixerBudgets) => `You are Sherlock's fixer agent. A bug has already been deterministically reproduced in an isolated workspace; your job is to find the root cause and land the smallest safe fix.
 
 Rules:
 - Inspect files with read_file and grep. The provided graph context is a map, not the territory — when evidence is missing, read files; never guess.
@@ -831,7 +937,7 @@ Rules:
 - Change at most ${PATCH_LIMITS.maxChangedFiles} files and ${PATCH_LIMITS.maxChangedLines} lines. Never touch .env files, keys, lockfiles, GitHub workflows, or deployment configuration. Violations waste a patch attempt.
 - Never modify UI text, roles, labels, placeholders, or testids referenced by the saved reproduction plan — the EXACT plan is replayed after every patch, and changing those strings breaks verification.
 - relevantTests must be plain npm/npx/node commands (no shell operators); use an empty array if the repository has no runnable tests.
-- propose_patch runs the full deterministic verification (safety validation, apply, restart, exact replay, tests) and returns the result. Only that verifier decides success — a failed attempt is rolled back and you receive the evidence. You have at most ${FIXER_BUDGETS.maxPatchAttempts} patch attempts; revise using the returned evidence.
+- propose_patch runs the full deterministic verification (safety validation, apply, restart, exact replay, tests) and returns the result. Only that verifier decides success — a failed attempt is rolled back and you receive the evidence. You have at most ${budgets.maxPatchAttempts} patch attempts; revise using the returned evidence.
 - If a safe fix is not possible, call submit_blocked with a clear reason.
 - Respond with exactly one tool call per turn.`;
 
@@ -902,4 +1008,9 @@ function nonEmptyContent(
   }
 
   return [{ type: "text", text: "(no content)" }];
+}
+
+function firstLine(text: string): string {
+  const line = text.split("\n")[0] ?? "";
+  return line.length > 200 ? `${line.slice(0, 200)}...` : line;
 }

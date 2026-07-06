@@ -13,6 +13,7 @@ import { describe, expect, test } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   REPRODUCER_BUDGETS,
+  detectApiIssueSignal,
   runReproducerAgent,
   type ReproducerAgentInput,
 } from "../backend/agents/reproducer.js";
@@ -63,7 +64,9 @@ type MakeInputResult = {
   restartCalls: () => number;
 };
 
-async function makeInput(): Promise<MakeInputResult> {
+async function makeInput(
+  issueOverrides: { issueTitle?: string; issueBody?: string } = {},
+): Promise<MakeInputResult> {
   const { repoPath, commit } = await makeGitRepo();
   const investigationDir = await mkdtemp(path.join(tmpdir(), "repro-agent-inv-"));
   let restarts = 0;
@@ -73,8 +76,10 @@ async function makeInput(): Promise<MakeInputResult> {
     investigationDir,
     repoPath,
     sourceCommit: commit,
-    issueTitle: "Archiving completed tasks breaks the task list",
-    issueBody: "After archiving, GET /api/tasks returns 500.",
+    // Contains an explicit "GET /api/tasks" - a clear API signal, so the
+    // UI-first policy is waived for tests that submit without exploring.
+    issueTitle: issueOverrides.issueTitle ?? "Archiving completed tasks breaks the task list",
+    issueBody: issueOverrides.issueBody ?? "After archiving, GET /api/tasks returns 500.",
     repoUrl: "https://github.com/example/app",
     defaultBranch: "main",
     fileTree: ["server.js"],
@@ -478,6 +483,72 @@ describe("reproducer agent loop", () => {
     expect(result.status).toBe("plan_failed");
     expect(result.reason).toContain("Archive button does not exist");
     expect(restartCalls()).toBe(0);
+  });
+
+  test("detectApiIssueSignal recognizes clear API failures and rejects vague text", () => {
+    expect(detectApiIssueSignal("GET /api/tasks returns 500")).toContain("GET /api/tasks");
+    expect(detectApiIssueSignal("the route /api/tasks/archive breaks")).toContain("/api/tasks/archive");
+    expect(detectApiIssueSignal("the archive endpoint is broken")).toContain("endpoint");
+    expect(detectApiIssueSignal("the API response is a 500 error")).toContain("status code");
+    expect(detectApiIssueSignal("The archive button does nothing when clicked")).toBeNull();
+    expect(detectApiIssueSignal("Completed tasks still appear under the Active filter")).toBeNull();
+  });
+
+  test("UI-first policy blocks terminals until goto + read_page, without consuming submissions", async () => {
+    const { input } = await makeInput({
+      issueTitle: "Archive button does nothing",
+      issueBody: "Clicking the archive button has no visible effect.",
+    });
+    const sessions = stubSessionFactory([stepRecord("goto", "passed")]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION), // blocked by policy
+      toolUseMessage("submit_not_reproducible", { reason: "giving up" }), // blocked too
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("submit_plan", VALID_SUBMISSION), // now allowed
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => replayResult("reproduced", "Failure observed."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    // Neither blocked terminal consumed a submission.
+    expect(result.submissions).toHaveLength(1);
+    expect(lastToolResultText(model.calls[1])).toContain("Policy");
+    expect(lastToolResultText(model.calls[2])).toContain("Policy");
+
+    const mode = JSON.parse(
+      await readFile(path.join(input.investigationDir, "repro-agent", "mode.json"), "utf8"),
+    ) as { uiFirstPolicy: Record<string, unknown> };
+    expect(mode.uiFirstPolicy).toMatchObject({
+      required: true,
+      satisfied: true,
+      apiIssueSignal: null,
+    });
+  });
+
+  test("UI-first policy is waived when the issue names an API failure", async () => {
+    const { input } = await makeInput(); // default issue contains "GET /api/tasks"
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([toolUseMessage("submit_plan", VALID_SUBMISSION)]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => replayResult("reproduced", "500 observed."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(result.submissions).toHaveLength(1);
+
+    const mode = JSON.parse(
+      await readFile(path.join(input.investigationDir, "repro-agent", "mode.json"), "utf8"),
+    ) as { uiFirstPolicy: { required: boolean; apiIssueSignal: string | null } };
+    expect(mode.uiFirstPolicy.required).toBe(false);
+    expect(mode.uiFirstPolicy.apiIssueSignal).toContain("GET /api/tasks");
   });
 
   test("getPlanMode classifies api-only, browser, and mixed plans", () => {

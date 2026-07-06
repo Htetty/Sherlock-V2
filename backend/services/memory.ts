@@ -6,6 +6,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import type { ReproductionPlan } from "./plan.js";
 
 const MAX_MATCHES = 3;
 
@@ -28,6 +29,11 @@ export type MemoryEntry = {
   whatWorked: string;
   whatFailed: string;
   createdAt: string;
+  // The accepted successful reproduction plan (memory-plan replay). Optional
+  // and backward compatible: old entries without it are simply not replay
+  // candidates — no migration required. NEVER trusted without a fresh
+  // executeReproductionPlan() replay.
+  reproductionPlan?: ReproductionPlan;
 };
 
 export function dataDir(): string {
@@ -143,7 +149,10 @@ export async function renderPastInvestigations(
   return blocks.join("\n\n");
 }
 
-async function findStaleFile(
+// Staleness by patched-file hashes. Useful but insufficient for replay (a
+// plan can go stale through files that were never patched) — used only to
+// skip obviously wasteful replay attempts, never to mark anything reproduced.
+export async function findStaleFile(
   entry: MemoryEntry,
   repoPath: string,
 ): Promise<string | null> {

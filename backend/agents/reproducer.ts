@@ -18,13 +18,13 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type Anthropic from "@anthropic-ai/sdk";
+import { createCompactor } from "./compaction.js";
 import { createArtifactStore } from "../services/artifacts.js";
 import {
   MODEL,
   createModelMessage,
   formatGraphSection,
   formatPastSection,
-  formatRepoEvidence,
 } from "../services/claude.js";
 import type { RestartResult } from "../services/fix.js";
 import type { GraphContext } from "../services/graphContext.js";
@@ -51,13 +51,14 @@ import type { CreateModelMessage } from "./fixer.js";
 const execFileAsync = promisify(execFile);
 
 // --- Budgets (docs/fable/11) --------------------------------------------------
+//
+// Two profiles: cost-conscious "standard" (default) and quality-oriented
+// "deep" behind SHERLOCK_DEEP_INVESTIGATION=true. Every tool call consumes a
+// model turn, so maxModelTurns must cover the plausible tool-call budget plus
+// terminal turns. First-pass numbers — tune from cost-shape.json.
 
-export const REPRODUCER_BUDGETS = {
-  maxModelTurns: 40,
-  maxBrowserActions: 30, // goto/click/fill/wait combined
-  maxRequestCalls: 15,
-  maxReadPageCalls: 15,
-  maxPlanSubmissions: 3, // invalid submissions count
+// Limits shared by both profiles (safety caps, not cost knobs).
+const REPRODUCER_SHARED_LIMITS = {
   maxWallTimeMs: 10 * 60_000,
   maxResponseTokens: 4_000,
   // Per read_page result.
@@ -65,6 +66,40 @@ export const REPRODUCER_BUDGETS = {
   // Cumulative tool-result bytes returned to the model.
   maxEvidenceBytes: 300 * 1024,
 };
+
+export const STANDARD_REPRODUCER_BUDGETS = {
+  ...REPRODUCER_SHARED_LIMITS,
+  maxModelTurns: 16,
+  maxBrowserActions: 8, // goto/click/fill/wait combined
+  maxRequestCalls: 8,
+  maxReadPageCalls: 5,
+  maxPlanSubmissions: 2, // invalid submissions count
+};
+
+export const DEEP_REPRODUCER_BUDGETS = {
+  ...REPRODUCER_SHARED_LIMITS,
+  maxModelTurns: 40,
+  maxBrowserActions: 30,
+  maxRequestCalls: 15,
+  maxReadPageCalls: 15,
+  maxPlanSubmissions: 3,
+};
+
+export type ReproducerBudgets = typeof STANDARD_REPRODUCER_BUDGETS;
+
+// Stable alias for existing imports; the agent runtime selects a profile via
+// getReproducerBudgets() at run start instead of using this directly.
+export const REPRODUCER_BUDGETS = STANDARD_REPRODUCER_BUDGETS;
+
+export function getBudgetProfileName(): "standard" | "deep" {
+  return process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard";
+}
+
+export function getReproducerBudgets(): ReproducerBudgets {
+  return getBudgetProfileName() === "deep"
+    ? DEEP_REPRODUCER_BUDGETS
+    : STANDARD_REPRODUCER_BUDGETS;
+}
 
 // --- Public interface -----------------------------------------------------------
 
@@ -122,6 +157,9 @@ export type ReproducerAgentResult = {
   // How the agent explored (may be broader than the accepted plan's mode).
   explorationMode: ReproductionMode;
   submissions: PlanSubmissionRecord[];
+  // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
+  turns: number;
+  compactionEvents: number;
 };
 
 export type ReproducerAgentDeps = {
@@ -275,6 +313,38 @@ const TOOLS: Anthropic.Messages.Tool[] = [
 
 const BROWSER_ACTION_TOOLS = new Set(["goto", "click", "fill", "wait"]);
 
+// --- UI-first policy ---------------------------------------------------------------
+// The agent must look at the running app (at least one successful goto and
+// one read_page) before submitting a plan or declaring the issue not
+// reproducible - UNLESS the issue or past memory clearly identifies an API
+// endpoint failure. Returns the matched signal (for artifacts/logs) or null.
+
+export function detectApiIssueSignal(text: string): string | null {
+  const methodPath = text.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+\/[^\s"'`)]+/);
+
+  if (methodPath) {
+    return `explicit request "${methodPath[0]}"`;
+  }
+
+  const apiPath = text.match(/(?:^|[\s"'`(])(\/api\/[^\s"'`)]+)/);
+
+  if (apiPath) {
+    return `API route "${apiPath[1]}"`;
+  }
+
+  const hasStatusCode = /\b[45]\d{2}\b/.test(text);
+
+  if (hasStatusCode && /\b(api|endpoint|route|request|response)\b/i.test(text)) {
+    return "HTTP status code mentioned together with an API/endpoint/request reference";
+  }
+
+  if (/\bendpoint\b/i.test(text)) {
+    return 'the word "endpoint"';
+  }
+
+  return null;
+}
+
 // --- Agent loop -----------------------------------------------------------------------
 
 export async function runReproducerAgent(
@@ -285,9 +355,15 @@ export async function runReproducerAgent(
   const openSession = deps.openLiveSession ?? openLiveSession;
   const replayPlan = deps.executeReproductionPlan ?? executeReproductionPlan;
 
+  // Budget profile is selected once at run start and used for the whole run.
+  const budgetProfile = getBudgetProfileName();
+  const budgets = getReproducerBudgets();
+
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Reproducer: ${message}`);
   };
+
+  log(`Reproducer budget profile: ${budgetProfile}`);
 
   const agentDir = path.join(input.investigationDir, "repro-agent");
   const store = await createArtifactStore(input.investigationId, agentDir);
@@ -308,10 +384,26 @@ export async function runReproducerAgent(
     // against the live session. Invalid attempts never count toward mode.
     pageActionsExecuted: 0, // goto/click/fill
     requestsExecuted: 0,
+    gotoPassed: 0, // successful goto steps (UI-first policy)
     readPage: 0,
+    readPageOk: 0, // read_page calls that returned a digest (UI-first policy)
     submissions: 0,
     evidenceBytes: 0,
   };
+
+  // UI-first policy: required unless the issue/memory clearly identifies an
+  // API endpoint failure. Satisfied by >=1 successful goto and >=1 read_page.
+  const apiIssueSignal = detectApiIssueSignal(
+    `${input.issueTitle}\n${input.issueBody}\n${input.pastInvestigations}`,
+  );
+  const uiFirstRequired = apiIssueSignal === null;
+  const uiFirstSatisfied = () => counters.gotoPassed >= 1 && counters.readPageOk >= 1;
+
+  if (uiFirstRequired) {
+    log("UI-first policy active: no clear API signal in the issue or memory.");
+  } else {
+    log(`UI-first policy waived: ${apiIssueSignal}.`);
+  }
 
   // Exploration mode: page tools (goto/click/fill/read_page) vs request.
   // "wait" is neutral. "unknown" = no meaningful action before a terminal.
@@ -337,6 +429,50 @@ export async function runReproducerAgent(
   let toolCallIndex = 0;
   let stepCounter = 0;
   let nudged = false;
+
+  // Compaction (SHERLOCK_COMPACTION=true): locally tracked state used to
+  // rebuild a compact summary when old history is spliced out.
+  const compactor = createCompactor();
+  const factLog: string[] = [];
+  let lastReplayFeedback = "";
+
+  const buildStateSummary = (): string => {
+    const sections = [
+      factLog.length > 0
+        ? `Actions taken so far (live exploration):\n${factLog.slice(-40).map((line) => `- ${line}`).join("\n")}`
+        : "No exploration actions yet.",
+      submissions.length > 0
+        ? `Plan submissions so far:\n${submissions
+            .map(
+              (submission) =>
+                `- submission ${submission.index}: ${submission.valid ? `replay ${submission.replayOutcome ?? "?"} — ${(submission.replayReason ?? "").slice(0, 200)}` : `invalid — ${(submission.validationErrors ?? []).join(" | ").slice(0, 300)}`}`,
+            )
+            .join("\n")}`
+        : "No plan submissions yet.",
+      lastReplayFeedback ? `Latest official replay feedback:\n${lastReplayFeedback}` : "",
+      `Remaining budgets: ${budgets.maxModelTurns - counters.turns} model turn(s), ${Math.max(0, budgets.maxBrowserActions - counters.browserActions)} browser action(s), ${Math.max(0, budgets.maxRequestCalls - counters.requests)} request(s), ${Math.max(0, budgets.maxReadPageCalls - counters.readPage)} read_page call(s), ${budgets.maxPlanSubmissions - counters.submissions} submission(s).`,
+      uiFirstRequired && !uiFirstSatisfied()
+        ? "UI-first policy is still unsatisfied: perform at least one successful goto and one read_page before submitting."
+        : "",
+    ];
+
+    return sections.filter(Boolean).join("\n\n");
+  };
+
+  const pushResult = (
+    assistantContent: Anthropic.Messages.ContentBlock[],
+    toolUseId: string,
+    content: string,
+    isError: boolean,
+  ) => {
+    pushToolResult(messages, assistantContent, toolUseId, content, isError);
+    compactor.record(content.length);
+
+    if (compactor.maybeCompact(messages, buildStateSummary)) {
+      transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+      log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+    }
+  };
 
   // Live session state. Opened lazily; closed before every official replay.
   let session: LiveSession | null = null;
@@ -374,6 +510,8 @@ export async function runReproducerAgent(
       reason,
       explorationMode: mode,
       submissions,
+      turns: counters.turns,
+      compactionEvents: compactor.events,
     };
     transcript.push({ type: "final_result", status, reason, submissions, mode });
     await store.writeJson("transcript.json", transcript);
@@ -384,6 +522,11 @@ export async function runReproducerAgent(
       readPageCalls: counters.readPage,
       submittedPlans: counters.submissions,
       submittedPlanMode: acceptedPlanMode,
+      uiFirstPolicy: {
+        required: uiFirstRequired,
+        satisfied: uiFirstSatisfied(),
+        apiIssueSignal,
+      },
     });
     await store.writeJson("reproduction-evidence-summary.json", {
       explorationMode: mode,
@@ -398,6 +541,7 @@ export async function runReproducerAgent(
       acceptedPlanMode,
       submissions,
       counters,
+      compactionEvents: compactor.events,
       durationMs: Date.now() - startedAt,
       replayOutcome: result?.outcome ?? null,
     });
@@ -436,11 +580,11 @@ export async function runReproducerAgent(
 
   try {
     while (true) {
-      if (Date.now() - startedAt > REPRODUCER_BUDGETS.maxWallTimeMs) {
+      if (Date.now() - startedAt > budgets.maxWallTimeMs) {
         return await finishExhausted("Wall-time budget exhausted.");
       }
 
-      if (counters.turns >= REPRODUCER_BUDGETS.maxModelTurns) {
+      if (counters.turns >= budgets.maxModelTurns) {
         return await finishExhausted("Model turn budget exhausted.");
       }
 
@@ -448,7 +592,7 @@ export async function runReproducerAgent(
 
       const message = await createMessage({
         model: MODEL,
-        max_tokens: REPRODUCER_BUDGETS.maxResponseTokens,
+        max_tokens: budgets.maxResponseTokens,
         temperature: 0,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
@@ -491,6 +635,32 @@ export async function runReproducerAgent(
         input: toolUse.name === "submit_plan" ? "(see tool-calls artifact)" : toolUse.input,
       });
       log(`turn ${counters.turns}: ${toolUse.name}`);
+
+      // --- UI-first policy gate on terminal tools ------------------------------
+      // Both terminals are blocked (WITHOUT consuming a submission) until the
+      // agent has actually looked at the app, unless the issue/memory clearly
+      // identified an API endpoint failure. Bounded by the turn budget.
+      if (
+        (toolUse.name === "submit_plan" || toolUse.name === "submit_not_reproducible") &&
+        uiFirstRequired &&
+        !uiFirstSatisfied()
+      ) {
+        const policyMessage =
+          "Policy: this issue does not clearly identify an API endpoint failure, so you must inspect the running app first - perform at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. This attempt was NOT counted against your submission budget.";
+
+        transcript.push({
+          type: "ui_first_policy_rejection",
+          turn: counters.turns,
+          tool: toolUse.name,
+          gotoPassed: counters.gotoPassed,
+          readPageOk: counters.readPageOk,
+        });
+        log(`UI-first policy blocked ${toolUse.name} (goto: ${counters.gotoPassed}, read_page: ${counters.readPageOk}).`);
+        await recordToolCall(toolUse.name, toolUse.input, policyMessage);
+
+        pushResult(message.content, toolUse.id, policyMessage, true);
+        continue;
+      }
 
       // --- Terminal: agent declares not reproducible -------------------------
       if (toolUse.name === "submit_not_reproducible") {
@@ -537,13 +707,13 @@ export async function runReproducerAgent(
           const feedback = `The submitted plan is invalid:\n${validation.errors.map((error) => `- ${error}`).join("\n")}`;
           await recordToolCall("submit_plan", submitted, feedback);
 
-          if (counters.submissions >= REPRODUCER_BUDGETS.maxPlanSubmissions) {
+          if (counters.submissions >= budgets.maxPlanSubmissions) {
             return await finishExhausted(
-              `Plan submission budget exhausted (${REPRODUCER_BUDGETS.maxPlanSubmissions} submissions, none reproduced).`,
+              `Plan submission budget exhausted (${budgets.maxPlanSubmissions} submissions, none reproduced).`,
             );
           }
 
-          pushToolResult(messages, message.content, toolUse.id, `${feedback}\n\n${remainingSubmissions()}`, true);
+          pushResult(message.content, toolUse.id, `${feedback}\n\n${remainingSubmissions()}`, true);
           continue;
         }
 
@@ -632,14 +802,14 @@ export async function runReproducerAgent(
 
         lastReplay = { plan: frozen, result: replayResult };
 
-        if (counters.submissions >= REPRODUCER_BUDGETS.maxPlanSubmissions) {
+        if (counters.submissions >= budgets.maxPlanSubmissions) {
           return await finishExhausted(
-            `Plan submission budget exhausted (${REPRODUCER_BUDGETS.maxPlanSubmissions} submissions, none reproduced).`,
+            `Plan submission budget exhausted (${budgets.maxPlanSubmissions} submissions, none reproduced).`,
           );
         }
 
-        pushToolResult(
-          messages,
+        lastReplayFeedback = feedback;
+        pushResult(
           message.content,
           toolUse.id,
           `${feedback}\n\nThe workspace and app were reset to a pristine state. ${remainingSubmissions()} You may explore again (a fresh live session will open) and revise.`,
@@ -654,10 +824,10 @@ export async function runReproducerAgent(
 
       if (toolUse.name === "read_page") {
         counters.readPage += 1;
-        if (counters.readPage > REPRODUCER_BUDGETS.maxReadPageCalls) {
+        if (counters.readPage > budgets.maxReadPageCalls) {
           resultText = "read_page budget exhausted — submit a plan or call submit_not_reproducible.";
           isError = true;
-        } else if (counters.evidenceBytes >= REPRODUCER_BUDGETS.maxEvidenceBytes) {
+        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
           resultText = "Evidence budget exhausted — submit a plan or call submit_not_reproducible.";
           isError = true;
         } else {
@@ -665,8 +835,9 @@ export async function runReproducerAgent(
             const live = await ensureSession();
             const digest = await live.readPageDigest();
             const delta = drainEvidenceDelta(live, evidenceCursor);
-            resultText = truncateText(`${digest}\n\n${delta}`, REPRODUCER_BUDGETS.maxDigestBytes);
+            resultText = truncateText(`${digest}\n\n${delta}`, budgets.maxDigestBytes);
             counters.evidenceBytes += resultText.length;
+            counters.readPageOk += 1;
             await live
               .captureScreenshot(`${String(toolCallIndex + 1).padStart(3, "0")}-after-read_page`)
               .catch(() => null);
@@ -684,10 +855,10 @@ export async function runReproducerAgent(
           counters.browserActions += 1;
         }
 
-        if (!isRequest && counters.browserActions > REPRODUCER_BUDGETS.maxBrowserActions) {
+        if (!isRequest && counters.browserActions > budgets.maxBrowserActions) {
           resultText = "Browser action budget exhausted — submit a plan or call submit_not_reproducible.";
           isError = true;
-        } else if (isRequest && counters.requests > REPRODUCER_BUDGETS.maxRequestCalls) {
+        } else if (isRequest && counters.requests > budgets.maxRequestCalls) {
           resultText = "Request budget exhausted — submit a plan or call submit_not_reproducible.";
           isError = true;
         } else {
@@ -716,6 +887,10 @@ export async function runReproducerAgent(
                 counters.requestsExecuted += 1;
               } else if (toolUse.name !== "wait") {
                 counters.pageActionsExecuted += 1;
+
+                if (toolUse.name === "goto" && record.outcome === "passed") {
+                  counters.gotoPassed += 1;
+                }
               }
 
               // Exploration trace: screenshot after successful browser
@@ -750,7 +925,11 @@ export async function runReproducerAgent(
         bytes: resultText.length,
       });
 
-      pushToolResult(messages, message.content, toolUse.id, resultText, isError);
+      factLog.push(
+        `${toolUse.name} ${JSON.stringify(toolUse.input).slice(0, 160)} -> ${isError ? `error: ${firstLine(resultText)}` : `ok (${resultText.length} bytes)`}`,
+      );
+
+      pushResult(message.content, toolUse.id, resultText, isError);
     }
   } catch (error) {
     return await finish(
@@ -778,7 +957,7 @@ export async function runReproducerAgent(
   }
 
   function remainingSubmissions(): string {
-    return `${REPRODUCER_BUDGETS.maxPlanSubmissions - counters.submissions} submission(s) remaining.`;
+    return `${budgets.maxPlanSubmissions - counters.submissions} submission(s) remaining.`;
   }
 }
 
@@ -914,9 +1093,57 @@ Rules:
 - The assertion must detect the reported failure using evidence you actually observed: copy exact strings from responses and errors you saw. Never invent error text.
 - A "console_error" or "element_text" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
 - Use browser actions (goto/click/fill) for UI/user-facing bugs. Use request actions for API/backend bugs. If your reproduction is API-only, make that intentional and assert against response_status or response_body. Do not open a blank page just to create a screenshot - screenshots are only meaningful when the bug is visible on a page.
+- Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.
 - Submissions are limited; explore until you have SEEN the failure before submitting.
 - Respond with exactly one tool call per turn.`;
+
+// Deliberately lean initial context (cost): the reproducer explores the LIVE
+// app, so it does not need hydrated source file bodies — it gets graph
+// node/edge names as route/API/UI hints, a package/scripts summary, past
+// memory, and a bounded tail of the sandbox logs. It has no read_file/grep
+// tools, so source inspection is not assumed. The fixer still receives the
+// full refined, hydrated context after reproduction is proven.
+const SANDBOX_LOG_TAIL_LINES = 40;
+
+function tailLines(text: string, maxLines: number): string {
+  const lines = text.split("\n");
+
+  if (lines.length <= maxLines) {
+    return text;
+  }
+
+  return `[...${lines.length - maxLines} earlier line(s) omitted]\n${lines.slice(-maxLines).join("\n")}`;
+}
+
+export function summarizePackageJson(packageJson: string | null): string {
+  if (!packageJson) {
+    return "(not found)";
+  }
+
+  try {
+    const parsed = JSON.parse(packageJson) as {
+      name?: unknown;
+      scripts?: Record<string, unknown>;
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
+
+    const scripts = Object.entries(parsed.scripts ?? {})
+      .map(([key, value]) => `  ${key}: ${String(value)}`)
+      .join("\n");
+
+    return [
+      `name: ${typeof parsed.name === "string" ? parsed.name : "(unknown)"}`,
+      `scripts:\n${scripts || "  (none)"}`,
+      `dependencies: ${Object.keys(parsed.dependencies ?? {}).join(", ") || "(none)"}`,
+      `devDependencies: ${Object.keys(parsed.devDependencies ?? {}).join(", ") || "(none)"}`,
+    ].join("\n");
+  } catch {
+    // Unparseable package.json: fall back to a bounded slice.
+    return packageJson.slice(0, 2_000);
+  }
+}
 
 function buildInitialMessage(input: ReproducerAgentInput): string {
   return `Reproduce this issue in the live app, then submit a deterministic plan.
@@ -924,21 +1151,31 @@ function buildInitialMessage(input: ReproducerAgentInput): string {
 The app is running now; use goto/read_page/click/fill/request/wait to explore it.
 ${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}
 Grounding rules:
-- Only reference files, routes, components, and UI strings that appear in the
+- Only reference routes, components, and UI strings that appear in the
   evidence below or that you observe live. If you have not seen it, it does
   not exist.
+- You cannot read source files. Ground your plan in what you observe through
+  read_page, request responses, and the graph hints above.
 
-${formatRepoEvidence({
-  issueTitle: input.issueTitle,
-  issueBody: input.issueBody,
-  repoUrl: input.repoUrl,
-  defaultBranch: input.defaultBranch,
-  fileTree: input.fileTree,
-  packageJson: input.packageJson,
-  readme: input.readme,
-  sourceFiles: input.initialSourceFiles,
-  sandboxResult: input.sandboxResult,
-})}`;
+Issue title:
+${input.issueTitle}
+
+Issue body:
+${input.issueBody || "(empty)"}
+
+package.json summary:
+${summarizePackageJson(input.packageJson)}
+
+Sandbox runtime logs (bounded tail):
+
+Base URL:
+${input.sandboxResult.baseUrl || "(unknown)"}
+
+STDOUT (last ${SANDBOX_LOG_TAIL_LINES} lines):
+${tailLines(input.sandboxResult.stdout, SANDBOX_LOG_TAIL_LINES) || "(empty)"}
+
+STDERR (last ${SANDBOX_LOG_TAIL_LINES} lines):
+${tailLines(input.sandboxResult.stderr, SANDBOX_LOG_TAIL_LINES) || "(empty)"}`;
 }
 
 // --- Small helpers ---------------------------------------------------------------------------
