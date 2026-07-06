@@ -32,6 +32,7 @@ import {
   classifyPostPatchRun,
   classifyPrePatchRun,
   extractRegressionFailureMarker,
+  type AppNetworkTarget,
   hashTestContents,
   materializeTest,
   runRegressionTest,
@@ -61,6 +62,9 @@ export type RestartResult = {
   ok: boolean;
   baseUrl?: string;
   log?: string;
+  // Identity of the restarted app container so strict-network regression
+  // containers can join its network namespace.
+  appNetwork?: AppNetworkTarget | null;
 };
 
 export type TestRunRecord = {
@@ -101,6 +105,9 @@ export type FixAttemptInput = {
   // unavailable for this investigation — reported truthfully, never faked.
   generateRegressionTest?: ((feedback: string | null) => Promise<unknown>) | null;
   regressionTimeoutMs?: number;
+  // The ORIGINAL (pre-patch) running app container, for strict-network
+  // regression execution against the unpatched source.
+  appNetwork?: AppNetworkTarget | null;
 };
 
 export type RepositoryValidationSummary = {
@@ -346,6 +353,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         repoPath: input.repoPath,
         relativePath: testProposal.relativePath,
         targetUrl: input.plan.baseUrl,
+        appNetwork: input.appNetwork ?? null,
         timeoutMs: input.regressionTimeoutMs,
       });
 
@@ -639,6 +647,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         repoPath: input.repoPath,
         relativePath: provenRegressionTest.relativePath,
         targetUrl: restart.baseUrl ?? input.plan.baseUrl,
+        appNetwork: restart.appNetwork ?? null,
         timeoutMs: input.regressionTimeoutMs,
       });
 

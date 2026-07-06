@@ -189,11 +189,33 @@ describe("repository validation execution", () => {
       // Restricted-container path (same runner as everything else).
       expect(args).toContain("--cap-drop=ALL");
       expect(args[args.indexOf("--name") + 1]).toMatch(/^sherlock-validate-/);
+      // Default network policy is strict: validation commands run with NO
+      // outbound network — dependencies were installed earlier.
+      expect(args).toContain("--network=none");
     }
 
     // Order: test before lint.
     expect(docker.spawned[0][docker.spawned[0].length - 1]).toBe("test");
     expect(docker.spawned[1][docker.spawned[1].length - 1]).toBe("lint");
+  });
+
+  test("permissive network policy preserves the previous validation container args", async () => {
+    const repoPath = await createRepo({
+      "package.json": pkg({ test: "vitest run" }),
+    });
+    const docker = createFakeDocker({ test: { exitCode: 0 } });
+
+    const validation = await runRepositoryValidation(docker.adapter, {
+      repoPath,
+      timeoutMs: 5_000,
+      networkPolicy: "permissive",
+    });
+
+    expect(validation.aggregate).toBe("passed");
+    expect(docker.spawned[0].join(" ")).not.toContain("--network");
+    // The rest of the restriction set is unchanged by the policy.
+    expect(docker.spawned[0]).toContain("--cap-drop=ALL");
+    expect(docker.spawned[0]).toContain("--read-only");
   });
 
   test("failed, timed-out, and launch-failure commands are classified truthfully", async () => {

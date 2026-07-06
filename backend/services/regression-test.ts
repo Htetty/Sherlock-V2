@@ -11,9 +11,12 @@ import { lstat, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildTargetEnv,
+  getSandboxNetworkPolicy,
   runContainerCommand,
   type ContainerCommandResult,
+  type ContainerNetwork,
   type DockerAdapter,
+  type SandboxNetworkPolicy,
 } from "./container.js";
 import type { ReproductionPlan } from "./plan.js";
 import type { ReproductionResult } from "./playwright.js";
@@ -344,29 +347,68 @@ export function rewriteTargetUrlForContainer(baseUrl: string): string {
   return baseUrl.replace(/localhost|127\.0\.0\.1/, "host.docker.internal");
 }
 
+// The running app container, identified so a strict-policy regression
+// container can join its network namespace instead of having any network
+// path of its own.
+export type AppNetworkTarget = {
+  containerName: string;
+  internalPort: number;
+};
+
 export async function runRegressionTest(
   docker: DockerAdapter,
   options: {
     repoPath: string;
     relativePath: string;
     targetUrl?: string | null;
+    appNetwork?: AppNetworkTarget | null;
+    networkPolicy?: SandboxNetworkPolicy;
     timeoutMs?: number;
   },
 ): Promise<ContainerCommandResult> {
+  const policy = options.networkPolicy ?? getSandboxNetworkPolicy();
+
+  let network: ContainerNetwork | undefined;
+  let addHostGateway = false;
+  let targetUrlForTest: string | null = null;
+
+  if (!options.targetUrl) {
+    // No app access needed: under strict there is no network at all.
+    network = policy === "strict" ? "none" : undefined;
+  } else if (policy === "strict" && options.appNetwork) {
+    // Strict with a known app container: join ITS network namespace. The
+    // test reaches the app at localhost:<internal port> and has no network
+    // path beyond the app container's own boundary — no bridge, no
+    // host gateway, no internet of its own.
+    network = { joinContainer: options.appNetwork.containerName };
+    targetUrlForTest = `http://localhost:${options.appNetwork.internalPort}`;
+  } else {
+    // Permissive, or strict without an identified app container (e.g. tests
+    // injecting a bespoke restart): previous behavior — default bridge with
+    // the host-gateway alias. Documented fallback, not silent.
+    addHostGateway = true;
+    targetUrlForTest = rewriteTargetUrlForContainer(options.targetUrl);
+
+    if (policy === "strict") {
+      console.warn(
+        "Regression test needs app access but no app container was identified; falling back to host-gateway networking.",
+      );
+    }
+  }
+
   return runContainerCommand(docker, {
     purpose: "regression",
     workspacePath: options.repoPath,
     env: buildTargetEnv({
       extra: {
         CI: "true",
-        ...(options.targetUrl
-          ? { SHERLOCK_TARGET_URL: rewriteTargetUrlForContainer(options.targetUrl) }
-          : {}),
+        ...(targetUrlForTest ? { SHERLOCK_TARGET_URL: targetUrlForTest } : {}),
       },
     }),
     command: ["node", options.relativePath],
     timeoutMs: options.timeoutMs ?? getRegressionTimeoutMs(),
-    addHostGateway: options.targetUrl ? true : false,
+    addHostGateway,
+    network,
   });
 }
 

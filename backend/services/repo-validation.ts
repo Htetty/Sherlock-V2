@@ -8,8 +8,10 @@ import { readFile, access } from "node:fs/promises";
 import path from "node:path";
 import {
   buildTargetEnv,
+  getSandboxNetworkPolicy,
   runContainerCommand,
   type DockerAdapter,
+  type SandboxNetworkPolicy,
 } from "./container.js";
 
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
@@ -177,10 +179,15 @@ export async function runRepositoryValidation(
   options: {
     repoPath: string;
     timeoutMs?: number;
+    networkPolicy?: SandboxNetworkPolicy;
   },
 ): Promise<RepositoryValidation> {
   const startedAt = new Date().toISOString();
   const timeoutMs = options.timeoutMs ?? getValidationTimeoutMs();
+  // Validation commands (test/typecheck/lint/build) run against already
+  // installed dependencies: under the strict policy they get no network at
+  // all, so repository code cannot exfiltrate or call external services.
+  const networkPolicy = options.networkPolicy ?? getSandboxNetworkPolicy();
   const plan = await discoverRepositoryValidation(options.repoPath);
   const results: ValidationCategoryResult[] = [];
 
@@ -207,6 +214,7 @@ export async function runRepositoryValidation(
       env: buildTargetEnv({ extra: { CI: "true" } }),
       command: command.argv,
       timeoutMs,
+      network: networkPolicy === "strict" ? "none" : undefined,
     });
 
     const status: ValidationStatus = run.timedOut

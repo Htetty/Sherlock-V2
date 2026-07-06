@@ -250,6 +250,69 @@ describe("regression container execution", () => {
     expect(removed).toHaveLength(1);
   });
 
+  test("strict policy: app access joins the app container's network namespace; no URL means no network", async () => {
+    const spawnedByCall: string[][] = [];
+    const adapter: DockerAdapter = {
+      isAvailable: async () => true,
+      spawnContainer: (args) => {
+        spawnedByCall.push(args);
+        const proc = new EventEmitter() as any;
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.exitCode = null;
+        proc.kill = () => true;
+        setImmediate(() => proc.emit("close", 0));
+        return proc as ChildProcessWithoutNullStreams;
+      },
+      removeContainer: async () => {},
+    };
+
+    // Strict + identified app container: join its netns, reach the app at
+    // localhost:<internal port>, no host gateway, no own network path.
+    await runRegressionTest(adapter, {
+      repoPath: "/tmp/ws",
+      relativePath: "t.mjs",
+      targetUrl: "http://localhost:51234",
+      appNetwork: { containerName: "sherlock-app-xyz", internalPort: 3000 },
+      networkPolicy: "strict",
+      timeoutMs: 5_000,
+    });
+
+    const joined = spawnedByCall[0];
+    expect(joined).toContain("--network=container:sherlock-app-xyz");
+    expect(joined.join(" ")).toContain("-e SHERLOCK_TARGET_URL=http://localhost:3000");
+    expect(joined.join(" ")).not.toContain("--add-host");
+    expect(joined.join(" ")).not.toContain("host.docker.internal");
+    // Existing restrictions and shell-free argv remain.
+    expect(joined).toContain("--cap-drop=ALL");
+    expect(joined.slice(-2)).toEqual(["node", "t.mjs"]);
+
+    // Strict without any app URL: fully isolated.
+    await runRegressionTest(adapter, {
+      repoPath: "/tmp/ws",
+      relativePath: "t.mjs",
+      networkPolicy: "strict",
+      timeoutMs: 5_000,
+    });
+    expect(spawnedByCall[1]).toContain("--network=none");
+    expect(spawnedByCall[1].join(" ")).not.toContain("SHERLOCK_TARGET_URL");
+
+    // Permissive preserves the previous behavior (bridge + host gateway).
+    await runRegressionTest(adapter, {
+      repoPath: "/tmp/ws",
+      relativePath: "t.mjs",
+      targetUrl: "http://localhost:51234",
+      appNetwork: { containerName: "sherlock-app-xyz", internalPort: 3000 },
+      networkPolicy: "permissive",
+      timeoutMs: 5_000,
+    });
+    expect(spawnedByCall[2].join(" ")).not.toContain("--network");
+    expect(spawnedByCall[2]).toContain("--add-host=host.docker.internal:host-gateway");
+    expect(spawnedByCall[2].join(" ")).toContain(
+      "-e SHERLOCK_TARGET_URL=http://host.docker.internal:51234",
+    );
+  });
+
   test("timeout forces cleanup and reports timed-out state", async () => {
     const removed: string[] = [];
     const adapter: DockerAdapter = {

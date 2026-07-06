@@ -13,8 +13,12 @@ import {
   generateReproductionPlan,
 } from "./claude.js";
 import { runFixAttempt, type FixAttemptResult, type FixOutcome } from "./fix.js";
+import { getSandboxNetworkPolicy } from "./container.js";
 import { formatValidationLine } from "./repo-validation.js";
-import { formatRegressionCommentLines } from "./regression-test.js";
+import {
+  formatRegressionCommentLines,
+  type AppNetworkTarget,
+} from "./regression-test.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -37,6 +41,7 @@ import {
 import { RepositoryError } from "./repo-auth.js";
 import {
   runSandboxInvestigation,
+  type SandboxResult,
   type SandboxSession,
 } from "./sandbox.js";
 import {
@@ -209,7 +214,9 @@ export async function runInvestigationPipeline(
       });
     }
 
-    log(`Sandbox started at ${sandboxSession.result.baseUrl}`);
+    log(
+      `Sandbox started at ${sandboxSession.result.baseUrl} (network policy: ${getSandboxNetworkPolicy()})`,
+    );
 
     // --- Graph context (docs/fable/07): issue-specific repo context -------
     const graphContext = await buildGraphContext({
@@ -450,6 +457,7 @@ export async function runInvestigationPipeline(
           return {
             ok: true,
             baseUrl: sandboxSession.result.baseUrl,
+            appNetwork: appNetworkTarget(sandboxSession.result),
             log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
               .filter(Boolean)
               .join("\n"),
@@ -474,6 +482,7 @@ export async function runInvestigationPipeline(
           proposal: generatedFix.parsed,
           restart,
           repositoryLabel: `${payload.repoOwner}/${payload.repoName}`,
+          appNetwork: appNetworkTarget(sandboxSession.result),
           generateRegressionTest: async (feedback) =>
             generateRegressionTestProposal(
               {
@@ -758,6 +767,19 @@ export function resolveFinalOutcome(
   return reproductionOutcome === "reproduced" && fixOutcome === "verified"
     ? "verified_fix"
     : reproductionOutcome;
+}
+
+// The running app container's identity for strict-network regression
+// execution; null when the sandbox did not report one.
+function appNetworkTarget(result: SandboxResult): AppNetworkTarget | null {
+  if (result.containerName && result.internalPort) {
+    return {
+      containerName: result.containerName,
+      internalPort: result.internalPort,
+    };
+  }
+
+  return null;
 }
 
 // --- Terminal logging helpers ---------------------------------------------

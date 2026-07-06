@@ -8,6 +8,7 @@ import {
   CONTAINER_DEFAULTS,
   buildContainerRunArgs,
   buildTargetEnv,
+  getSandboxNetworkPolicy,
   isProtectedEnvName,
   runContainerCommand,
   sanitizeDockerCommand,
@@ -203,5 +204,67 @@ describe("short-lived command containers", () => {
 
     const containerName = spawned[0][spawned[0].indexOf("--name") + 1];
     expect(removed).toContain(containerName);
+  });
+});
+
+describe("sandbox network policy", () => {
+  test("strict is the default; invalid values fall back to strict with a warning", () => {
+    expect(getSandboxNetworkPolicy({})).toBe("strict");
+    expect(getSandboxNetworkPolicy({ SHERLOCK_SANDBOX_NETWORK_POLICY: "strict" })).toBe(
+      "strict",
+    );
+    expect(
+      getSandboxNetworkPolicy({ SHERLOCK_SANDBOX_NETWORK_POLICY: "permissive" }),
+    ).toBe("permissive");
+
+    const warnings: unknown[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => warnings.push(args.join(" "));
+
+    try {
+      expect(
+        getSandboxNetworkPolicy({ SHERLOCK_SANDBOX_NETWORK_POLICY: "wide-open" }),
+      ).toBe("strict");
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    expect(warnings.join("\n")).toContain("wide-open");
+    expect(warnings.join("\n")).toContain("strict");
+  });
+
+  test("network argument construction: none, app-netns join, and add-host suppression", () => {
+    const base = {
+      containerName: "sherlock-test-x",
+      workspacePath: "/tmp/ws",
+      env: { CI: "true" },
+      command: ["node", "t.mjs"],
+    };
+
+    // No network option: no --network flag (Docker default bridge — install
+    // containers and the app container rely on this).
+    expect(buildContainerRunArgs(base).join(" ")).not.toContain("--network");
+
+    // Isolated command container.
+    const none = buildContainerRunArgs({ ...base, network: "none" });
+    expect(none).toContain("--network=none");
+
+    // Regression container joining the app's network namespace: single
+    // argv token, no shell, and --add-host must be suppressed (it conflicts
+    // with a container-mode netns).
+    const joined = buildContainerRunArgs({
+      ...base,
+      network: { joinContainer: "sherlock-app-abc" },
+      addHostGateway: true,
+    });
+    expect(joined).toContain("--network=container:sherlock-app-abc");
+    expect(joined.join(" ")).not.toContain("--add-host");
+
+    // The restriction set is independent of the network mode.
+    for (const args of [none, joined]) {
+      expect(args).toContain("--cap-drop=ALL");
+      expect(args).toContain("--read-only");
+      expect(args).toContain(`--user=${CONTAINER_DEFAULTS.user}`);
+    }
   });
 });
