@@ -204,4 +204,26 @@ describe("short-lived command containers", () => {
     const containerName = spawned[0][spawned[0].indexOf("--name") + 1];
     expect(removed).toContain(containerName);
   });
+
+  test("bounds stdout and stderr from target containers", async () => {
+    const proc = createFakeProcess();
+    const { adapter } = createAdapter(proc);
+    const large = "x".repeat(300 * 1024);
+
+    const pending = runContainerCommand(adapter, {
+      purpose: "test",
+      workspacePath: "/tmp/ws",
+      env: buildTargetEnv(),
+      command: ["npm", "test"],
+      timeoutMs: 5_000,
+    });
+
+    proc.emitAndClose(large, large, 0);
+    const result = await pending;
+
+    expect(result.stdout.length).toBeLessThan(large.length);
+    expect(result.stderr.length).toBeLessThan(large.length);
+    expect(result.stdout).toContain("[STDOUT TRUNCATED:");
+    expect(result.stderr).toContain("[STDERR TRUNCATED:");
+  });
 });

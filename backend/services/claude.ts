@@ -5,6 +5,7 @@ import {
   extractFixProposalJson,
   requestValidProposal,
 } from "./fix-proposal.js";
+import { truncateWithMarker } from "./bounded-text.js";
 import type { GraphContext } from "./graphContext.js";
 import type { ReproductionResult } from "./playwright.js";
 
@@ -18,6 +19,9 @@ function getClient(): Anthropic {
 }
 
 export const MODEL = "claude-sonnet-4-6";
+const MAX_PROMPT_LOG_CHARS = 8_000;
+const MAX_PROMPT_HTML_CHARS = 8_000;
+const MAX_PROMPT_API_BODY_CHARS = 4_000;
 
 // Low-level model call shared by this module and the fixer agent.
 export function createModelMessage(
@@ -205,7 +209,7 @@ API responses:
 ${formatApiResponses(input.browserResult.apiResponses)}
 
 Page HTML:
-${input.browserResult.html || "(empty)"}
+${truncateWithMarker(input.browserResult.html || "(empty)", MAX_PROMPT_HTML_CHARS, "HTML PROMPT TRUNCATED")}
 
 Provide:
 - Summary
@@ -444,10 +448,10 @@ Base URL:
 ${input.sandboxResult.baseUrl || "(unknown)"}
 
 STDOUT:
-${input.sandboxResult.stdout || "(empty)"}
+${truncateWithMarker(input.sandboxResult.stdout || "(empty)", MAX_PROMPT_LOG_CHARS, "STDOUT PROMPT TRUNCATED")}
 
 STDERR:
-${input.sandboxResult.stderr || "(empty)"}
+${truncateWithMarker(input.sandboxResult.stderr || "(empty)", MAX_PROMPT_LOG_CHARS, "STDERR PROMPT TRUNCATED")}
 `;
 }
 
@@ -484,7 +488,7 @@ function formatApiResponses(responses: ReproductionResult["apiResponses"]) {
 
   return responses
     .map((response) => {
-      return `${response.method} ${response.url} -> ${response.status} ${response.statusText}\n${response.body}`;
+      return `${response.method} ${response.url} -> ${response.status} ${response.statusText}${response.bodyTruncated ? ` (body truncated from ${response.originalBodyLength ?? "unknown"} chars)` : ""}\n${truncateWithMarker(response.body, MAX_PROMPT_API_BODY_CHARS, "API BODY PROMPT TRUNCATED")}`;
     })
     .join("\n\n");
 }

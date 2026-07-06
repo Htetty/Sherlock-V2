@@ -96,3 +96,30 @@ export async function writeExecutionArtifacts(
   });
   await store.writeJson("network-failures.json", result.networkFailures);
 }
+
+export function rebaseExecutionArtifactPaths(
+  result: ReproductionResult,
+  prefix: string,
+): ReproductionResult {
+  const cleanPrefix = normalizeArtifactPath(prefix);
+
+  if (!cleanPrefix) {
+    return result;
+  }
+
+  const rebase = (reference: string | null) =>
+    reference ? normalizeArtifactPath(path.join(cleanPrefix, reference)) : reference;
+
+  return {
+    ...result,
+    screenshots: result.screenshots.map((reference) => rebase(reference)!),
+    steps: result.steps.map((step) => ({
+      ...step,
+      screenshot: rebase(step.screenshot),
+    })),
+  };
+}
+
+function normalizeArtifactPath(reference: string) {
+  return reference.split(path.sep).join("/");
+}

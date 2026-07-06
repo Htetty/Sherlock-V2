@@ -11,6 +11,7 @@
 // REPRODUCER_AGENT_ENABLED=true now means "the reproducer agent is AVAILABLE
 // AS FALLBACK", not "always use the reproducer agent first".
 
+import path from "node:path";
 import {
   analyzeIssue,
   generateMemoryReflection,
@@ -57,6 +58,7 @@ import {
   createArtifactStore,
   createInvestigationId,
   isInvestigationId,
+  rebaseExecutionArtifactPaths,
   writeExecutionArtifacts,
   type ArtifactStore,
 } from "./artifacts.js";
@@ -76,6 +78,8 @@ export type InvestigationStage =
   | "opening_pull_request"
   | "completed"
   | "failed";
+
+const ONE_SHOT_SOURCE_FILE_LIMIT = 3;
 
 export type InvestigationPipelineInput = {
   investigationId?: string;
@@ -230,6 +234,7 @@ export async function runInvestigationPipeline(
     const contextSourceFiles = graphContext.available
       ? graphContext.relevantFiles
       : repoContext.sourceFiles;
+    const oneShotSourceFiles = contextSourceFiles.slice(0, ONE_SHOT_SOURCE_FILE_LIMIT);
 
     // Sandbox restart used by both the reproducer agent (pristine official
     // replays) and the fix loop (post-patch verification).
@@ -407,7 +412,10 @@ export async function runInvestigationPipeline(
           if (replayResult.outcome === "reproduced") {
             log("Memory replay reproduced issue; skipping one-shot and reproducer agent.");
             plan = replayValidation.plan;
-            result = replayResult;
+            result = rebaseExecutionArtifactPaths(
+              replayResult,
+              path.relative(store.dir, replayStore.dir),
+            );
             reproductionPath = "memory_replay";
             await costShape.update({ memoryReplaySucceeded: true });
             await store.writeJson("reproduction-plan.json", plan);
@@ -430,7 +438,7 @@ export async function runInvestigationPipeline(
         fileTree: repoContext.fileTree,
         packageJson: repoContext.packageJson,
         readme: repoContext.readme,
-        sourceFiles: contextSourceFiles,
+        sourceFiles: oneShotSourceFiles,
         sandboxResult: sandboxSession.result,
         graphContext,
         pastInvestigations,

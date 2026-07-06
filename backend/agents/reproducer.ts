@@ -19,7 +19,10 @@ import path from "node:path";
 import { promisify } from "node:util";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createCompactor } from "./compaction.js";
-import { createArtifactStore } from "../services/artifacts.js";
+import {
+  createArtifactStore,
+  rebaseExecutionArtifactPaths,
+} from "../services/artifacts.js";
 import {
   MODEL,
   createModelMessage,
@@ -769,6 +772,10 @@ export async function runReproducerAgent(
           httpResponses: replayResult.httpResponses,
           networkFailures: replayResult.networkFailures,
         });
+        const promotedReplayResult = rebaseExecutionArtifactPaths(
+          replayResult,
+          path.relative(input.investigationDir, replayStore.dir),
+        );
 
         submissions.push({
           index: counters.submissions,
@@ -793,14 +800,24 @@ export async function runReproducerAgent(
         await recordToolCall("submit_plan", submitted, feedback);
 
         if (replayResult.outcome === "reproduced") {
-          return await finish("reproduced", replayResult.outcomeReason, frozen, replayResult);
+          return await finish(
+            "reproduced",
+            replayResult.outcomeReason,
+            frozen,
+            promotedReplayResult,
+          );
         }
 
         if (replayResult.outcome === "environment_failed") {
-          return await finish("environment_failed", replayResult.outcomeReason, frozen, replayResult);
+          return await finish(
+            "environment_failed",
+            replayResult.outcomeReason,
+            frozen,
+            promotedReplayResult,
+          );
         }
 
-        lastReplay = { plan: frozen, result: replayResult };
+        lastReplay = { plan: frozen, result: promotedReplayResult };
 
         if (counters.submissions >= budgets.maxPlanSubmissions) {
           return await finishExhausted(

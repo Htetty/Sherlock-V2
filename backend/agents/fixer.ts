@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 import type Anthropic from "@anthropic-ai/sdk";
 import { createCompactor } from "./compaction.js";
 import { createArtifactStore } from "../services/artifacts.js";
+import { truncateWithMarker } from "../services/bounded-text.js";
 import {
   MODEL,
   createModelMessage,
@@ -960,7 +961,7 @@ ${result.pageErrors.join("\n") || "(none)"}
 Failed network requests:
 ${result.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join("\n") || "(none)"}
 API responses:
-${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}\n${response.body}`).join("\n\n") || "(none)"}
+${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}${response.bodyTruncated ? ` (body truncated from ${response.originalBodyLength ?? "unknown"} chars)` : ""}\n${truncateWithMarker(response.body, 4_000, "API BODY PROMPT TRUNCATED")}`).join("\n\n") || "(none)"}
 ${formatGraphSection(input.graphContext, "refined by reproduction evidence")}
 ${formatRepoEvidence({
   issueTitle: input.issueTitle,

@@ -24,12 +24,14 @@ import {
 } from "./container.js";
 import {
   renderProposedPatch,
+  resolveWorkspaceFilePath,
   validateFixProposalShape,
   validatePatchSafety,
   type FixProposal,
 } from "./fix-proposal.js";
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
+import { createRuntimeWorkspace } from "./runtime-workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -407,8 +409,16 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 }
 
 async function applyProposal(proposal: FixProposal, repoPath: string) {
+  const repoRoot = path.resolve(repoPath);
+
   for (const file of proposal.files) {
-    const absolutePath = path.resolve(repoPath, file.path);
+    const resolved = await resolveWorkspaceFilePath(file.path, repoRoot);
+
+    if (!resolved.ok) {
+      throw new Error(resolved.error);
+    }
+
+    const absolutePath = resolved.absolutePath;
     let contents = await readFile(absolutePath, "utf8");
 
     for (const edit of file.edits) {
@@ -443,31 +453,36 @@ async function runTestCommand(
 ): Promise<TestRunRecord> {
   const stdoutFile = path.join(store.dir, `test-${index + 1}-stdout.log`);
   const stderrFile = path.join(store.dir, `test-${index + 1}-stderr.log`);
+  const runtime = await createRuntimeWorkspace(repoPath);
 
-  const run = await runContainerCommand(docker, {
-    purpose: "test",
-    workspacePath: repoPath,
-    env: buildTargetEnv(),
-    command: command.trim().split(/\s+/),
-    timeoutMs: TEST_COMMAND_TIMEOUT_MS,
-  });
+  try {
+    const run = await runContainerCommand(docker, {
+      purpose: "test",
+      workspacePath: runtime.path,
+      env: buildTargetEnv(),
+      command: command.trim().split(/\s+/),
+      timeoutMs: TEST_COMMAND_TIMEOUT_MS,
+    });
 
-  const stderr = run.timedOut
-    ? `${run.stderr}\nTest command timed out after ${TEST_COMMAND_TIMEOUT_MS}ms and its container was force-removed.`
-    : run.stderr;
+    const stderr = run.timedOut
+      ? `${run.stderr}\nTest command timed out after ${TEST_COMMAND_TIMEOUT_MS}ms and its container was force-removed.`
+      : run.stderr;
 
-  await writeFile(stdoutFile, run.stdout, "utf8");
-  await writeFile(stderrFile, stderr, "utf8");
+    await writeFile(stdoutFile, run.stdout, "utf8");
+    await writeFile(stderrFile, stderr, "utf8");
 
-  return {
-    command,
-    exitCode: run.exitCode,
-    durationMs: run.durationMs,
-    targeted,
-    timedOut: run.timedOut,
-    stdoutFile,
-    stderrFile,
-  };
+    return {
+      command,
+      exitCode: run.exitCode,
+      durationMs: run.durationMs,
+      targeted,
+      timedOut: run.timedOut,
+      stdoutFile,
+      stderrFile,
+    };
+  } finally {
+    await runtime.cleanup();
+  }
 }
 
 // Hash of the plan's behavior (steps + assertion, excluding baseUrl) proving

@@ -8,7 +8,7 @@
 //
 // Filesystem model:
 // - `--read-only` protects the container's root filesystem.
-// - the cloned target workspace is mounted read-write at /app because
+// - a short-lived .git-less runtime copy is mounted read-write at /app because
 //   dependency installation, builds, and patch verification must write there.
 // - /tmp is a tmpfs so npm has a writable HOME/cache.
 // - nothing else is mounted: no Sherlock repo, worker home, Docker socket,
@@ -24,10 +24,12 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
+import { appendBoundedText } from "./bounded-text.js";
 
 const execFileAsync = promisify(execFile);
 
 const DOCKER_CHECK_TIMEOUT_MS = 5_000;
+const MAX_CONTAINER_OUTPUT_CHARS = 256 * 1024;
 
 export const CONTAINER_WORKDIR = "/app";
 
@@ -276,10 +278,20 @@ export async function runContainerCommand(
 
   const child = docker.spawnContainer(args);
   child.stdout.on("data", (chunk) => {
-    stdout += chunk.toString();
+    stdout = appendBoundedText(
+      stdout,
+      chunk.toString(),
+      MAX_CONTAINER_OUTPUT_CHARS,
+      "STDOUT TRUNCATED",
+    );
   });
   child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString();
+    stderr = appendBoundedText(
+      stderr,
+      chunk.toString(),
+      MAX_CONTAINER_OUTPUT_CHARS,
+      "STDERR TRUNCATED",
+    );
   });
 
   const exitCode = await new Promise<number>((resolve) => {

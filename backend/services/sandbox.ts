@@ -8,6 +8,7 @@
 
 import { createServer } from "node:net";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { appendBoundedText } from "./bounded-text.js";
 import { buildLaunchConfig, formatSanitizedCommand } from "./launch.js";
 import {
   buildTargetEnv,
@@ -16,11 +17,16 @@ import {
   startAppContainer,
   type DockerAdapter,
 } from "./container.js";
+import {
+  createRuntimeWorkspace,
+  type RuntimeWorkspace,
+} from "./runtime-workspace.js";
 
 export type { DockerAdapter } from "./container.js";
 
 const SANDBOX_STARTUP_TIMEOUT_MS = 30_000;
 const INSTALL_TIMEOUT_MS = 180_000;
+const MAX_APP_OUTPUT_CHARS = 256 * 1024;
 
 // Probot (3000) and the Sherlock backend (4000) must never be handed out as a
 // target-application sandbox port: a collision makes reproduction silently
@@ -105,91 +111,97 @@ export async function runSandboxInvestigation({
 
   const hostPort = await getAvailablePort();
   const baseUrl = `http://localhost:${hostPort}`;
+  const runtime = await createRuntimeWorkspace(repoPath);
 
-  // Dependency installation runs in its own short-lived restricted
-  // container, never on the host.
-  const install = await runContainerCommand(docker, {
-    purpose: "install",
-    workspacePath: repoPath,
-    env: buildTargetEnv({ port: hostPort }),
-    command: ["npm", "install"],
-    timeoutMs: INSTALL_TIMEOUT_MS,
-  });
+  try {
+    // Dependency installation runs in its own short-lived restricted
+    // container, against the runtime copy, never on the host/trusted clone.
+    const install = await runContainerCommand(docker, {
+      purpose: "install",
+      workspacePath: runtime.path,
+      env: buildTargetEnv({ port: hostPort }),
+      command: ["npm", "install"],
+      timeoutMs: INSTALL_TIMEOUT_MS,
+    });
 
-  if (install.exitCode !== 0) {
+    if (install.exitCode !== 0) {
+      throw new SandboxUnreachableError(
+        [
+          `Dependency installation failed in the target container (exit ${install.exitCode}${install.timedOut ? ", timed out" : ""}).`,
+          `Attempted command: ${install.sanitizedCommand}`,
+          `stdout (tail): ${tail(install.stdout)}`,
+          `stderr (tail): ${tail(install.stderr)}`,
+        ].join("\n"),
+        { stdout: install.stdout, stderr: install.stderr, allocatedPort: hostPort },
+      );
+    }
+
+    // First attempt: the allocated host port doubles as the container-internal
+    // PORT, mapped 1:1.
+    const first = await startApplicationAttempt({
+      repoPath: runtime.path,
+      docker,
+      probe,
+      startupTimeoutMs,
+      hostPort,
+      internalPort: hostPort,
+      strategy: "container-dynamic-port",
+      installOutput: install,
+    });
+
+    if (first.session) {
+      return attachRuntimeCleanup(first.session, runtime);
+    }
+
+    // Hardcoded-port fallback: the app ignored PORT. Look for the fixed
+    // internal port it logged (bounded detection rules); that port is only
+    // ever used as the container-internal side of the mapping — the public
+    // base URL stays on the allocated host port.
+    const internalPort = detectFixedInternalPort(
+      `${first.stdout}\n${first.stderr}`,
+      hostPort,
+    );
+
+    if (internalPort === null) {
+      throw new SandboxUnreachableError(
+        [
+          `Target application did not become reachable at ${baseUrl} and no fixed internal port could be detected from its startup output.`,
+          `Attempted command: ${first.sanitizedCommand}`,
+          `stdout (tail): ${tail(first.stdout)}`,
+          `stderr (tail): ${tail(first.stderr)}`,
+        ].join("\n"),
+        { stdout: first.stdout, stderr: first.stderr, allocatedPort: hostPort },
+      );
+    }
+
+    const second = await startApplicationAttempt({
+      repoPath: runtime.path,
+      docker,
+      probe,
+      startupTimeoutMs,
+      hostPort,
+      internalPort,
+      strategy: "container-fixed-port",
+      installOutput: install,
+    });
+
+    if (second.session) {
+      return attachRuntimeCleanup(second.session, runtime);
+    }
+
     throw new SandboxUnreachableError(
       [
-        `Dependency installation failed in the target container (exit ${install.exitCode}${install.timedOut ? ", timed out" : ""}).`,
-        `Attempted command: ${install.sanitizedCommand}`,
-        `stdout (tail): ${tail(install.stdout)}`,
-        `stderr (tail): ${tail(install.stderr)}`,
+        `Target application (fixed internal port ${internalPort}) did not become reachable at ${baseUrl} through container port mapping ${hostPort}:${internalPort}.`,
+        `Attempted command: ${second.sanitizedCommand}`,
+        `stdout (tail): ${tail(second.stdout)}`,
+        `stderr (tail): ${tail(second.stderr)}`,
       ].join("\n"),
-      { stdout: install.stdout, stderr: install.stderr, allocatedPort: hostPort },
+      { stdout: second.stdout, stderr: second.stderr, allocatedPort: hostPort },
     );
+  } catch (error) {
+    await runtime.cleanup().catch(() => {});
+    throw error;
   }
-
-  // First attempt: the allocated host port doubles as the container-internal
-  // PORT, mapped 1:1.
-  const first = await startApplicationAttempt({
-    repoPath,
-    docker,
-    probe,
-    startupTimeoutMs,
-    hostPort,
-    internalPort: hostPort,
-    strategy: "container-dynamic-port",
-    installOutput: install,
-  });
-
-  if (first.session) {
-    return first.session;
-  }
-
-  // Hardcoded-port fallback: the app ignored PORT. Look for the fixed
-  // internal port it logged (bounded detection rules); that port is only
-  // ever used as the container-internal side of the mapping — the public
-  // base URL stays on the allocated host port.
-  const internalPort = detectFixedInternalPort(
-    `${first.stdout}\n${first.stderr}`,
-    hostPort,
-  );
-
-  if (internalPort === null) {
-    throw new SandboxUnreachableError(
-      [
-        `Target application did not become reachable at ${baseUrl} and no fixed internal port could be detected from its startup output.`,
-        `Attempted command: ${first.sanitizedCommand}`,
-        `stdout (tail): ${tail(first.stdout)}`,
-        `stderr (tail): ${tail(first.stderr)}`,
-      ].join("\n"),
-      { stdout: first.stdout, stderr: first.stderr, allocatedPort: hostPort },
-    );
-  }
-
-  const second = await startApplicationAttempt({
-    repoPath,
-    docker,
-    probe,
-    startupTimeoutMs,
-    hostPort,
-    internalPort,
-    strategy: "container-fixed-port",
-    installOutput: install,
-  });
-
-  if (second.session) {
-    return second.session;
-  }
-
-  throw new SandboxUnreachableError(
-    [
-      `Target application (fixed internal port ${internalPort}) did not become reachable at ${baseUrl} through container port mapping ${hostPort}:${internalPort}.`,
-      `Attempted command: ${second.sanitizedCommand}`,
-      `stdout (tail): ${tail(second.stdout)}`,
-      `stderr (tail): ${tail(second.stderr)}`,
-    ].join("\n"),
-    { stdout: second.stdout, stderr: second.stderr, allocatedPort: hostPort },
-  );
 }
 
 type AttemptResult = {
@@ -294,12 +306,38 @@ function collectProcessOutput(
   output: SandboxResult,
 ) {
   appProcess.stdout.on("data", (chunk) => {
-    output.stdout += chunk.toString();
+    output.stdout = appendBoundedText(
+      output.stdout,
+      chunk.toString(),
+      MAX_APP_OUTPUT_CHARS,
+      "STDOUT TRUNCATED",
+    );
   });
 
   appProcess.stderr.on("data", (chunk) => {
-    output.stderr += chunk.toString();
+    output.stderr = appendBoundedText(
+      output.stderr,
+      chunk.toString(),
+      MAX_APP_OUTPUT_CHARS,
+      "STDERR TRUNCATED",
+    );
   });
+}
+
+function attachRuntimeCleanup(
+  session: SandboxSession,
+  runtime: RuntimeWorkspace,
+): SandboxSession {
+  return {
+    result: session.result,
+    stop: async () => {
+      try {
+        await session.stop();
+      } finally {
+        await runtime.cleanup();
+      }
+    },
+  };
 }
 
 function waitForProcessSpawnError(appProcess: ChildProcessWithoutNullStreams) {

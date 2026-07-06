@@ -10,6 +10,7 @@
 
 import path from "node:path";
 import { chromium, type Locator, type Page } from "playwright";
+import { truncateWithMarker } from "./bounded-text.js";
 import {
   getPlanMode,
   type DomTargetIntent,
@@ -24,6 +25,8 @@ const STEP_SETTLE_MS = 1_000;
 const BASE_URL_PROBE_TIMEOUT_MS = 10_000;
 const MAX_EVENTS = 1_000;
 const MAX_HTTP_RESPONSES = 300;
+const MAX_API_RESPONSE_BODY_CHARS = 64 * 1024;
+const MAX_RESULT_HTML_CHARS = 64 * 1024;
 
 export type StepOutcome = "passed" | "failed" | "skipped";
 
@@ -61,7 +64,11 @@ export type NetworkFailure = {
   failure: string;
 };
 
-export type ApiResponseRecord = HttpResponseRecord & { body: string };
+export type ApiResponseRecord = HttpResponseRecord & {
+  body: string;
+  bodyTruncated?: boolean;
+  originalBodyLength?: number;
+};
 
 export type AssertionResult = {
   assertion: PlanAssertion;
@@ -94,6 +101,8 @@ export type ReproductionResult = {
   assertion: AssertionResult | null;
   events: PlaywrightEvent[];
   html: string;
+  htmlTruncated?: boolean;
+  originalHtmlLength?: number;
 };
 
 // Rolling evidence sink shared by the plan executor and live sessions
@@ -242,12 +251,20 @@ async function performStepAction(
         data: step.body,
       });
 
+      const rawBody = await response.text();
+      const body = truncateWithMarker(
+        rawBody,
+        MAX_API_RESPONSE_BODY_CHARS,
+        "API BODY TRUNCATED",
+      );
       const apiRecord: ApiResponseRecord = {
         method: step.method,
         url,
         status: response.status(),
         statusText: response.statusText(),
-        body: await response.text(),
+        body,
+        bodyTruncated: rawBody.length > MAX_API_RESPONSE_BODY_CHARS,
+        originalBodyLength: rawBody.length,
       };
 
       evidence.apiResponses.push(apiRecord);
@@ -414,7 +431,14 @@ export async function executeReproductionPlan(
     }
 
     await waitForPageToSettle(page);
-    result.html = await page.content().catch(() => "");
+    const rawHtml = await page.content().catch(() => "");
+    result.html = truncateWithMarker(
+      rawHtml,
+      MAX_RESULT_HTML_CHARS,
+      "HTML TRUNCATED",
+    );
+    result.htmlTruncated = rawHtml.length > MAX_RESULT_HTML_CHARS;
+    result.originalHtmlLength = rawHtml.length;
     await screenshot("final").catch(() => null);
 
     if (failedStep) {
@@ -638,9 +662,17 @@ async function evaluateAssertion(
       }
 
       const matchedFailure = lastMatch.body.includes(assertion.failureContains);
-      const matchedExpected = assertion.expectedContains
-        ? lastMatch.body.includes(assertion.expectedContains) && !matchedFailure
-        : !matchedFailure;
+      const maybeTruncated = lastMatch.bodyTruncated === true;
+      const matchedExpected =
+        !matchedFailure &&
+        !maybeTruncated &&
+        (assertion.expectedContains
+          ? lastMatch.body.includes(assertion.expectedContains)
+          : true);
+      const truncationNote =
+        maybeTruncated && !matchedFailure
+          ? " Body was truncated before assertion evaluation, so absence of the failure text is not treated as proof of expected behavior."
+          : "";
 
       return {
         assertion,
@@ -649,7 +681,7 @@ async function evaluateAssertion(
         matchedExpected,
         detail: matchedFailure
           ? `${lastMatch.method} ${lastMatch.url} response body contained "${assertion.failureContains}".`
-          : `${lastMatch.method} ${lastMatch.url} response body did not contain "${assertion.failureContains}".`,
+          : `${lastMatch.method} ${lastMatch.url} response body did not contain "${assertion.failureContains}".${truncationNote}`,
       };
     }
     case "element_text": {
