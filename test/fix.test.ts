@@ -8,7 +8,7 @@ delete process.env.ANTHROPIC_API_KEY;
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, readFile, writeFile, stat } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -651,6 +651,23 @@ describe("verified fix loop", () => {
       );
       expect(traversal.ok).toBe(false);
       expect(traversal.errors.join(" ")).toContain("escapes the repository workspace");
+
+      const outsideDir = await mkdtemp(path.join(tmpdir(), "sherlock-outside-"));
+      await writeFile(path.join(outsideDir, "escape.txt"), "original\n", "utf8");
+      await symlink(outsideDir, path.join(repoPath, "linked-out"));
+      const symlinkEscape = await validatePatchSafety(
+        correctProposal({
+          files: [
+            {
+              path: "linked-out/escape.txt",
+              edits: [{ oldText: "original", newText: "changed" }],
+            },
+          ],
+        }),
+        repoPath,
+      );
+      expect(symlinkEscape.ok).toBe(false);
+      expect(symlinkEscape.errors.join(" ")).toContain("via a symlink");
 
       const tooManyFiles = await validatePatchSafety(
         correctProposal({

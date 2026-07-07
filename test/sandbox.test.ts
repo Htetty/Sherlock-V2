@@ -5,7 +5,7 @@
 // through the injected adapter — no Docker daemon required.
 import { EventEmitter } from "node:events";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
@@ -29,6 +29,8 @@ async function createFixtureRepo() {
     "utf8",
   );
   await writeFile(path.join(repoPath, "server.js"), "// fixture", "utf8");
+  await mkdir(path.join(repoPath, ".git"), { recursive: true });
+  await writeFile(path.join(repoPath, ".git", "config"), "[core]\n", "utf8");
 
   return repoPath;
 }
@@ -85,6 +87,11 @@ function appContainers(spawned: string[][]) {
   );
 }
 
+function mountedWorkspace(args: string[]) {
+  const volume = args[args.indexOf("-v") + 1];
+  return volume.slice(0, volume.lastIndexOf(":"));
+}
+
 describe("container-only sandbox", () => {
   test("Docker unavailable returns an environment failure and never executes anything", async () => {
     const repoPath = await createFixtureRepo();
@@ -131,9 +138,13 @@ describe("container-only sandbox", () => {
     const install = spawned[0];
     expect(install[install.indexOf("--name") + 1]).toMatch(/^sherlock-install-/);
     expect(install.slice(-2)).toEqual(["npm", "install"]);
+    const installWorkspace = mountedWorkspace(install);
+    expect(installWorkspace).not.toBe(repoPath);
+    await expect(access(path.join(installWorkspace, ".git"))).rejects.toThrow();
 
     // The app container maps <allocated>:<allocated> with PORT injected.
     const app = appContainers(spawned)[0];
+    expect(mountedWorkspace(app)).toBe(installWorkspace);
     const hostPort = session.result.hostPort!;
     expect(hostPort).not.toBe(3000);
     expect(hostPort).not.toBe(4000);

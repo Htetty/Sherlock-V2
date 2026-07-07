@@ -15,6 +15,7 @@ import { createArtifactStore, createFixAttemptId } from "./artifacts.js";
 import { realDockerAdapter, type DockerAdapter } from "./container.js";
 import {
   renderProposedPatch,
+  resolveWorkspaceFilePath,
   validateFixProposalShape,
   validatePatchSafety,
   type FixProposal,
@@ -740,8 +741,16 @@ function boundOutput(text: string): string {
 }
 
 async function applyProposal(proposal: FixProposal, repoPath: string) {
+  const repoRoot = path.resolve(repoPath);
+
   for (const file of proposal.files) {
-    const absolutePath = path.resolve(repoPath, file.path);
+    const resolved = await resolveWorkspaceFilePath(file.path, repoRoot);
+
+    if (!resolved.ok) {
+      throw new Error(resolved.error);
+    }
+
+    const absolutePath = resolved.absolutePath;
     let contents = await readFile(absolutePath, "utf8");
 
     for (const edit of file.edits) {

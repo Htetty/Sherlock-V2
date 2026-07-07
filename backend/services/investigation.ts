@@ -1,18 +1,27 @@
 // The investigation pipeline: clone -> memory recall -> sandbox -> graph
-// context -> reproduction plan -> deterministic execution -> verified fix
-// loop (with graph refinement) -> pull request -> memory reflection.
+// context -> memory-plan replay -> one-shot reproduction plan -> reproducer
+// agent fallback -> deterministic execution -> verified fix loop (with graph
+// refinement) -> pull request -> memory reflection.
 // Extracted from the HTTP route so the queue worker can run it directly;
 // both the Express route and the BullMQ worker call this single
 // implementation.
+//
+// Cheap-first ordering (cost): deterministic memory replay first, one-shot
+// generation second, agentic exploration only when necessary. Note that
+// REPRODUCER_AGENT_ENABLED=true now means "the reproducer agent is AVAILABLE
+// AS FALLBACK", not "always use the reproducer agent first".
 
+import path from "node:path";
 import {
   analyzeIssue,
-  generateFixProposal,
   generateMemoryReflection,
   generateRegressionTestProposal,
   generateReproductionPlan,
 } from "./claude.js";
-import { runFixAttempt, type FixAttemptResult, type FixOutcome } from "./fix.js";
+import { runFixerAgent, type FixerAgentStatus } from "../agents/fixer.js";
+import { getBudgetProfileName, runReproducerAgent } from "../agents/reproducer.js";
+import { createCostShapeTracker } from "./cost-shape.js";
+import type { FixAttemptResult, FixOutcome } from "./fix.js";
 import { getSandboxNetworkPolicy } from "./container.js";
 import { formatValidationLine } from "./repo-validation.js";
 import {
@@ -22,6 +31,7 @@ import {
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
+  findStaleFile,
   hashRepoFiles,
   loadMemory,
   matchMemory,
@@ -48,11 +58,16 @@ import {
   executeReproductionPlan,
   type ReproductionResult,
 } from "./playwright.js";
-import { validateReproductionPlan, type ReproductionPlan } from "./plan.js";
+import {
+  getPlanMode,
+  validateReproductionPlan,
+  type ReproductionPlan,
+} from "./plan.js";
 import {
   createArtifactStore,
   createInvestigationId,
   isInvestigationId,
+  rebaseExecutionArtifactPaths,
   writeExecutionArtifacts,
   type ArtifactStore,
 } from "./artifacts.js";
@@ -60,7 +75,6 @@ import {
   formatFixComment,
   formatPullRequestComment,
   formatResultComment,
-  redactSecrets,
   type InvestigationSummary,
 } from "./report.js";
 
@@ -73,6 +87,8 @@ export type InvestigationStage =
   | "opening_pull_request"
   | "completed"
   | "failed";
+
+const ONE_SHOT_SOURCE_FILE_LIMIT = 3;
 
 export type InvestigationPipelineInput = {
   investigationId?: string;
@@ -143,6 +159,12 @@ export async function runInvestigationPipeline(
     await reportStage("reproducing");
 
     store = await createArtifactStore(investigationId);
+
+    // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
+    // incrementally so a crash still leaves a partial record.
+    const costShape = createCostShapeTracker(store, getBudgetProfileName());
+    await costShape.update({});
+
     investigationRecord = {
       investigationId,
       createdAt: new Date().toISOString(),
@@ -242,62 +264,328 @@ export async function runInvestigationPipeline(
     const contextSourceFiles = graphContext.available
       ? graphContext.relevantFiles
       : repoContext.sourceFiles;
+    const oneShotSourceFiles = contextSourceFiles.slice(0, ONE_SHOT_SOURCE_FILE_LIMIT);
 
-    const generated = await generateReproductionPlan({
-      issueTitle: payload.issueTitle,
-      issueBody: payload.issueBody ?? "",
-      repoUrl: payload.repoUrl,
-      defaultBranch: payload.defaultBranch,
-      fileTree: repoContext.fileTree,
-      packageJson: repoContext.packageJson,
-      readme: repoContext.readme,
-      sourceFiles: contextSourceFiles,
-      sandboxResult: sandboxSession.result,
-      graphContext,
-      pastInvestigations,
-    });
-
-    await store.writeJson("reproduction-plan-raw.json", {
-      rawText: generated.rawText,
-      parseError: generated.parseError,
-      attempts: generated.attempts ?? [],
-    });
-
-    for (const [index, attempt] of (generated.attempts ?? []).entries()) {
-      log(
-        `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
-      );
-    }
-
-    if (generated.parseError !== null) {
-      log(`Plan generation failed after all attempts: ${generated.parseError}`);
-      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
-
-      return await finishInvestigation(store, investigationRecord, {
-        investigationId,
-        outcome: "plan_failed",
-        planErrors: [generated.parseError],
-      });
-    }
-
-    const validation = validateReproductionPlan(generated.parsed);
-
-    if (!validation.ok) {
-      log(`Plan rejected by validator:`);
-      for (const validationError of validation.errors) {
-        log(`  - ${validationError}`);
+    // Sandbox restart used by both the reproducer agent (pristine official
+    // replays) and the fix loop (post-patch verification).
+    const repoPath = repoContext.repoPath;
+    const restart = async () => {
+      if (sandboxSession) {
+        await sandboxSession.stop();
+        sandboxSession = null;
       }
-      log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
 
+      try {
+        sandboxSession = await runSandboxInvestigation({ repoPath });
+      } catch (error) {
+        return { ok: false, log: formatError(error) };
+      }
+
+      return {
+        ok: true,
+        baseUrl: sandboxSession.result.baseUrl,
+        // Identity of the restarted app container so strict-network
+        // regression containers can join its network namespace.
+        appNetwork: appNetworkTarget(sandboxSession.result),
+        log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
+          .filter(Boolean)
+          .join("\n"),
+      };
+    };
+
+    // Reproduction ordering (cost, cheap-first):
+    //   1. memory-plan replay (deterministic, no model call)
+    //   2. one-shot generateReproductionPlan()
+    //   3. reproducer agent (docs/fable/11) as FALLBACK when enabled
+    // REPRODUCER_AGENT_ENABLED=true means the agent is available as fallback,
+    // not that it runs first. Only executeReproductionPlan() can mark
+    // reproduced — memory is never trusted without replay.
+    const reproducerAgentEnabled = process.env.REPRODUCER_AGENT_ENABLED === "true";
+    const escalateNotReproduced =
+      process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
+
+    let plan: ReproductionPlan | null = null;
+    let result: ReproductionResult | null = null;
+    // Mode of the accepted plan (agent path only): surfaces in the summary
+    // and result comment so a reader can tell what evidence drove the fixer.
+    let reproductionMode: string | null = null;
+    let reproductionPath:
+      | "memory_replay"
+      | "one_shot"
+      | "reproducer_agent"
+      | null = null;
+
+    // Runs the reproducer agent fallback. Returns a finished pipeline result
+    // on a terminal failure, or null when a plan/result was accepted (stored
+    // into the outer plan/result variables).
+    const runReproducerAgentFallback =
+      async (): Promise<InvestigationPipelineResult | null> => {
+        await costShape.update({ reproducerAgentUsed: true });
+
+        const reproResult = await runReproducerAgent({
+          investigationId,
+          investigationDir: store!.dir,
+          repoPath,
+          sourceCommit: repoContext!.commit,
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext!.fileTree,
+          packageJson: repoContext!.packageJson,
+          readme: repoContext!.readme,
+          sandboxResult: sandboxSession!.result,
+          graphContext,
+          initialSourceFiles: contextSourceFiles,
+          pastInvestigations,
+          restart,
+        });
+
+        await costShape.update({
+          reproducerTurns: reproResult.turns,
+          compactionEvents:
+            costShape.shape.compactionEvents + reproResult.compactionEvents,
+        });
+
+        log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
+        for (const submission of reproResult.submissions) {
+          log(
+            `  submission ${submission.index}: ${submission.valid ? (submission.replayOutcome ?? "valid") : `invalid - ${(submission.validationErrors ?? []).join(" | ")}`}`,
+          );
+        }
+
+        if (reproResult.status === "plan_failed" || reproResult.status === "exhausted") {
+          return await finishInvestigation(store!, investigationRecord, {
+            investigationId,
+            outcome: "plan_failed",
+            planErrors: [reproResult.reason],
+          });
+        }
+
+        if (reproResult.status === "environment_failed") {
+          return await finishInvestigation(store!, investigationRecord, {
+            investigationId,
+            outcome: "environment_failed",
+            stage: "reproduction replay",
+            error: reproResult.reason,
+          });
+        }
+
+        if (reproResult.status === "failed" || !reproResult.plan || !reproResult.result) {
+          return await finishInvestigation(store!, investigationRecord, {
+            investigationId,
+            outcome: "execution_failed",
+            error: reproResult.reason,
+          });
+        }
+
+        plan = reproResult.plan;
+        result = reproResult.result;
+        reproductionMode = getPlanMode(plan);
+        reproductionPath = "reproducer_agent";
+        investigationRecord.reproduction = {
+          explorationMode: reproResult.explorationMode,
+          planMode: reproductionMode,
+        };
+
+        // Exploration can be broader than the frozen proof (e.g. mixed
+        // exploration, api-only plan) - make the split explicit.
+        log(`Exploration mode: ${reproResult.explorationMode}`);
+        log(`Submitted plan mode: ${reproductionMode}`);
+        log(`Fixer evidence mode: ${reproductionMode} official replay result`);
+
+        await store!.writeJson("reproduction-plan.json", plan);
+
+        return null;
+      };
+
+    // --- 1. Memory-plan replay -------------------------------------------
+    // A stored plan from a past verified/reproduced investigation is replayed
+    // from scratch. A stale-but-attempted replay is safe (it just fails and
+    // falls through); the hash check only skips obviously wasteful attempts.
+    const replayCandidate = pastEntries.find((entry) => entry.reproductionPlan);
+
+    if (replayCandidate?.reproductionPlan) {
+      log("Memory replay candidate found.");
+
+      const staleFile = await findStaleFile(replayCandidate, repoContext.repoPath);
+
+      if (staleFile) {
+        log(
+          `Memory replay skipped: ${staleFile} changed since the stored plan; falling through to one-shot reproduction.`,
+        );
+      } else {
+        await costShape.update({ memoryReplayTried: true });
+
+        // Rewrite the stored plan's baseUrl to the current sandbox.
+        const replayValidation = validateReproductionPlan({
+          ...replayCandidate.reproductionPlan,
+          baseUrl: sandboxSession.result.baseUrl,
+        });
+
+        if (!replayValidation.ok) {
+          log(
+            `Memory replay plan failed validation (schema drift?); falling through to one-shot reproduction.`,
+          );
+        } else {
+          const replayStore = await createArtifactStore(
+            investigationId,
+            `${store.dir}/memory-replay`,
+          );
+          const replayResult = await executeReproductionPlan(
+            replayValidation.plan,
+            replayStore,
+          );
+
+          await replayStore.writeJson("reproduction-result.json", {
+            investigationId,
+            ...replayResult,
+          });
+
+          if (replayResult.outcome === "reproduced") {
+            log("Memory replay reproduced issue; skipping one-shot and reproducer agent.");
+            plan = replayValidation.plan;
+            result = rebaseExecutionArtifactPaths(
+              replayResult,
+              path.relative(store.dir, replayStore.dir),
+            );
+            reproductionPath = "memory_replay";
+            await costShape.update({ memoryReplaySucceeded: true });
+            await store.writeJson("reproduction-plan.json", plan);
+          } else {
+            log("Memory replay did not reproduce; falling through to one-shot reproduction.");
+          }
+        }
+      }
+    }
+
+    // --- 2. One-shot reproduction plan ------------------------------------
+    if (!result) {
+      await costShape.update({ oneShotPlanTried: true });
+
+      const generated = await generateReproductionPlan({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        repoUrl: payload.repoUrl,
+        defaultBranch: payload.defaultBranch,
+        fileTree: repoContext.fileTree,
+        packageJson: repoContext.packageJson,
+        readme: repoContext.readme,
+        sourceFiles: oneShotSourceFiles,
+        sandboxResult: sandboxSession.result,
+        graphContext,
+        pastInvestigations,
+      });
+
+      await store.writeJson("reproduction-plan-raw.json", {
+        rawText: generated.rawText,
+        parseError: generated.parseError,
+        attempts: generated.attempts ?? [],
+      });
+
+      for (const [index, attempt] of (generated.attempts ?? []).entries()) {
+        log(
+          `Plan generation attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
+        );
+      }
+
+      // Generation/validation failure falls through to the agent when it is
+      // enabled; it only terminates the run when the agent is unavailable.
+      let planErrors: string[] | null = null;
+      let oneShotPlan: ReproductionPlan | null = null;
+
+      if (generated.parseError !== null) {
+        log(`Plan generation failed after all attempts: ${generated.parseError}`);
+        log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+        planErrors = [generated.parseError];
+      } else {
+        const validation = validateReproductionPlan(generated.parsed);
+
+        if (!validation.ok) {
+          log(`Plan rejected by validator:`);
+          for (const validationError of validation.errors) {
+            log(`  - ${validationError}`);
+          }
+          log(`Raw model response (first 600 chars):\n${generated.rawText.slice(0, 600)}`);
+          planErrors = validation.errors;
+        } else {
+          oneShotPlan = validation.plan;
+        }
+      }
+
+      if (planErrors !== null) {
+        if (reproducerAgentEnabled) {
+          log("One-shot reproduction plan failed; falling back to reproducer agent.");
+          const terminal = await runReproducerAgentFallback();
+
+          if (terminal) {
+            return terminal;
+          }
+        } else {
+          return await finishInvestigation(store, investigationRecord, {
+            investigationId,
+            outcome: "plan_failed",
+            planErrors,
+          });
+        }
+      } else if (oneShotPlan) {
+        await store.writeJson("reproduction-plan.json", oneShotPlan);
+
+        const oneShotResult = await executeReproductionPlan(oneShotPlan, store);
+
+        if (oneShotResult.outcome === "reproduced") {
+          log("One-shot reproduction succeeded; skipping reproducer agent.");
+          plan = oneShotPlan;
+          result = oneShotResult;
+          reproductionPath = "one_shot";
+          await costShape.update({ oneShotPlanSucceeded: true });
+        } else if (
+          oneShotResult.outcome === "execution_failed" &&
+          reproducerAgentEnabled
+        ) {
+          log("One-shot reproduction execution failed; falling back to reproducer agent.");
+          const terminal = await runReproducerAgentFallback();
+
+          if (terminal) {
+            return terminal;
+          }
+        } else if (
+          oneShotResult.outcome === "not_reproduced" &&
+          escalateNotReproduced &&
+          reproducerAgentEnabled
+        ) {
+          log(
+            "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
+          );
+          const terminal = await runReproducerAgentFallback();
+
+          if (terminal) {
+            return terminal;
+          }
+        } else {
+          if (oneShotResult.outcome === "not_reproduced") {
+            log("One-shot reproduction not_reproduced; accepting result.");
+          }
+
+          plan = oneShotPlan;
+          result = oneShotResult;
+          reproductionPath = "one_shot";
+        }
+      }
+    }
+
+    if (!plan || !result) {
+      // Defensive: every path above either accepts a plan/result or returns.
       return await finishInvestigation(store, investigationRecord, {
         investigationId,
-        outcome: "plan_failed",
-        planErrors: validation.errors,
+        outcome: "execution_failed",
+        error: "No reproduction path produced a plan and result.",
       });
     }
 
-    const plan = validation.plan;
-    await store.writeJson("reproduction-plan.json", plan);
+    investigationRecord.reproductionPath = reproductionPath;
+    log(`Accepted reproduction path: ${reproductionPath}`);
+
     log(`Validated plan: ${plan.steps.length} step(s), assertion ${plan.assertion.type}`);
     for (const step of plan.steps) {
       log(`  ${step.id}: ${describePlanStep(step)}`);
@@ -306,7 +594,6 @@ export async function runInvestigationPipeline(
     log(`  failureCondition: ${plan.failureCondition}`);
     log(`  assertion: ${JSON.stringify(plan.assertion)}`);
 
-    const result = await executeReproductionPlan(plan, store);
     await writeExecutionArtifacts(store, result);
 
     log(`Plan executed with outcome: ${result.outcome} (${durationMs(result.startedAt, result.finishedAt)}ms)`);
@@ -331,34 +618,18 @@ export async function runInvestigationPipeline(
       `  evidence: ${result.consoleErrors.length} console error(s), ${result.pageErrors.length} page error(s), ${result.networkFailures.length} network failure(s), ${result.apiResponses.length} api response(s), ${result.screenshots.length} screenshot(s)`,
     );
 
-    let claudeAnalysis: unknown = null;
-
-    if (result.outcome === "reproduced" || result.outcome === "not_reproduced") {
-      claudeAnalysis = await analyzeIssue({
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        repoUrl: payload.repoUrl,
-        defaultBranch: payload.defaultBranch,
-        fileTree: repoContext.fileTree,
-        packageJson: repoContext.packageJson,
-        readme: repoContext.readme,
-        sourceFiles: contextSourceFiles,
-        sandboxResult: sandboxSession.result,
-        browserResult: result,
-      }).catch((error: unknown) => {
-        log(`Claude analysis failed: ${formatError(error)}`);
-        return null;
-      });
-
-      await store.writeJson("claude-analysis.json", claudeAnalysis);
-    }
-
-    // Verified fix loop: only for a confirmed reproduction, one attempt.
+    // Verified fix loop: only for a confirmed reproduction. The bounded
+    // fixer agent may make several verifier-judged attempts internally.
+    // analyzeIssue() moved AFTER the fix decision (cost): a verified fix
+    // attempt already carries root cause, summary, changed files, and
+    // verification checks, so the diagnostic call is skipped entirely.
     let fixAttempt: FixAttemptResult | null = null;
+    let fixerStatus: FixerAgentStatus | null = null;
 
     if (result.outcome === "reproduced") {
       try {
         await reportStage("fixing");
+        await costShape.update({ fixerAgentUsed: true });
 
         // Re-select the graph around reproduction evidence (docs/fable/09):
         // by now we know which elements were touched and what failed.
@@ -386,7 +657,25 @@ export async function runInvestigationPipeline(
           hydratedFiles: refinedContext.relevantFiles.map((file) => file.path),
         });
 
-        const generatedFix = await generateFixProposal({
+        await reportStage("verifying");
+
+        // One regression test per fix attempt (dev): Claude-backed generator
+        // with bounded refinement handled inside runFixAttempt(). The fixer
+        // agent binds each patch proposal into the generator per attempt.
+        const regressionSourceFiles = (
+          refinedContext.available ? refinedContext.relevantFiles : contextSourceFiles
+        ).map((file) => ({ path: file.path, contents: file.contents }));
+        const acceptedPlan = plan;
+        const acceptedResult = result;
+
+        // Bounded fixer agent (docs/fable/10): explores the repo, proposes
+        // patches, and revises using deterministic verification evidence.
+        // Only runFixAttempt() inside the agent can mark an attempt verified.
+        const agentResult = await runFixerAgent({
+          investigationId,
+          investigationDir: store.dir,
+          repoPath,
+          sourceCommit: repoContext.commit,
           issueTitle: payload.issueTitle,
           issueBody: payload.issueBody ?? "",
           repoUrl: payload.repoUrl,
@@ -394,147 +683,120 @@ export async function runInvestigationPipeline(
           fileTree: repoContext.fileTree,
           packageJson: repoContext.packageJson,
           readme: repoContext.readme,
-          sourceFiles: refinedContext.available
-            ? refinedContext.relevantFiles
-            : contextSourceFiles,
           sandboxResult: sandboxSession.result,
-          commit: repoContext.commit,
           plan,
           reproductionResult: result,
           graphContext: refinedContext,
-        });
-
-        // Sanitized raw model responses (every attempt) kept for debugging
-        // rejected proposals.
-        await store.writeJson("fix-proposal-raw.json", {
-          rawText: redactSecrets(generatedFix.rawText),
-          parseError: generatedFix.parseError,
-          attempts: (generatedFix.attempts ?? []).map((attempt) => ({
-            rawText: redactSecrets(attempt.rawText),
-            error: attempt.error,
-          })),
-        });
-
-        for (const [index, attempt] of (generatedFix.attempts ?? []).entries()) {
-          log(
-            `Fix proposal attempt ${index + 1}: ${attempt.error ? `rejected - ${attempt.error}` : "ok"}`,
-          );
-        }
-
-        if (generatedFix.parseError !== null) {
-          log(`Fix proposal failed after all attempts: ${generatedFix.parseError}`);
-          log(
-            `Raw model response (first 600 chars):\n${redactSecrets(generatedFix.rawText.slice(0, 600))}`,
-          );
-        } else {
-          const proposal = generatedFix.parsed as Record<string, unknown>;
-          log(`Fix proposal parsed:`);
-          log(`  summary: ${String(proposal.summary ?? "(none)")}`);
-          log(`  rootCause: ${String(proposal.rootCause ?? "(none)")}`);
-          log(
-            `  confidence: ${String(proposal.confidence ?? "?")} | risk: ${String(proposal.risk ?? "?")}`,
-          );
-          if (Array.isArray(proposal.files)) {
-            for (const file of proposal.files as { path?: string; edits?: unknown[] }[]) {
-              log(`  file: ${file.path ?? "?"} (${file.edits?.length ?? 0} edit(s))`);
-            }
-          }
-        }
-
-        const repoPath = repoContext.repoPath;
-        const restart = async () => {
-          if (sandboxSession) {
-            await sandboxSession.stop();
-            sandboxSession = null;
-          }
-
-          try {
-            sandboxSession = await runSandboxInvestigation({ repoPath });
-          } catch (error) {
-            return { ok: false, log: formatError(error) };
-          }
-
-          return {
-            ok: true,
-            baseUrl: sandboxSession.result.baseUrl,
-            appNetwork: appNetworkTarget(sandboxSession.result),
-            log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
-              .filter(Boolean)
-              .join("\n"),
-          };
-        };
-
-        await reportStage("verifying");
-
-        // One regression test per fix attempt: Claude-backed generator with
-        // bounded refinement handled inside the fix loop.
-        const regressionSourceFiles = (
-          refinedContext.available ? refinedContext.relevantFiles : contextSourceFiles
-        ).map((file) => ({ path: file.path, contents: file.contents }));
-
-        fixAttempt = await runFixAttempt({
-          investigationId,
-          investigationDir: store.dir,
-          repoPath,
-          sourceCommit: repoContext.commit,
-          plan,
-          originalOutcome: result.outcome,
-          proposal: generatedFix.parsed,
+          initialSourceFiles: refinedContext.available
+            ? refinedContext.relevantFiles
+            : contextSourceFiles,
           restart,
           repositoryLabel: `${payload.repoOwner}/${payload.repoName}`,
           appNetwork: appNetworkTarget(sandboxSession.result),
-          generateRegressionTest: async (feedback) =>
+          buildRegressionTestGenerator: (proposal) => (feedback) =>
             generateRegressionTestProposal(
               {
                 issueTitle: payload.issueTitle,
                 issueBody: payload.issueBody ?? "",
-                plan,
-                reproductionResult: result,
-                fixProposal: generatedFix.parsed,
+                plan: acceptedPlan,
+                reproductionResult: acceptedResult,
+                fixProposal: proposal,
                 sourceFiles: regressionSourceFiles,
               },
               feedback,
             ),
         });
 
-        log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
-        for (const item of fixAttempt.checks) {
-          log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
+        fixAttempt = agentResult.fixAttempt;
+        fixerStatus = agentResult.status;
+        await costShape.update({
+          fixerTurns: agentResult.turns,
+          fixerPatchAttempts: agentResult.attempts.length,
+          compactionEvents:
+            costShape.shape.compactionEvents + agentResult.compactionEvents,
+        });
+        log(`Fixer agent finished: ${agentResult.status} — ${agentResult.reason}`);
+        for (const attempt of agentResult.attempts) {
+          log(
+            `  attempt ${attempt.index} (${attempt.fixAttemptId ?? "?"}): ${attempt.outcome ?? "?"}${attempt.reason ? ` - ${firstLine(attempt.reason)}` : ""}`,
+          );
         }
-        if (fixAttempt.reason) {
-          log(`  reason: ${fixAttempt.reason}`);
-        }
-        if (fixAttempt.changedFiles.length > 0) {
-          log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
-        }
-        if (fixAttempt.postPatchOutcome) {
-          log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
-        }
-        if (fixAttempt.regressionTest) {
-          const regression = fixAttempt.regressionTest;
 
-          if (regression.testName) {
-            log(`Regression test generated: ${regression.testName}`);
+        if (fixAttempt) {
+          log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
+          for (const item of fixAttempt.checks) {
+            log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
           }
-          if (regression.prePatch) {
-            log(`Pre-patch regression result: ${regression.prePatch}`);
+          if (fixAttempt.reason) {
+            log(`  reason: ${fixAttempt.reason}`);
           }
-          if (regression.postPatch) {
-            log(`Post-patch regression result: ${regression.postPatch}`);
+          if (fixAttempt.changedFiles.length > 0) {
+            log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
           }
-          if (regression.hashMatched !== null) {
-            log(`Regression test hash matched: ${regression.hashMatched}`);
+          if (fixAttempt.postPatchOutcome) {
+            log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
           }
-          if (regression.status === "unavailable") {
-            log(`Regression test unavailable: ${regression.reason ?? "(no reason recorded)"}`);
+          if (fixAttempt.regressionTest) {
+            const regression = fixAttempt.regressionTest;
+
+            if (regression.testName) {
+              log(`Regression test generated: ${regression.testName}`);
+            }
+            if (regression.prePatch) {
+              log(`Pre-patch regression result: ${regression.prePatch}`);
+            }
+            if (regression.postPatch) {
+              log(`Post-patch regression result: ${regression.postPatch}`);
+            }
+            if (regression.hashMatched !== null) {
+              log(`Regression test hash matched: ${regression.hashMatched}`);
+            }
+            if (regression.status === "unavailable") {
+              log(`Regression test unavailable: ${regression.reason ?? "(no reason recorded)"}`);
+            }
           }
-        }
-        for (const run of fixAttempt.testRuns) {
-          log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+          for (const run of fixAttempt.testRuns) {
+            log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
+          }
         }
       } catch (error) {
         log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
       }
+    }
+
+    // Diagnostic analysis (reporting only; the fixer never consumes it).
+    // Called ONLY when the investigation ends without a verified fix:
+    // reproduced-but-unfixed, or not_reproduced needing an explanatory
+    // report. A verified fix already carries root cause + verification
+    // detail, so the call is skipped entirely (claudeAnalysis stays null).
+    let claudeAnalysis: unknown = null;
+    const fixVerified = fixAttempt?.outcome === "verified";
+
+    if (
+      !fixVerified &&
+      (result.outcome === "reproduced" || result.outcome === "not_reproduced")
+    ) {
+      await costShape.update({ analyzeIssueCalled: true });
+
+      claudeAnalysis = await analyzeIssue({
+        issueTitle: payload.issueTitle,
+        issueBody: payload.issueBody ?? "",
+        repoUrl: payload.repoUrl,
+        defaultBranch: payload.defaultBranch,
+        fileTree: repoContext.fileTree,
+        packageJson: repoContext.packageJson,
+        readme: repoContext.readme,
+        sourceFiles: contextSourceFiles,
+        sandboxResult: sandboxSession.result,
+        browserResult: result,
+      }).catch((error: unknown) => {
+        log(`Claude analysis failed: ${formatError(error)}`);
+        return null;
+      });
+
+      await store.writeJson("claude-analysis.json", claudeAnalysis);
+    } else if (fixVerified) {
+      log("Fix verified; skipping analyzeIssue (fix attempt carries root cause and verification detail).");
     }
 
     // Verified fix -> GitHub pull request. Only verified fixes may push.
@@ -585,66 +847,109 @@ export async function runInvestigationPipeline(
     }
 
     // --- Memory recording (docs/fable/08): always learn from the run ------
+    // Cost: the reflection input is compact structured fields (plan summary,
+    // bounded evidence), never full plan JSON / logs / analysis text. On a
+    // verified fix all fields derive directly from the fix attempt and the
+    // Claude reflection call is skipped entirely.
     try {
-      const outcome = mapMemoryOutcome(result, fixAttempt);
+      const outcome = mapMemoryOutcome(result, fixAttempt, fixerStatus);
       const patchedFiles = fixAttempt?.changedFiles ?? [];
-      const reflection = await generateMemoryReflection({
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        outcome,
-        intentPlanJson: JSON.stringify(plan),
-        browserErrors: [
-          result.outcomeReason,
-          ...(result.assertion ? [result.assertion.detail] : []),
-          ...result.consoleErrors,
-          ...result.pageErrors,
-        ],
-        analysisText: extractAnalysisText(claudeAnalysis),
-        patchedFiles,
-      });
+      const planSummary = `${plan.steps.length} step(s), assertion ${plan.assertion.type} — intent: ${firstLine(plan.failureCondition)}`;
+      const failedChecks =
+        fixAttempt && fixAttempt.outcome !== "verified"
+          ? fixAttempt.checks
+              .filter((item) => !item.passed)
+              .map((item) => `${item.name}: ${item.detail}`)
+          : [];
+
+      let memoryFields: {
+        issueTerms: string[];
+        rootCause: string;
+        whatWorked: string;
+        whatFailed: string;
+      };
+
+      if (fixVerified && fixAttempt) {
+        // Derive directly from the verified fix attempt; no model call.
+        memoryFields = {
+          issueTerms: issueTerms.slice(0, 8),
+          rootCause: fixAttempt.rootCause ?? "",
+          whatWorked:
+            fixAttempt.summary ??
+            `Verified fix touching ${patchedFiles.join(", ") || "(no files recorded)"}`,
+          whatFailed: "",
+        };
+      } else {
+        await costShape.update({ memoryReflectionCalled: true });
+
+        const reflection = await generateMemoryReflection({
+          issueTitle: payload.issueTitle,
+          outcome,
+          planSummary,
+          assertionDetail: result.assertion?.detail ?? "",
+          browserErrors: [
+            result.outcomeReason,
+            ...(result.assertion ? [result.assertion.detail] : []),
+          ],
+          fixRootCause: fixAttempt?.rootCause ?? "",
+          fixSummary: fixAttempt?.summary ?? "",
+          changedFiles: patchedFiles,
+          failedChecks,
+        });
+        memoryFields = {
+          issueTerms: reflection.issueTerms,
+          rootCause: fixAttempt?.rootCause ?? reflection.rootCause,
+          whatWorked: reflection.whatWorked,
+          whatFailed: reflection.whatFailed,
+        };
+      }
 
       // Truthful memory for rejected regression proofs: when the exact
       // replay DID pass after the patch, the record must say so — the
       // failure was the generated-test proof, not the reproduction.
-      let memoryWhatWorked = reflection.whatWorked;
-      let memoryWhatFailed = reflection.whatFailed;
-
       if (
         fixAttempt?.outcome === "rejected_regression_test_failed" &&
         fixAttempt.postPatchOutcome === "not_reproduced"
       ) {
-        memoryWhatWorked = [
+        memoryFields.whatWorked = [
           "The exact reproduction replay passed after the patch.",
-          memoryWhatWorked,
+          memoryFields.whatWorked,
         ]
           .filter(Boolean)
           .join(" ");
-        memoryWhatFailed = `The generated regression test did not prove the fix (${
+        memoryFields.whatFailed = `The generated regression test did not prove the fix (${
           fixAttempt.regressionTest?.reason ?? "regression proof failed"
         }), so the patch was rejected despite the passing replay.`;
       }
 
       await appendMemory(payload.repoUrl, {
         issueTitle: payload.issueTitle,
-        issueTerms: reflection.issueTerms,
+        issueTerms: memoryFields.issueTerms,
         commitSha: repoContext.commit,
         outcome,
-        rootCause: fixAttempt?.rootCause ?? reflection.rootCause,
+        rootCause: memoryFields.rootCause,
         patchedFiles,
         fileHashes: await hashRepoFiles(repoContext.repoPath, patchedFiles),
-        whatWorked: memoryWhatWorked,
-        whatFailed: memoryWhatFailed,
+        whatWorked: memoryFields.whatWorked,
+        whatFailed: memoryFields.whatFailed,
         createdAt: new Date().toISOString(),
+        // Memory-plan replay: store the deterministically proven plan so
+        // repeat issues can replay it instead of regenerating. Only plans
+        // that actually reproduced are stored; replay (never trust) decides.
+        ...(result.outcome === "reproduced" ? { reproductionPlan: plan } : {}),
       });
 
       log(`Memory entry recorded (outcome: ${outcome}).`);
-      log(`  terms: ${reflection.issueTerms.join(", ")}`);
-      log(`  rootCause: ${fixAttempt?.rootCause ?? reflection.rootCause}`);
-      if (reflection.whatWorked) {
-        log(`  whatWorked: ${reflection.whatWorked}`);
+      log(`  terms: ${memoryFields.issueTerms.join(", ")}`);
+      log(`  rootCause: ${memoryFields.rootCause}`);
+      if (result.outcome === "reproduced") {
+        log("  reproductionPlan: stored for future memory replay");
       }
-      if (reflection.whatFailed) {
-        log(`  whatFailed: ${reflection.whatFailed}`);
+      if (memoryFields.whatWorked) {
+        log(`  whatWorked: ${memoryFields.whatWorked}`);
+      }
+      if (memoryFields.whatFailed) {
+        log(`  whatFailed: ${memoryFields.whatFailed}`);
       }
     } catch (error) {
       log(`Could not record memory entry: ${formatError(error)}`);
@@ -708,7 +1013,10 @@ export async function runInvestigationPipeline(
     return await finishInvestigation(
       store,
       investigationRecord,
-      summary,
+      {
+        ...summary,
+        ...(reproductionMode ? { reproductionMode } : {}),
+      },
       {
         result,
         claudeAnalysis,
@@ -813,14 +1121,24 @@ function durationMs(startedAt: string, finishedAt: string): number {
 }
 
 // Memory outcome mapping (docs/fable/10):
-// verified fix -> verified; failed/rejected fix attempt -> failed;
-// reproduced but no usable fix attempt -> blocked; otherwise analysis only.
+// agent status verified -> verified, blocked -> blocked, exhausted/failed ->
+// failed. Without an agent run: reproduced but no usable fix attempt ->
+// blocked; otherwise analysis only.
 function mapMemoryOutcome(
   result: ReproductionResult,
   fixAttempt: FixAttemptResult | null,
+  fixerStatus: FixerAgentStatus | null,
 ): MemoryOutcome {
-  if (fixAttempt?.outcome === "verified") {
+  if (fixerStatus === "verified" || fixAttempt?.outcome === "verified") {
     return "verified";
+  }
+
+  if (fixerStatus === "blocked") {
+    return "blocked";
+  }
+
+  if (fixerStatus === "exhausted" || fixerStatus === "failed") {
+    return "failed";
   }
 
   if (fixAttempt) {
@@ -836,21 +1154,6 @@ function mapMemoryOutcome(
   }
 
   return "analysis_complete";
-}
-
-function extractAnalysisText(claudeAnalysis: unknown): string {
-  if (
-    claudeAnalysis &&
-    typeof claudeAnalysis === "object" &&
-    "type" in claudeAnalysis &&
-    claudeAnalysis.type === "text" &&
-    "text" in claudeAnalysis &&
-    typeof claudeAnalysis.text === "string"
-  ) {
-    return claudeAnalysis.text;
-  }
-
-  return "";
 }
 
 // Refine terms for the fixer's graph re-selection (docs/fable/09): step

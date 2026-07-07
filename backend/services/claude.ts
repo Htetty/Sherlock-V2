@@ -1,12 +1,11 @@
 import "dotenv/config";
 import Anthropic from "@anthropic-ai/sdk";
-import { REPRODUCTION_PLAN_VERSION, type ReproductionPlan } from "./plan.js";
+import { REPRODUCTION_PLAN_VERSION } from "./plan.js";
 import {
-  FIX_PROPOSAL_VERSION,
-  PATCH_LIMITS,
   extractFixProposalJson,
   requestValidProposal,
 } from "./fix-proposal.js";
+import { truncateWithMarker } from "./bounded-text.js";
 import type { GraphContext } from "./graphContext.js";
 import type { ReproductionResult } from "./playwright.js";
 import {
@@ -14,9 +13,26 @@ import {
   type RegressionGenerationInput,
 } from "./regression-test.js";
 
-const client = new Anthropic();
+// Lazy so importing this module (e.g. from the fixer agent or tests with
+// injected model calls) never requires ANTHROPIC_API_KEY.
+let client: Anthropic | null = null;
 
-const MODEL = "claude-sonnet-4-6";
+function getClient(): Anthropic {
+  client ??= new Anthropic();
+  return client;
+}
+
+export const MODEL = "claude-sonnet-4-6";
+const MAX_PROMPT_LOG_CHARS = 8_000;
+const MAX_PROMPT_HTML_CHARS = 8_000;
+const MAX_PROMPT_API_BODY_CHARS = 4_000;
+
+// Low-level model call shared by this module and the fixer agent.
+export function createModelMessage(
+  params: Anthropic.Messages.MessageCreateParamsNonStreaming,
+): Promise<Anthropic.Messages.Message> {
+  return getClient().messages.create(params);
+}
 
 export type AnalyzeIssueInput = {
   issueTitle: string;
@@ -141,7 +157,7 @@ Your previous response was rejected because it was not a valid reproduction plan
 
 Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, reasoning, or any text before or after the JSON object.`;
 
-    const message = await client.messages.create({
+    const message = await createModelMessage({
       model: MODEL,
       max_tokens: 2_500,
       temperature: 0,
@@ -166,107 +182,9 @@ Respond again with ONLY the JSON object matching the exact shape shown above. Do
   };
 }
 
-export type FixProposalInput = RepoEvidenceInput & {
-  commit: string;
-  plan: ReproductionPlan;
-  reproductionResult: ReproductionResult;
-  graphContext?: GraphContext | null;
-};
-
-export async function generateFixProposal(
-  input: FixProposalInput,
-): Promise<GeneratedPlan> {
-  const prompt = `
-You are proposing a minimal code fix for a bug that Sherlock has deterministically reproduced.
-
-Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
-
-The JSON must match this exact shape:
-{
-  "version": ${FIX_PROPOSAL_VERSION},
-  "summary": "one sentence describing the fix",
-  "rootCause": "one sentence describing the exact root cause",
-  "confidence": 0.0,
-  "files": [
-    {
-      "path": "relative/path/from/repo/root.ts",
-      "edits": [
-        { "oldText": "exact text currently in the file", "newText": "replacement text" }
-      ]
-    }
-  ],
-  "relevantTests": ["npm test"],
-  "risk": "low",
-  "assumptions": []
-}
-
-Rules:
-- Each oldText must appear EXACTLY ONCE in the target file, copied verbatim including whitespace.
-- Make the smallest change that fixes the root cause. Do not refactor.
-- Change at most ${PATCH_LIMITS.maxChangedFiles} files and ${PATCH_LIMITS.maxChangedLines} lines.
-- Never touch .env files, keys, lockfiles, GitHub workflows, or deployment configuration.
-- relevantTests must be plain npm/npx/node commands (no shell operators). Use the smallest relevant project test command; use an empty array if the repository has no runnable tests.
-- Do not create new files.
-- Do not change UI text, roles, labels, or testids that the reproduction plan targets - verification replays the same plan after the patch, and changing those strings breaks it.
-- Fix the root cause, not the symptom. Walk the graph context (when present) from the touched element to its handler to its route; the bug is on that path.
-- If graph context is present, ground your rootCause in it: cite the file and function the graph points to.
-
-Repository commit: ${input.commit}
-
-Saved reproduction plan (already verified to reproduce the bug):
-${JSON.stringify(input.plan, null, 2)}
-
-Reproduction outcome: ${input.reproductionResult.outcome} — ${input.reproductionResult.outcomeReason}
-Failed assertion: ${JSON.stringify(input.reproductionResult.assertion)}
-Console errors:
-${input.reproductionResult.consoleErrors.join("\n") || "(none)"}
-Page errors:
-${input.reproductionResult.pageErrors.join("\n") || "(none)"}
-Failed network requests:
-${input.reproductionResult.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join("\n") || "(none)"}
-API responses:
-${input.reproductionResult.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}\n${response.body}`).join("\n\n") || "(none)"}
-${formatGraphSection(input.graphContext, "refined by reproduction evidence")}
-${formatRepoEvidence(input)}
-`;
-
-  // One retry on format failure: the extraction error is fed back together
-  // with the schema (already part of the base prompt) and a bare-JSON
-  // instruction.
-  const result = await requestValidProposal(async (retryError) => {
-    const finalPrompt =
-      retryError === null
-        ? prompt
-        : `${prompt}
-
-Your previous response was rejected because it was not a valid fix proposal: ${retryError}
-
-Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, explanations, or any text before or after the JSON object.`;
-
-    const message = await client.messages.create({
-      model: MODEL,
-      max_tokens: 2_000,
-      temperature: 0,
-      messages: [
-        {
-          role: "user",
-          content: finalPrompt,
-        },
-      ],
-    });
-
-    return getTextContent(message.content);
-  });
-
-  const lastAttempt = result.attempts[result.attempts.length - 1];
-
-  return {
-    rawText: lastAttempt?.rawText ?? "",
-    parsed: result.proposal,
-    parseError: result.parseError,
-    attempts: result.attempts,
-  };
-}
+// The one-shot generateFixProposal() flow was replaced by the bounded fixer
+// agent in backend/agents/fixer.ts (docs/fable/10). Fix proposals are now
+// authored through native tool use; only runFixAttempt() verifies them.
 
 export type RegressionTestInput = RegressionGenerationInput;
 
@@ -278,8 +196,8 @@ export async function generateRegressionTestProposal(
   input: RegressionTestInput,
   feedback: string | null,
 ): Promise<unknown> {
-  const message = await client.messages.create({
-    model: "claude-sonnet-4-6",
+  const message = await createModelMessage({
+    model: MODEL,
     max_tokens: 3_000,
     messages: [{ role: "user", content: buildRegressionTestPrompt(input, feedback) }],
   });
@@ -316,7 +234,7 @@ API responses:
 ${formatApiResponses(input.browserResult.apiResponses)}
 
 Page HTML:
-${input.browserResult.html || "(empty)"}
+${truncateWithMarker(input.browserResult.html || "(empty)", MAX_PROMPT_HTML_CHARS, "HTML PROMPT TRUNCATED")}
 
 Provide:
 - Summary
@@ -327,7 +245,7 @@ Provide:
 - Evidence from source code and sandbox logs that supports the root cause
 `;
 
-  const message = await client.messages.create({
+  const message = await createModelMessage({
     model: MODEL,
     max_tokens: 500,
     messages: [
@@ -351,15 +269,45 @@ export type MemoryReflection = {
   whatFailed: string;
 };
 
-export async function generateMemoryReflection(input: {
+// Deliberately compact input (cost): a plan SUMMARY instead of the full plan
+// JSON, bounded error evidence instead of full logs/arrays, and short
+// structured fields. The reflection prompt stays small and bounded.
+export type MemoryReflectionInput = {
   issueTitle: string;
-  issueBody: string;
   outcome: string;
-  intentPlanJson: string;
+  // Compact official-plan summary: step count, assertion type, one-line intent.
+  planSummary: string;
+  // Assertion detail from the accepted reproduction result, if any.
+  assertionDetail: string;
+  // Bounded error evidence (first lines of outcomeReason / failed checks).
   browserErrors: string[];
-  analysisText: string;
-  patchedFiles: string[];
-}): Promise<MemoryReflection> {
+  // Fix detail when available (derived from the fix attempt).
+  fixRootCause: string;
+  fixSummary: string;
+  changedFiles: string[];
+  // Failed verification checks when no fix was verified.
+  failedChecks: string[];
+};
+
+const REFLECTION_MAX_EVIDENCE_LINES = 8;
+const REFLECTION_MAX_LINE_CHARS = 300;
+
+function boundLines(lines: string[], maxLines = REFLECTION_MAX_EVIDENCE_LINES): string {
+  return lines
+    .filter(Boolean)
+    .slice(0, maxLines)
+    .map((line) => {
+      const first = line.split("\n")[0] ?? "";
+      return first.length > REFLECTION_MAX_LINE_CHARS
+        ? `${first.slice(0, REFLECTION_MAX_LINE_CHARS)}...`
+        : first;
+    })
+    .join("\n");
+}
+
+export async function generateMemoryReflection(
+  input: MemoryReflectionInput,
+): Promise<MemoryReflection> {
   const prompt = `You are recording the outcome of an automated bug investigation so future
 investigations of this repository start smarter.
 
@@ -368,14 +316,16 @@ Return ONLY valid JSON matching the schema at the end.
 ## What happened
 
 Issue title: ${input.issueTitle}
-Issue body: ${input.issueBody || "(empty)"}
 Outcome: ${input.outcome}
-Reproduction plan executed: ${input.intentPlanJson}
-Browser errors/evidence:
-${input.browserErrors.join("\n") || "(none)"}
-Root cause analysis:
-${input.analysisText || "(none)"}
-Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
+Official reproduction plan: ${input.planSummary || "(none)"}
+Assertion detail: ${input.assertionDetail || "(none)"}
+Error evidence (bounded):
+${boundLines(input.browserErrors) || "(none)"}
+Fix root cause: ${input.fixRootCause || "(none)"}
+Fix summary: ${input.fixSummary || "(none)"}
+Failed verification checks (if no verified fix):
+${boundLines(input.failedChecks) || "(none)"}
+Patched files (if any): ${input.changedFiles.join(", ") || "(none)"}
 
 ## Rules
 
@@ -397,7 +347,7 @@ Patched files (if any): ${input.patchedFiles.join(", ") || "(none)"}
   "whatFailed": "actionable lesson, or empty string"
 }`;
 
-  const message = await client.messages.create({
+  const message = await createModelMessage({
     model: MODEL,
     max_tokens: 400,
     temperature: 0,
@@ -440,7 +390,7 @@ function isMemoryReflection(value: unknown): value is MemoryReflection {
 
 // --- Prompt sections -------------------------------------------------------
 
-function formatGraphSection(
+export function formatGraphSection(
   graphContext: GraphContext | null | undefined,
   label = "",
 ): string {
@@ -467,7 +417,7 @@ ${graphContext.graphEdges || "(none)"}
 `;
 }
 
-function formatPastSection(pastInvestigations: string | undefined): string {
+export function formatPastSection(pastInvestigations: string | undefined): string {
   if (!pastInvestigations) {
     return "";
   }
@@ -491,7 +441,7 @@ How to use these:
 `;
 }
 
-function formatRepoEvidence(input: RepoEvidenceInput) {
+export function formatRepoEvidence(input: RepoEvidenceInput) {
   return `
 Repository URL:
 ${input.repoUrl}
@@ -523,10 +473,10 @@ Base URL:
 ${input.sandboxResult.baseUrl || "(unknown)"}
 
 STDOUT:
-${input.sandboxResult.stdout || "(empty)"}
+${truncateWithMarker(input.sandboxResult.stdout || "(empty)", MAX_PROMPT_LOG_CHARS, "STDOUT PROMPT TRUNCATED")}
 
 STDERR:
-${input.sandboxResult.stderr || "(empty)"}
+${truncateWithMarker(input.sandboxResult.stderr || "(empty)", MAX_PROMPT_LOG_CHARS, "STDERR PROMPT TRUNCATED")}
 `;
 }
 
@@ -563,7 +513,7 @@ function formatApiResponses(responses: ReproductionResult["apiResponses"]) {
 
   return responses
     .map((response) => {
-      return `${response.method} ${response.url} -> ${response.status} ${response.statusText}\n${response.body}`;
+      return `${response.method} ${response.url} -> ${response.status} ${response.statusText}${response.bodyTruncated ? ` (body truncated from ${response.originalBodyLength ?? "unknown"} chars)` : ""}\n${truncateWithMarker(response.body, MAX_PROMPT_API_BODY_CHARS, "API BODY PROMPT TRUNCATED")}`;
     })
     .join("\n\n");
 }

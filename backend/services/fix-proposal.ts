@@ -2,7 +2,7 @@
 // This module must stay free of Claude/Anthropic imports so fix attempts can
 // be validated and applied without any Claude dependency.
 
-import { readFile, lstat } from "node:fs/promises";
+import { readFile, lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 
 export const FIX_PROPOSAL_VERSION = 1;
@@ -331,14 +331,14 @@ export async function validatePatchSafety(
 
     seenPaths.add(file.path);
 
-    const pathError = validateWorkspacePath(file.path, repoRoot);
+    const resolved = await resolveWorkspaceFilePath(file.path, repoRoot);
 
-    if (pathError) {
-      errors.push(pathError);
+    if (!resolved.ok) {
+      errors.push(resolved.error);
       continue;
     }
 
-    const absolutePath = path.resolve(repoRoot, file.path);
+    const absolutePath = resolved.absolutePath;
     let contents: string;
 
     try {
@@ -394,6 +394,39 @@ export async function validatePatchSafety(
   return { ok: errors.length === 0, errors };
 }
 
+export async function resolveWorkspaceFilePath(
+  filePath: string,
+  repoRoot: string,
+): Promise<{ ok: true; absolutePath: string } | { ok: false; error: string }> {
+  const pathError = validateWorkspacePath(filePath, repoRoot);
+
+  if (pathError) {
+    return { ok: false, error: pathError };
+  }
+
+  const normalized = path.normalize(filePath);
+  const absolutePath = path.resolve(repoRoot, normalized);
+
+  try {
+    const realRoot = await realpath(repoRoot);
+    const realParent = await realpath(path.dirname(absolutePath));
+
+    if (realParent !== realRoot && !realParent.startsWith(realRoot + path.sep)) {
+      return {
+        ok: false,
+        error: `Path ${filePath} escapes the repository workspace via a symlink.`,
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      error: `Path ${filePath} does not exist in the workspace. Creating new files is not supported.`,
+    };
+  }
+
+  return { ok: true, absolutePath };
+}
+
 function validateWorkspacePath(filePath: string, repoRoot: string): string | null {
   if (path.isAbsolute(filePath)) {
     return `Path ${filePath} is absolute; only workspace-relative paths are allowed.`;
@@ -401,7 +434,7 @@ function validateWorkspacePath(filePath: string, repoRoot: string): string | nul
 
   const normalized = path.normalize(filePath);
 
-  if (normalized.startsWith("..")) {
+  if (normalized === ".." || normalized.startsWith(`..${path.sep}`)) {
     return `Path ${filePath} escapes the repository workspace.`;
   }
 
