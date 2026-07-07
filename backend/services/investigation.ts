@@ -7,9 +7,7 @@
 // implementation.
 //
 // Cheap-first ordering (cost): deterministic memory replay first, one-shot
-// generation second, agentic exploration only when necessary. Note that
-// REPRODUCER_AGENT_ENABLED=true now means "the reproducer agent is AVAILABLE
-// AS FALLBACK", not "always use the reproducer agent first".
+// generation second, agentic exploration only when necessary.
 
 import path from "node:path";
 import {
@@ -127,6 +125,25 @@ export type PipelineOptions = {
   // clone flow.
   cloneRepo?: typeof cloneRepoForInvestigation;
 };
+
+export type ReproducerFallbackCase =
+  | "memory_reproduced"
+  | "plan_failed"
+  | "reproduced"
+  | "not_reproduced"
+  | "environment_failed"
+  | "execution_failed";
+
+export function shouldRunReproducerFallback(
+  fallbackCase: ReproducerFallbackCase,
+  escalateNotReproduced: boolean,
+): boolean {
+  return (
+    fallbackCase === "plan_failed" ||
+    fallbackCase === "execution_failed" ||
+    (fallbackCase === "not_reproduced" && escalateNotReproduced)
+  );
+}
 
 export async function runInvestigationPipeline(
   payload: InvestigationPipelineInput,
@@ -296,11 +313,9 @@ export async function runInvestigationPipeline(
     // Reproduction ordering (cost, cheap-first):
     //   1. memory-plan replay (deterministic, no model call)
     //   2. one-shot generateReproductionPlan()
-    //   3. reproducer agent (docs/fable/11) as FALLBACK when enabled
-    // REPRODUCER_AGENT_ENABLED=true means the agent is available as fallback,
-    // not that it runs first. Only executeReproductionPlan() can mark
-    // reproduced — memory is never trusted without replay.
-    const reproducerAgentEnabled = process.env.REPRODUCER_AGENT_ENABLED === "true";
+    //   3. reproducer agent (docs/fable/11) as FALLBACK
+    // Only executeReproductionPlan() can mark reproduced — memory is never
+    // trusted without replay.
     const escalateNotReproduced =
       process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
 
@@ -514,7 +529,7 @@ export async function runInvestigationPipeline(
       }
 
       if (planErrors !== null) {
-        if (reproducerAgentEnabled) {
+        if (shouldRunReproducerFallback("plan_failed", escalateNotReproduced)) {
           log("One-shot reproduction plan failed; falling back to reproducer agent.");
           const terminal = await runReproducerAgentFallback();
 
@@ -540,23 +555,17 @@ export async function runInvestigationPipeline(
           reproductionPath = "one_shot";
           await costShape.update({ oneShotPlanSucceeded: true });
         } else if (
-          oneShotResult.outcome === "execution_failed" &&
-          reproducerAgentEnabled
+          shouldRunReproducerFallback(oneShotResult.outcome, escalateNotReproduced)
         ) {
-          log("One-shot reproduction execution failed; falling back to reproducer agent.");
-          const terminal = await runReproducerAgentFallback();
-
-          if (terminal) {
-            return terminal;
+          if (oneShotResult.outcome === "not_reproduced") {
+            log(
+              "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
+            );
+          } else {
+            log(
+              "One-shot reproduction execution failed; falling back to reproducer agent.",
+            );
           }
-        } else if (
-          oneShotResult.outcome === "not_reproduced" &&
-          escalateNotReproduced &&
-          reproducerAgentEnabled
-        ) {
-          log(
-            "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
-          );
           const terminal = await runReproducerAgentFallback();
 
           if (terminal) {
