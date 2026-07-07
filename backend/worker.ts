@@ -25,6 +25,11 @@ import {
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
+import {
+  describeWorkerError,
+  enforceStartupChecks,
+  runWorkerPreflight,
+} from "./worker-preflight.js";
 
 const concurrency = Math.max(
   1,
@@ -46,11 +51,19 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
   runPipeline: runInvestigationPipeline,
   getInstallationToken: async (installationId) => {
     const octokit = await getInstallationOctokit(installationId);
+    // Single token request: @octokit/auth-app's installation auth result
+    // already includes the token response's permission metadata, which is
+    // the authoritative record of the token's Contents access.
     const auth = (await octokit.auth({ type: "installation" })) as {
       token?: string;
+      permissions?: Record<string, string>;
     };
 
-    return auth.token ?? null;
+    if (!auth.token) {
+      return null;
+    }
+
+    return { token: auth.token, permissions: auth.permissions ?? null };
   },
   postIssueComment: async ({ installationId, owner, repo, issueNumber, body }) => {
     const octokit = await getInstallationOctokit(installationId);
@@ -63,6 +76,22 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
   },
   log: (message) => console.log(message),
 };
+
+// Optional startup enforcement: with SHERLOCK_RUN_STARTUP_CHECKS=true the
+// preflight must pass before the BullMQ worker is created (and therefore
+// before any job can be consumed). Without the flag, behavior is unchanged.
+const proceed = await enforceStartupChecks(
+  process.env,
+  () => runWorkerPreflight(),
+  () => {
+    process.exitCode = 1;
+  },
+);
+
+if (!proceed) {
+  await connection.quit().catch(() => {});
+  process.exit(1);
+}
 
 const worker = new Worker<InvestigationJobPayload>(
   INVESTIGATION_QUEUE_NAME,
@@ -83,6 +112,12 @@ worker.on("completed", (job) => {
 
 worker.on("failed", (job, error) => {
   console.error(`[queue] Job ${job?.id} failed: ${error.message}`);
+});
+
+// Redis/worker infrastructure errors surface asynchronously; log them
+// safely (redacted) instead of crashing silently.
+worker.on("error", (error) => {
+  console.error(`[queue] Worker error: ${describeWorkerError(error)}`);
 });
 
 console.log(

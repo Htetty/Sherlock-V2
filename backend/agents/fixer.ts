@@ -30,6 +30,7 @@ import {
   type FixAttemptResult,
   type RestartResult,
 } from "../services/fix.js";
+import type { AppNetworkTarget } from "../services/regression-test.js";
 import { FIX_PROPOSAL_VERSION, PATCH_LIMITS } from "../services/fix-proposal.js";
 import { queryGraphNeighbors, type GraphContext } from "../services/graphContext.js";
 import type { ReproductionPlan } from "../services/plan.js";
@@ -121,6 +122,18 @@ export type FixerAgentInput = {
   graphContext: GraphContext;
   initialSourceFiles: SourceFile[];
   restart: () => Promise<RestartResult>;
+  // --- Verification extras (dev: repo validation + regression tests) ------
+  // "owner/name" used in validation artifacts; never a URL or secret.
+  repositoryLabel?: string;
+  // The ORIGINAL (pre-patch) running app container, for strict-network
+  // regression execution against the unpatched source.
+  appNetwork?: AppNetworkTarget | null;
+  // Binds one patch proposal into a regression-test generator; the verifier
+  // calls the returned function at most twice (initial + one refinement).
+  // Absent means regression testing is unavailable — reported truthfully.
+  buildRegressionTestGenerator?:
+    | ((proposal: unknown) => (feedback: string | null) => Promise<unknown>)
+    | null;
 };
 
 export type FixerAgentStatus = "verified" | "blocked" | "exhausted" | "failed";
@@ -477,6 +490,11 @@ export async function runFixerAgent(
           originalOutcome: input.reproductionResult.outcome,
           proposal,
           restart: input.restart,
+          repositoryLabel: input.repositoryLabel,
+          appNetwork: input.appNetwork ?? null,
+          generateRegressionTest: input.buildRegressionTestGenerator
+            ? input.buildRegressionTestGenerator(proposal)
+            : null,
         });
 
         lastAttempt = attempt;

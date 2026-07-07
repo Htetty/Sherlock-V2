@@ -205,6 +205,8 @@ function attemptResult(
     rootCause: "stub root cause",
     postPatchOutcome: outcome === "verified" ? "not_reproduced" : "reproduced",
     testRuns: [],
+    repositoryValidation: null,
+    regressionTest: null,
     startedAt: new Date().toISOString(),
     finishedAt: new Date().toISOString(),
   };

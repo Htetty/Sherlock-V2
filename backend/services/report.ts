@@ -6,7 +6,11 @@ export type InvestigationOutcome =
   | "not_reproduced"
   | "plan_failed"
   | "environment_failed"
-  | "execution_failed";
+  | "execution_failed"
+  // Bug reproduced AND the patch was verified (replay + repository
+  // validation). The original reproduction outcome is preserved separately
+  // in originalOutcome.
+  | "verified_fix";
 
 export type InvestigationSummary = {
   investigationId: string;
@@ -21,6 +25,9 @@ export type InvestigationSummary = {
   // tell whether the fixer evidence is browser-level or API-level.
   // Optional: absent on the one-shot path and on failures.
   reproductionMode?: string | null;
+  originalOutcome?: string | null;
+  verification?: string | null;
+  pullRequestStatus?: string | null;
   evidence?: {
     screenshots: number;
     consoleErrors: number;
@@ -37,6 +44,8 @@ const MAX_DIAGNOSTIC_ERROR_CHARS = 1_600;
 const MAX_COMMENT_CHARS = 3_000;
 
 const OUTCOME_HEADLINES: Record<InvestigationOutcome, string> = {
+  verified_fix:
+    "Sherlock reproduced the reported failure and verified a fix for it.",
   reproduced: "Sherlock reproduced the reported failure.",
   not_reproduced:
     "Sherlock executed the reproduction plan but did not observe the reported failure.",
@@ -58,6 +67,18 @@ export function formatResultComment(summary: InvestigationSummary): string {
 
   if (summary.reproductionMode) {
     lines.push(`Reproduction evidence: ${summary.reproductionMode} (official replay)`);
+  }
+
+  if (summary.originalOutcome) {
+    lines.push(`Original reproduction: ${summary.originalOutcome}`);
+  }
+
+  if (summary.verification) {
+    lines.push(`Verification: ${summary.verification}`);
+  }
+
+  if (summary.pullRequestStatus) {
+    lines.push(`Pull request: ${summary.pullRequestStatus}`);
   }
 
   if (summary.observed) {
@@ -132,6 +153,10 @@ export type FixCommentSummary = {
   changedFiles?: string[];
   reason?: string | null;
   verification?: string[];
+  // Truthful per-category repository validation lines, e.g. "Tests: passed".
+  repositoryValidation?: string[];
+  // Truthful regression-test lines, e.g. "Before patch: failed as expected".
+  regressionTest?: string[];
 };
 
 const FIX_OUTCOME_HEADLINES: Record<string, string> = {
@@ -147,6 +172,8 @@ const FIX_OUTCOME_HEADLINES: Record<string, string> = {
     "Sherlock generated a fix, but the application environment failed during verification.",
   rejected_verification_inconclusive:
     "Sherlock generated a fix, but could not conclusively verify it.",
+  rejected_regression_test_failed:
+    "Sherlock generated a fix, but the generated regression test did not prove it.",
 };
 
 export function formatFixComment(summary: FixCommentSummary): string {
@@ -175,6 +202,22 @@ export function formatFixComment(summary: FixCommentSummary): string {
     lines.push("Verification:");
 
     for (const item of summary.verification) {
+      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
+    }
+  }
+
+  if (summary.repositoryValidation && summary.repositoryValidation.length > 0) {
+    lines.push("Repository validation:");
+
+    for (const item of summary.repositoryValidation) {
+      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
+    }
+  }
+
+  if (summary.regressionTest && summary.regressionTest.length > 0) {
+    lines.push("Regression test:");
+
+    for (const item of summary.regressionTest) {
       lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
     }
   }

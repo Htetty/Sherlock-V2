@@ -44,6 +44,9 @@ export type SandboxResult = {
   hostPort?: number;
   internalPort?: number | null;
   command?: string;
+  // Docker container name of the running app, so strict-network regression
+  // containers can join its network namespace.
+  containerName?: string | null;
 };
 
 export type SandboxSession = {
@@ -244,6 +247,7 @@ async function startApplicationAttempt(input: {
     hostPort: input.hostPort,
     internalPort: input.internalPort,
     command: app.sanitizedCommand,
+    containerName: app.containerName,
   };
 
   collectProcessOutput(app.process, output);

@@ -71,7 +71,8 @@ async function createVerifiedAttempt(root: string, commit: string, overrides: Pa
     "application_restarted",
     "exact_plan_replayed",
     "failure_no_longer_observed",
-    "relevant_tests_passed",
+    "repository_validation",
+    "regression_test",
   ].map((name) => ({ name, passed: true, detail: `${name} ok` }));
 
   const fixAttempt: FixAttemptResult = {

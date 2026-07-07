@@ -179,13 +179,27 @@ async function git(repoPath: string, args: string[]) {
   return stdout;
 }
 
-async function createFixtureRepo() {
+async function createFixtureRepo(scripts?: Record<string, string>) {
   const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-fix-repo-"));
 
   await writeFile(path.join(repoPath, "server.mjs"), BUGGY_SERVER, "utf8");
   await writeFile(path.join(repoPath, "check-login.mjs"), CHECK_LOGIN_TEST, "utf8");
   await writeFile(path.join(repoPath, "failing-test.mjs"), "process.exit(1);\n", "utf8");
+  await writeFile(
+    path.join(repoPath, "never-exits.mjs"),
+    // Self-terminates as a leak guard; validation timeouts fire well before.
+    "setTimeout(() => process.exit(0), 15000);\nsetInterval(() => {}, 1000);\n",
+    "utf8",
+  );
   await writeFile(path.join(repoPath, ".env"), "SECRET_TOKEN=super-secret-value\n", "utf8");
+
+  if (scripts) {
+    await writeFile(
+      path.join(repoPath, "package.json"),
+      JSON.stringify({ name: "fixture-app", version: "1.0.0", scripts }),
+      "utf8",
+    );
+  }
 
   await git(repoPath, ["init", "--quiet"]);
   await git(repoPath, ["config", "user.email", "fixture@example.com"]);
@@ -298,8 +312,8 @@ function correctProposal(overrides: Partial<FixProposal> = {}): FixProposal {
 
 // Runs the seeded bug through reproduction, then a fix attempt with the given
 // proposal and restart behavior. Returns everything the assertions need.
-async function setupReproducedInvestigation() {
-  const { repoPath, commit } = await createFixtureRepo();
+async function setupReproducedInvestigation(scripts?: Record<string, string>) {
+  const { repoPath, commit } = await createFixtureRepo(scripts);
   const port = await getFreePort();
   let app = await startApp(repoPath, port);
   const baseUrl = `http://localhost:${port}`;
@@ -342,7 +356,12 @@ describe("verified fix loop", () => {
     "a correct patch is verified and original artifacts are preserved",
     { timeout: 120_000 },
     async () => {
-      const setup = await setupReproducedInvestigation();
+      // Fixture declares a real test script; validation must discover and
+      // run it in the container path (exact replay + all available checks
+      // passing allows verification).
+      const setup = await setupReproducedInvestigation({
+        test: "node check-login.mjs",
+      });
       const before = await readOriginalArtifacts(setup.store.dir);
       const docker = createHostEmulatingDocker();
 
@@ -363,13 +382,28 @@ describe("verified fix loop", () => {
       expect(attempt.changedFiles).toEqual(["server.mjs"]);
       expect(attempt.fixAttemptId).toMatch(/^fix_[0-9A-Z]{10,}$/);
       expect(attempt.testRuns).toHaveLength(1);
+      expect(attempt.testRuns[0].command).toBe("npm run test");
       expect(attempt.testRuns[0].exitCode).toBe(0);
       expect(attempt.testRuns[0].timedOut).toBe(false);
+      // No generator injected: regression testing is truthfully unavailable
+      // and never a fake pass, while replay + validation still verify.
+      expect(attempt.regressionTest?.status).toBe("unavailable");
+      expect(attempt.regressionTest?.prePatch).toBeNull();
 
-      // The test command ran in its own short-lived container (not the app
-      // container) and was force-removed afterwards.
+      expect(attempt.repositoryValidation).toEqual({
+        aggregate: "passed",
+        categories: [
+          { category: "test", status: "passed" },
+          { category: "typecheck", status: "not_available" },
+          { category: "lint", status: "not_available" },
+          { category: "build", status: "not_available" },
+        ],
+      });
+
+      // The validation command ran in its own short-lived container (not
+      // the app container) and was force-removed afterwards.
       expect(docker.containerNames).toHaveLength(1);
-      expect(docker.containerNames[0]).toMatch(/^sherlock-test-/);
+      expect(docker.containerNames[0]).toMatch(/^sherlock-validate-test-/);
       expect(docker.removed).toContain(docker.containerNames[0]);
 
       // The exact saved plan was replayed (hash recorded, steps untouched).
@@ -384,6 +418,8 @@ describe("verified fix loop", () => {
         "git-diff.patch",
         "build-result.json",
         "post-patch-reproduction-result.json",
+        "repository-validation.json",
+        "regression-test.json",
         "test-results.json",
         "verification-result.json",
       ]) {
@@ -440,9 +476,61 @@ describe("verified fix loop", () => {
   );
 
   test(
-    "a patch that fixes the bug but breaks relevant tests is rejected_tests_failed",
+    "a patch that fixes the bug but fails repository validation is rejected_tests_failed",
     { timeout: 120_000 },
     async () => {
+      // Discovered failing "test" script + passing "lint" script: any failed
+      // category prevents verification.
+      const setup = await setupReproducedInvestigation({
+        test: "node failing-test.mjs",
+        lint: "node check-login.mjs",
+      });
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+      });
+
+      expect(attempt.outcome).toBe("rejected_tests_failed");
+      // The reproduction itself did pass post-patch.
+      expect(attempt.postPatchOutcome).toBe("not_reproduced");
+      expect(attempt.repositoryValidation?.aggregate).toBe("failed");
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "test",
+        status: "failed",
+      });
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "lint",
+        status: "passed",
+      });
+      expect(attempt.testRuns[0].exitCode).not.toBe(0);
+      expect(attempt.testRuns[1].exitCode).toBe(0);
+
+      // Each validation command got its own uniquely named short-lived
+      // container, and both were cleaned up.
+      expect(docker.containerNames).toHaveLength(2);
+      expect(new Set(docker.containerNames).size).toBe(2);
+
+      for (const name of docker.containerNames) {
+        expect(docker.removed).toContain(name);
+      }
+    },
+  );
+
+  test(
+    "unavailable repository validation is reported truthfully and never faked as passing",
+    { timeout: 120_000 },
+    async () => {
+      // No package.json at all: the exact reproduction replay may still
+      // verify the fix, but nothing may claim tests passed.
       const setup = await setupReproducedInvestigation();
       const docker = createHostEmulatingDocker();
 
@@ -453,27 +541,64 @@ describe("verified fix loop", () => {
         sourceCommit: setup.commit,
         plan: setup.plan,
         originalOutcome: setup.original.outcome,
-        proposal: correctProposal({
-          relevantTests: ["node failing-test.mjs", "node check-login.mjs"],
-        }),
+        proposal: correctProposal(),
         restart: setup.restart,
         docker: docker.adapter,
       });
 
+      expect(attempt.outcome).toBe("verified");
+      expect(attempt.repositoryValidation?.aggregate).toBe("not_available");
+      expect(attempt.testRuns).toHaveLength(0);
+      // Unavailable categories execute nothing.
+      expect(docker.containerNames).toHaveLength(0);
+
+      // Truthful check: no fake relevant_tests_passed, no "passed with no
+      // coverage" wording anywhere.
+      const names = attempt.checks.map((item) => item.name);
+      expect(names).not.toContain("relevant_tests_passed");
+      const validationCheck = attempt.checks.find(
+        (item) => item.name === "repository_validation",
+      );
+      expect(validationCheck?.detail).toContain("unavailable");
+      const serialized = JSON.stringify(attempt);
+      expect(serialized).not.toContain("passed with no coverage");
+      expect(attempt.reason).toContain("Repository validation was unavailable");
+    },
+  );
+
+  test(
+    "a timed-out validation command prevents verified status",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation({
+        test: "node never-exits.mjs",
+      });
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        validationTimeoutMs: 800,
+      });
+
       expect(attempt.outcome).toBe("rejected_tests_failed");
-      // The reproduction itself did pass post-patch.
-      expect(attempt.postPatchOutcome).toBe("not_reproduced");
-      expect(attempt.testRuns[0].exitCode).not.toBe(0);
-      expect(attempt.testRuns[1].exitCode).toBe(0);
+      expect(attempt.repositoryValidation?.aggregate).toBe("failed");
+      expect(attempt.repositoryValidation?.categories).toContainEqual({
+        category: "test",
+        status: "timed_out",
+      });
+      expect(attempt.testRuns[0].timedOut).toBe(true);
+      expect(attempt.reason).toContain("timed out");
 
-      // Each verification command got its own uniquely named short-lived
-      // container, and both were cleaned up.
-      expect(docker.containerNames).toHaveLength(2);
-      expect(new Set(docker.containerNames).size).toBe(2);
-
-      for (const name of docker.containerNames) {
-        expect(docker.removed).toContain(name);
-      }
+      // Forced cleanup ran for the timed-out container.
+      expect(docker.removed).toContain(docker.containerNames[0]);
     },
   );
 
@@ -629,6 +754,310 @@ describe("verified fix loop", () => {
     expect(attempt.reason).toContain("Precondition failed");
     expect(await readFile(path.join(repoPath, "server.mjs"), "utf8")).toBe(serverBefore);
   });
+});
+
+// Regression-test lifecycle against the real fixture workspace: generated
+// tests are injected (Claude is mocked) and executed through the
+// host-emulating container adapter.
+describe("regression-test verification loop", () => {
+  const regressionProposal = (contents: string, name = "login-does-not-return-500") => ({
+    version: 1,
+    testName: name,
+    purpose: "Prove the login handler behavior.",
+    relativePath: "sherlock-regression.test.mjs",
+    runner: "node",
+    contents,
+    expectedPrePatchFailure: "The assertion fails on the buggy source.",
+    expectedPostPatchBehavior: "The assertion passes after the fix.",
+  });
+
+  const FAILS_ON_BUGGY = `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(!source.includes("res.writeHead(500"), "REGRESSION_EXPECTED_FAILURE: login handler must not respond 500");
+`;
+
+  test(
+    "fail-before/pass-after with identical bytes permits verification",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      let generatorCalls = 0;
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () => {
+          generatorCalls += 1;
+          return regressionProposal(FAILS_ON_BUGGY);
+        },
+      });
+
+      expect(attempt.outcome).toBe("verified");
+      expect(generatorCalls).toBe(1);
+      expect(attempt.regressionTest).toMatchObject({
+        status: "proven",
+        testName: "login-does-not-return-500",
+        prePatch: "failed_as_expected",
+        postPatch: "passed",
+        hashMatched: true,
+        generationAttempts: 1,
+      });
+      expect(attempt.regressionTest?.sha256).toMatch(/^[0-9a-f]{64}$/);
+
+      // Both runs happened in their own regression containers.
+      const regressionContainers = docker.containerNames.filter((name) =>
+        name.startsWith("sherlock-regression-"),
+      );
+      expect(regressionContainers).toHaveLength(2);
+
+      // The generated test is evidence only: gone from the workspace, with
+      // only the intended patch file changed — it can never reach the PR.
+      await expect(
+        stat(path.join(setup.repoPath, "sherlock-regression.test.mjs")),
+      ).rejects.toThrow();
+      const status = await execFileAsync("git", ["status", "--short"], {
+        cwd: setup.repoPath,
+      });
+      expect(status.stdout.trim()).toBe("M server.mjs");
+
+      // The intended production patch is intact.
+      const patched = await readFile(path.join(setup.repoPath, "server.mjs"), "utf8");
+      expect(patched).toContain("res.writeHead(401");
+
+      // Structured artifacts exist, with the exact source bytes preserved.
+      for (const fileName of [
+        "regression-test.json",
+        "regression-test-source.mjs",
+        "regression-prepatch-result.json",
+        "regression-postpatch-result.json",
+      ]) {
+        const info = await stat(path.join(attempt.attemptDir, fileName));
+        expect(info.isFile()).toBe(true);
+      }
+      expect(
+        await readFile(path.join(attempt.attemptDir, "regression-test-source.mjs"), "utf8"),
+      ).toBe(FAILS_ON_BUGGY);
+      const artifact = JSON.parse(
+        await readFile(path.join(attempt.attemptDir, "regression-test.json"), "utf8"),
+      );
+      expect(artifact.status).toBe("proven");
+      expect(JSON.stringify(artifact)).not.toContain("SECRET_TOKEN");
+    },
+  );
+
+  test(
+    "a test that unexpectedly passes on the original source rejects the fix before patching",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () =>
+          regressionProposal(
+            `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(source.includes("http"), "REGRESSION_EXPECTED_FAILURE: trivially true on the buggy source");
+`,
+            "trivially-passing-test",
+          ),
+      });
+
+      expect(attempt.outcome).toBe("rejected_regression_test_failed");
+      expect(attempt.regressionTest?.status).toBe("blocked");
+      expect(attempt.regressionTest?.prePatch).toBe("unexpectedly_passed");
+
+      // The patch was never applied: the buggy source is untouched.
+      const source = await readFile(path.join(setup.repoPath, "server.mjs"), "utf8");
+      expect(source).toContain("res.writeHead(500");
+    },
+  );
+
+  test(
+    "one invalid proposal permits exactly one refinement, and invalid twice is truthfully unavailable",
+    { timeout: 120_000 },
+    async () => {
+      // Invalid (syntax error) then valid: refinement succeeds.
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      const feedbackSeen: (string | null)[] = [];
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async (feedback) => {
+          feedbackSeen.push(feedback);
+          return feedbackSeen.length === 1
+            ? regressionProposal(
+                'const assert = ; // REGRESSION_EXPECTED_FAILURE: broken\n',
+                "broken-syntax-test",
+              )
+            : regressionProposal(FAILS_ON_BUGGY);
+        },
+      });
+
+      expect(attempt.outcome).toBe("verified");
+      expect(attempt.regressionTest?.status).toBe("proven");
+      expect(attempt.regressionTest?.generationAttempts).toBe(2);
+      expect(feedbackSeen).toHaveLength(2);
+      expect(feedbackSeen[0]).toBeNull();
+      expect(feedbackSeen[1]).toContain("invalid_test");
+
+      // Invalid twice: bounded at two attempts, no third call, neutral and
+      // truthful — verification still succeeds via replay, never a fake pass.
+      const setup2 = await setupReproducedInvestigation();
+      const docker2 = createHostEmulatingDocker();
+      let calls = 0;
+
+      const attempt2 = await runFixAttempt({
+        investigationId: setup2.investigationId,
+        investigationDir: setup2.store.dir,
+        repoPath: setup2.repoPath,
+        sourceCommit: setup2.commit,
+        plan: setup2.plan,
+        originalOutcome: setup2.original.outcome,
+        proposal: correctProposal(),
+        restart: setup2.restart,
+        docker: docker2.adapter,
+        generateRegressionTest: async () => {
+          calls += 1;
+          return regressionProposal(
+            'const assert = ; // REGRESSION_EXPECTED_FAILURE: still broken\n',
+            "still-broken-test",
+          );
+        },
+      });
+
+      expect(calls).toBe(2);
+      expect(attempt2.outcome).toBe("verified");
+      expect(attempt2.regressionTest?.status).toBe("unavailable");
+      expect(attempt2.regressionTest?.prePatch).toBe("invalid_test");
+      const regressionCheck = attempt2.checks.find((c) => c.name === "regression_test");
+      expect(regressionCheck?.passed).toBe(true);
+      expect(regressionCheck?.detail).toContain("No generated regression test was available");
+    },
+  );
+
+  test(
+    "a wrong-route setup failure is never accepted as behavioral proof and does not block a replay-verified patch",
+    { timeout: 120_000 },
+    async () => {
+      // Reproduces live inv_1JSR0AM8Q8T19Z3: the generated test hit an
+      // invented endpoint, its SETUP assertion failed (404-style), and that
+      // must classify as invalid_test — not failed_as_expected — leaving
+      // the replay-verified patch verifiable once generation is exhausted.
+      const WRONG_ROUTE_TEST = `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+let body = null;
+try {
+  body = await readFile("this-route-does-not-exist.json", "utf8");
+} catch {
+  assert.fail("Archive request should succeed, got 404");
+}
+assert.ok(!body.includes("nope"), "REGRESSION_EXPECTED_FAILURE: archived task reappeared");
+`;
+
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+      const feedbackSeen: (string | null)[] = [];
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async (feedback) => {
+          feedbackSeen.push(feedback);
+          return regressionProposal(WRONG_ROUTE_TEST, "wrong-route-test");
+        },
+      });
+
+      // Setup failure without the marker: invalid, refined once, then
+      // truthfully unavailable — never blocking the replay-verified patch.
+      expect(attempt.regressionTest?.prePatch).toBe("invalid_test");
+      expect(attempt.regressionTest?.status).toBe("unavailable");
+      expect(attempt.regressionTest?.generationAttempts).toBe(2);
+      expect(attempt.outcome).toBe("verified");
+
+      // The refinement feedback teaches the model what went wrong.
+      expect(feedbackSeen).toHaveLength(2);
+      expect(feedbackSeen[1]).toContain("invalid_test");
+      expect(feedbackSeen[1]).toContain("REGRESSION_EXPECTED_FAILURE");
+      expect(feedbackSeen[1]).toContain("not behavioral proof");
+    },
+  );
+
+  test(
+    "a regression test that still fails after the patch blocks verification",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const docker = createHostEmulatingDocker();
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () =>
+          regressionProposal(
+            `import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+const source = await readFile("server.mjs", "utf8");
+assert.ok(source.includes("unicorn"), "REGRESSION_EXPECTED_FAILURE: fails before AND after the patch");
+`,
+            "fails-both-sides-test",
+          ),
+      });
+
+      expect(attempt.outcome).toBe("rejected_regression_test_failed");
+      expect(attempt.regressionTest?.status).toBe("blocked");
+      expect(attempt.regressionTest?.prePatch).toBe("failed_as_expected");
+      expect(attempt.regressionTest?.postPatch).toBe("failed");
+      expect(attempt.regressionTest?.hashMatched).toBe(true);
+
+      // The generated test never remains in the workspace, even on rejection.
+      await expect(
+        stat(path.join(setup.repoPath, "sherlock-regression.test.mjs")),
+      ).rejects.toThrow();
+    },
+  );
 });
 
 describe("fix proposal extraction and retry", () => {

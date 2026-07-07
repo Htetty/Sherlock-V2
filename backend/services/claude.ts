@@ -8,6 +8,10 @@ import {
 import { truncateWithMarker } from "./bounded-text.js";
 import type { GraphContext } from "./graphContext.js";
 import type { ReproductionResult } from "./playwright.js";
+import {
+  buildRegressionTestPrompt,
+  type RegressionGenerationInput,
+} from "./regression-test.js";
 
 // Lazy so importing this module (e.g. from the fixer agent or tests with
 // injected model calls) never requires ANTHROPIC_API_KEY.
@@ -181,6 +185,27 @@ Respond again with ONLY the JSON object matching the exact shape shown above. Do
 // The one-shot generateFixProposal() flow was replaced by the bounded fixer
 // agent in backend/agents/fixer.ts (docs/fable/10). Fix proposals are now
 // authored through native tool use; only runFixAttempt() verifies them.
+
+export type RegressionTestInput = RegressionGenerationInput;
+
+// Single-shot structured regression-test proposal. Retry orchestration (at
+// most one refinement) lives in the fix loop, which calls this again with
+// feedback describing why the previous proposal was rejected. The prompt
+// itself lives in regression-test.ts so its rules are unit-testable.
+export async function generateRegressionTestProposal(
+  input: RegressionTestInput,
+  feedback: string | null,
+): Promise<unknown> {
+  const message = await createModelMessage({
+    model: MODEL,
+    max_tokens: 3_000,
+    messages: [{ role: "user", content: buildRegressionTestPrompt(input, feedback) }],
+  });
+
+  const extracted = extractFixProposalJson(getTextContent(message.content));
+
+  return extracted.ok ? extracted.value : null;
+}
 
 export async function analyzeIssue(input: AnalyzeIssueInput) {
   const prompt = `

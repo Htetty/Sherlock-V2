@@ -15,12 +15,19 @@ import path from "node:path";
 import {
   analyzeIssue,
   generateMemoryReflection,
+  generateRegressionTestProposal,
   generateReproductionPlan,
 } from "./claude.js";
 import { runFixerAgent, type FixerAgentStatus } from "../agents/fixer.js";
 import { getBudgetProfileName, runReproducerAgent } from "../agents/reproducer.js";
 import { createCostShapeTracker } from "./cost-shape.js";
-import type { FixAttemptResult } from "./fix.js";
+import type { FixAttemptResult, FixOutcome } from "./fix.js";
+import { getSandboxNetworkPolicy } from "./container.js";
+import { formatValidationLine } from "./repo-validation.js";
+import {
+  formatRegressionCommentLines,
+  type AppNetworkTarget,
+} from "./regression-test.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -41,8 +48,10 @@ import {
   cloneRepoForInvestigation,
   type RepoContext,
 } from "./repo.js";
+import { RepositoryError } from "./repo-auth.js";
 import {
   runSandboxInvestigation,
+  type SandboxResult,
   type SandboxSession,
 } from "./sandbox.js";
 import {
@@ -94,6 +103,8 @@ export type InvestigationPipelineInput = {
   triggerComment?: string;
   triggeredBy?: string;
   installationToken?: string | null;
+  // Permission metadata from the installation access-token response.
+  installationPermissions?: Record<string, string> | null;
 };
 
 export type InvestigationPipelineResult = {
@@ -112,6 +123,9 @@ export type InvestigationPipelineResult = {
 
 export type PipelineOptions = {
   onStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Injectable for tests; production always uses the real authenticated
+  // clone flow.
+  cloneRepo?: typeof cloneRepoForInvestigation;
 };
 
 export async function runInvestigationPipeline(
@@ -164,11 +178,25 @@ export async function runInvestigationPipeline(
     await store.writeJson("investigation.json", investigationRecord);
 
     try {
-      repoContext = await cloneRepoForInvestigation({
-        repoUrl: payload.repoUrl,
+      // Clone target is derived from the validated owner/name, never the
+      // webhook-supplied URL; the short-lived installation token (minted by
+      // the worker for this installation) authenticates private clones.
+      repoContext = await (options.cloneRepo ?? cloneRepoForInvestigation)({
+        repoOwner: payload.repoOwner,
+        repoName: payload.repoName,
         defaultBranch: payload.defaultBranch,
+        installationToken: payload.installationToken ?? null,
+        installationPermissions: payload.installationPermissions ?? null,
       });
     } catch (error) {
+      // Transient repository failures (GitHub 5xx/rate limits, network or
+      // transport blips) must reach the worker so BullMQ retries with
+      // backoff — they are never converted into a completed
+      // environment_failed result.
+      if (error instanceof RepositoryError && error.retryable) {
+        throw error;
+      }
+
       return await finishInvestigation(store, investigationRecord, {
         investigationId,
         outcome: "environment_failed",
@@ -208,7 +236,9 @@ export async function runInvestigationPipeline(
       });
     }
 
-    log(`Sandbox started at ${sandboxSession.result.baseUrl}`);
+    log(
+      `Sandbox started at ${sandboxSession.result.baseUrl} (network policy: ${getSandboxNetworkPolicy()})`,
+    );
 
     // --- Graph context (docs/fable/07): issue-specific repo context -------
     const graphContext = await buildGraphContext({
@@ -254,6 +284,9 @@ export async function runInvestigationPipeline(
       return {
         ok: true,
         baseUrl: sandboxSession.result.baseUrl,
+        // Identity of the restarted app container so strict-network
+        // regression containers can join its network namespace.
+        appNetwork: appNetworkTarget(sandboxSession.result),
         log: [sandboxSession.result.stdout, sandboxSession.result.stderr]
           .filter(Boolean)
           .join("\n"),
@@ -626,6 +659,15 @@ export async function runInvestigationPipeline(
 
         await reportStage("verifying");
 
+        // One regression test per fix attempt (dev): Claude-backed generator
+        // with bounded refinement handled inside runFixAttempt(). The fixer
+        // agent binds each patch proposal into the generator per attempt.
+        const regressionSourceFiles = (
+          refinedContext.available ? refinedContext.relevantFiles : contextSourceFiles
+        ).map((file) => ({ path: file.path, contents: file.contents }));
+        const acceptedPlan = plan;
+        const acceptedResult = result;
+
         // Bounded fixer agent (docs/fable/10): explores the repo, proposes
         // patches, and revises using deterministic verification evidence.
         // Only runFixAttempt() inside the agent can mark an attempt verified.
@@ -649,6 +691,20 @@ export async function runInvestigationPipeline(
             ? refinedContext.relevantFiles
             : contextSourceFiles,
           restart,
+          repositoryLabel: `${payload.repoOwner}/${payload.repoName}`,
+          appNetwork: appNetworkTarget(sandboxSession.result),
+          buildRegressionTestGenerator: (proposal) => (feedback) =>
+            generateRegressionTestProposal(
+              {
+                issueTitle: payload.issueTitle,
+                issueBody: payload.issueBody ?? "",
+                plan: acceptedPlan,
+                reproductionResult: acceptedResult,
+                fixProposal: proposal,
+                sourceFiles: regressionSourceFiles,
+              },
+              feedback,
+            ),
         });
 
         fixAttempt = agentResult.fixAttempt;
@@ -679,6 +735,25 @@ export async function runInvestigationPipeline(
           }
           if (fixAttempt.postPatchOutcome) {
             log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+          }
+          if (fixAttempt.regressionTest) {
+            const regression = fixAttempt.regressionTest;
+
+            if (regression.testName) {
+              log(`Regression test generated: ${regression.testName}`);
+            }
+            if (regression.prePatch) {
+              log(`Pre-patch regression result: ${regression.prePatch}`);
+            }
+            if (regression.postPatch) {
+              log(`Post-patch regression result: ${regression.postPatch}`);
+            }
+            if (regression.hashMatched !== null) {
+              log(`Regression test hash matched: ${regression.hashMatched}`);
+            }
+            if (regression.status === "unavailable") {
+              log(`Regression test unavailable: ${regression.reason ?? "(no reason recorded)"}`);
+            }
           }
           for (const run of fixAttempt.testRuns) {
             log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
@@ -829,6 +904,24 @@ export async function runInvestigationPipeline(
         };
       }
 
+      // Truthful memory for rejected regression proofs: when the exact
+      // replay DID pass after the patch, the record must say so — the
+      // failure was the generated-test proof, not the reproduction.
+      if (
+        fixAttempt?.outcome === "rejected_regression_test_failed" &&
+        fixAttempt.postPatchOutcome === "not_reproduced"
+      ) {
+        memoryFields.whatWorked = [
+          "The exact reproduction replay passed after the patch.",
+          memoryFields.whatWorked,
+        ]
+          .filter(Boolean)
+          .join(" ");
+        memoryFields.whatFailed = `The generated regression test did not prove the fix (${
+          fixAttempt.regressionTest?.reason ?? "regression proof failed"
+        }), so the patch was rejected despite the passing replay.`;
+      }
+
       await appendMemory(payload.repoUrl, {
         issueTitle: payload.issueTitle,
         issueTerms: memoryFields.issueTerms,
@@ -873,6 +966,14 @@ export async function runInvestigationPipeline(
           verification: fixAttempt.checks
             .filter((item) => item.passed)
             .map((item) => item.detail),
+          repositoryValidation: fixAttempt.repositoryValidation
+            ? fixAttempt.repositoryValidation.categories.map((item) =>
+                formatValidationLine(item),
+              )
+            : undefined,
+          regressionTest: fixAttempt.regressionTest
+            ? formatRegressionCommentLines(fixAttempt.regressionTest)
+            : undefined,
         })
       : null;
 
@@ -892,11 +993,28 @@ export async function runInvestigationPipeline(
     const extraComment =
       [fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
 
+    // Final outcome semantics: a reproduced bug whose patch was verified
+    // finishes as verified_fix. The original reproduction outcome is
+    // preserved in summary.originalOutcome and in the untouched
+    // reproduction-result.json artifact.
+    const summary = buildExecutionSummary(investigationId, plan.expectedBehavior, result);
+    const finalOutcome = resolveFinalOutcome(result.outcome, fixAttempt?.outcome ?? null);
+
+    if (finalOutcome === "verified_fix") {
+      summary.outcome = "verified_fix";
+      summary.originalOutcome = result.outcome;
+      summary.verification = "verified";
+      summary.pullRequestStatus = pullRequest?.status ?? "not_attempted";
+      log(
+        `Final outcome: verified_fix (original reproduction: ${result.outcome}, pull request: ${summary.pullRequestStatus})`,
+      );
+    }
+
     return await finishInvestigation(
       store,
       investigationRecord,
       {
-        ...buildExecutionSummary(investigationId, plan.expectedBehavior, result),
+        ...summary,
         ...(reproductionMode ? { reproductionMode } : {}),
       },
       {
@@ -910,6 +1028,12 @@ export async function runInvestigationPipeline(
       extraComment,
     );
   } catch (error) {
+    // Typed transient repository errors propagate to the worker retry
+    // classifier instead of becoming a completed execution_failed result.
+    if (error instanceof RepositoryError && error.retryable) {
+      throw error;
+    }
+
     console.error(`[${investigationId}] Investigation failed:`, error);
 
     const summary: InvestigationSummary = {
@@ -937,6 +1061,33 @@ export async function runInvestigationPipeline(
       await cleanupRepoContext(repoContext);
     }
   }
+}
+
+// Final investigation outcome semantics:
+// - environment/plan/execution failures and not_reproduced pass through
+// - reproduced with no verified patch stays "reproduced"
+// - reproduced AND a verified patch becomes "verified_fix"
+// PR creation status is a separate field, never part of the outcome.
+export function resolveFinalOutcome(
+  reproductionOutcome: ReproductionResult["outcome"],
+  fixOutcome: FixOutcome | null,
+): ReproductionResult["outcome"] | "verified_fix" {
+  return reproductionOutcome === "reproduced" && fixOutcome === "verified"
+    ? "verified_fix"
+    : reproductionOutcome;
+}
+
+// The running app container's identity for strict-network regression
+// execution; null when the sandbox did not report one.
+function appNetworkTarget(result: SandboxResult): AppNetworkTarget | null {
+  if (result.containerName && result.internalPort) {
+    return {
+      containerName: result.containerName,
+      internalPort: result.internalPort,
+    };
+  }
+
+  return null;
 }
 
 // --- Terminal logging helpers ---------------------------------------------

@@ -13,6 +13,7 @@ import type {
   InvestigationPipelineResult,
   InvestigationStage,
 } from "../services/investigation.js";
+import { RepositoryError } from "../services/repo-auth.js";
 import { redactSecrets } from "../services/report.js";
 import type { InvestigationJobPayload } from "./investigation-queue.js";
 
@@ -29,8 +30,13 @@ export type WorkerDeps = {
     options: { onStage?: (stage: InvestigationStage) => void | Promise<void> },
   ) => Promise<InvestigationPipelineResult>;
   // Mints a short-lived installation token from the GitHub App credentials;
-  // tokens are never stored in the queue payload.
-  getInstallationToken: (installationId: number) => Promise<string | null>;
+  // tokens are never stored in the queue payload. The permissions object is
+  // the token response's own metadata (authoritative for Contents access) —
+  // returned alongside the token so no extra token request is needed.
+  getInstallationToken: (installationId: number) => Promise<{
+    token: string;
+    permissions: Record<string, string> | null;
+  } | null>;
   postIssueComment: (input: {
     installationId: number;
     owner: string;
@@ -68,6 +74,14 @@ const TRANSIENT_MESSAGE_PATTERNS = [
 export function isTransientInfrastructureError(error: unknown): boolean {
   if (!error || typeof error !== "object") {
     return false;
+  }
+
+  // Typed repository errors carry their own retry classification; this is
+  // authoritative and never falls through to message matching (a logical
+  // access error whose message happens to mention "rate limit" must not be
+  // retried).
+  if (error instanceof RepositoryError) {
+    return error.retryable;
   }
 
   const candidate = error as {
@@ -127,7 +141,7 @@ export async function processInvestigationJob(
     await reportStage("running");
     log(`[${payload.investigationId}] Job started for ${payload.repositoryOwner}/${payload.repositoryName}#${payload.issueNumber} (tenant ${payload.tenantId}).`);
 
-    const installationToken = await deps.getInstallationToken(payload.installationId);
+    const installationAuth = await deps.getInstallationToken(payload.installationId);
 
     const result = await deps.runPipeline(
       {
@@ -142,7 +156,8 @@ export async function processInvestigationJob(
         issueUrl: payload.issueUrl,
         triggerComment: payload.triggerComment,
         triggeredBy: payload.triggeredBy,
-        installationToken,
+        installationToken: installationAuth?.token ?? null,
+        installationPermissions: installationAuth?.permissions ?? null,
       },
       { onStage: reportStage },
     );

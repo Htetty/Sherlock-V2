@@ -11,17 +11,8 @@ import { createHash } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import {
-  createArtifactStore,
-  createFixAttemptId,
-  type ArtifactStore,
-} from "./artifacts.js";
-import {
-  buildTargetEnv,
-  realDockerAdapter,
-  runContainerCommand,
-  type DockerAdapter,
-} from "./container.js";
+import { createArtifactStore, createFixAttemptId } from "./artifacts.js";
+import { realDockerAdapter, type DockerAdapter } from "./container.js";
 import {
   renderProposedPatch,
   resolveWorkspaceFilePath,
@@ -31,11 +22,29 @@ import {
 } from "./fix-proposal.js";
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
-import { createRuntimeWorkspace } from "./runtime-workspace.js";
+import {
+  formatValidationLine,
+  runRepositoryValidation,
+  type RepositoryValidation,
+  type ValidationCategory,
+  type ValidationStatus,
+} from "./repo-validation.js";
+import {
+  classifyPostPatchRun,
+  classifyPrePatchRun,
+  extractRegressionFailureMarker,
+  type AppNetworkTarget,
+  hashTestContents,
+  materializeTest,
+  runRegressionTest,
+  validateRegressionProposalSafety,
+  validateRegressionProposalShape,
+  type PostPatchClassification,
+  type RegressionTestProposal,
+  type RegressionTestSummary,
+} from "./regression-test.js";
 
 const execFileAsync = promisify(execFile);
-
-const TEST_COMMAND_TIMEOUT_MS = 180_000;
 
 export type FixOutcome =
   | "verified"
@@ -44,12 +53,19 @@ export type FixOutcome =
   | "rejected_tests_failed"
   | "rejected_patch_invalid"
   | "rejected_environment_failed"
-  | "rejected_verification_inconclusive";
+  | "rejected_verification_inconclusive"
+  // A generated regression test existed but its fail-before/pass-after
+  // contract was not satisfied (unexpectedly passed, failed post-patch,
+  // hash mismatch, or workspace residue).
+  | "rejected_regression_test_failed";
 
 export type RestartResult = {
   ok: boolean;
   baseUrl?: string;
   log?: string;
+  // Identity of the restarted app container so strict-network regression
+  // containers can join its network namespace.
+  appNetwork?: AppNetworkTarget | null;
 };
 
 export type TestRunRecord = {
@@ -81,6 +97,23 @@ export type FixAttemptInput = {
   // Verification commands run in restricted containers through this
   // adapter; injectable so tests run without a Docker daemon.
   docker?: DockerAdapter;
+  // "owner/name" used in the validation artifact; never a URL or secret.
+  repositoryLabel?: string;
+  validationTimeoutMs?: number;
+  // Produces a structured regression-test proposal (Claude-backed in
+  // production, stubbed in tests). Called at most twice: initial proposal,
+  // then one refinement with feedback. Absent means regression testing is
+  // unavailable for this investigation — reported truthfully, never faked.
+  generateRegressionTest?: ((feedback: string | null) => Promise<unknown>) | null;
+  regressionTimeoutMs?: number;
+  // The ORIGINAL (pre-patch) running app container, for strict-network
+  // regression execution against the unpatched source.
+  appNetwork?: AppNetworkTarget | null;
+};
+
+export type RepositoryValidationSummary = {
+  aggregate: RepositoryValidation["aggregate"];
+  categories: { category: ValidationCategory; status: ValidationStatus }[];
 };
 
 export type FixAttemptResult = {
@@ -96,6 +129,10 @@ export type FixAttemptResult = {
   rootCause: string | null;
   postPatchOutcome: string | null;
   testRuns: TestRunRecord[];
+  // Truthful repository validation summary (null until validation runs).
+  repositoryValidation: RepositoryValidationSummary | null;
+  // Generated regression test contract (null until the stage runs).
+  regressionTest: RegressionTestSummary | null;
   startedAt: string;
   finishedAt: string;
 };
@@ -120,6 +157,8 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     rootCause: null,
     postPatchOutcome: null,
     testRuns: [],
+    repositoryValidation: null,
+    regressionTest: null,
     startedAt: new Date().toISOString(),
     finishedAt: new Date().toISOString(),
   };
@@ -224,6 +263,152 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     renderProposedPatch(proposal),
     "utf8",
   );
+
+  // --- Regression test: generation + pre-patch proof ------------------------
+  // Runs BEFORE the patch is applied: the generated test must fail on the
+  // original source for the intended behavioral assertion. Bounded to two
+  // generation attempts (initial + one refinement) — never a model loop.
+  const regressionSummary: RegressionTestSummary = {
+    status: "unavailable",
+    testName: null,
+    relativePath: null,
+    runner: null,
+    sha256: null,
+    prePatch: null,
+    postPatch: null,
+    hashMatched: null,
+    generationAttempts: 0,
+    reason: null,
+  };
+  result.regressionTest = regressionSummary;
+
+  const persistRegressionArtifact = () =>
+    store.writeJson("regression-test.json", {
+      investigationId: input.investigationId,
+      fixAttemptId,
+      repository: input.repositoryLabel ?? null,
+      sourceCommit: input.sourceCommit,
+      ...regressionSummary,
+    });
+
+  let provenRegressionTest: RegressionTestProposal | null = null;
+
+  if (!input.generateRegressionTest) {
+    regressionSummary.reason =
+      "No regression-test generator is available for this investigation.";
+  } else {
+    let feedback: string | null = null;
+
+    for (let attempt = 1; attempt <= 2 && provenRegressionTest === null; attempt += 1) {
+      regressionSummary.generationAttempts = attempt;
+
+      let raw: unknown;
+
+      try {
+        raw = await input.generateRegressionTest(feedback);
+      } catch (error) {
+        regressionSummary.reason = `Regression-test generation failed: ${formatError(error)}`;
+        break;
+      }
+
+      const shape = validateRegressionProposalShape(raw);
+
+      if (!shape.ok) {
+        feedback = shape.errors.join(" | ");
+        regressionSummary.reason = `The proposed test was structurally invalid: ${feedback}`;
+        continue;
+      }
+
+      const safety = await validateRegressionProposalSafety(shape.proposal, input.repoPath);
+
+      if (!safety.ok) {
+        feedback = safety.errors.join(" | ");
+        regressionSummary.reason = `The proposed test was unsafe: ${feedback}`;
+        continue;
+      }
+
+      const testProposal = shape.proposal;
+      const sha256 = hashTestContents(testProposal.contents);
+      regressionSummary.testName = testProposal.testName;
+      regressionSummary.relativePath = testProposal.relativePath;
+      regressionSummary.runner = testProposal.runner;
+      regressionSummary.sha256 = sha256;
+
+      // Exact generated bytes preserved as an artifact.
+      await writeFile(
+        path.join(store.dir, "regression-test-source.mjs"),
+        testProposal.contents,
+        "utf8",
+      );
+
+      const materialized = await materializeTest(input.repoPath, testProposal, sha256);
+
+      if (!materialized.ok) {
+        await materialized.remove();
+        feedback = "The materialized test bytes did not match the proposal hash.";
+        regressionSummary.reason = feedback;
+        continue;
+      }
+
+      const preRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
+        repoPath: input.repoPath,
+        relativePath: testProposal.relativePath,
+        targetUrl: input.plan.baseUrl,
+        appNetwork: input.appNetwork ?? null,
+        timeoutMs: input.regressionTimeoutMs,
+      });
+
+      await materialized.remove();
+      // Restore the pristine pre-patch workspace (a test could have written
+      // residue) and prove it: generation must never contaminate the source.
+      await runGit(input.repoPath, ["checkout", "--", "."]);
+      await runGit(input.repoPath, ["clean", "-fd"]);
+
+      // Guaranteed non-null by shape validation: exactly one marker exists.
+      const failureMarker = extractRegressionFailureMarker(testProposal.contents)!;
+      const classification = classifyPrePatchRun(preRun, failureMarker);
+      regressionSummary.prePatch = classification;
+
+      await store.writeJson("regression-prepatch-result.json", {
+        investigationId: input.investigationId,
+        fixAttemptId,
+        attempt,
+        classification,
+        exitCode: preRun.exitCode,
+        timedOut: preRun.timedOut,
+        durationMs: preRun.durationMs,
+        stdout: boundOutput(preRun.stdout),
+        stderr: boundOutput(preRun.stderr),
+      });
+
+      if (classification === "failed_as_expected") {
+        provenRegressionTest = testProposal;
+        regressionSummary.reason = null;
+        break;
+      }
+
+      if (classification === "unexpectedly_passed") {
+        regressionSummary.status = "blocked";
+        regressionSummary.reason =
+          "The generated test unexpectedly passed on the original, unpatched source, so it does not demonstrate the bug.";
+        await persistRegressionArtifact();
+        check("regression_test", false, regressionSummary.reason);
+        return finish(
+          "rejected_regression_test_failed",
+          `The generated regression test "${testProposal.testName}" unexpectedly passed on the original source; it cannot prove the fix.`,
+        );
+      }
+
+      // invalid_test / timed_out / execution_failed: not regression proof.
+      // One refinement attempt with the diagnostic output as feedback.
+      feedback = `The previous test was classified as ${classification}. It must fail on the buggy source specifically at the final behavioral assertion carrying the "${failureMarker}" message — a setup failure (wrong route, 404, missing fixture) is not behavioral proof. Use only routes from the verified reproduction plan. Bounded output: ${boundOutput(
+        preRun.stderr || preRun.stdout,
+      ).slice(0, 800)}`;
+      regressionSummary.reason = `The generated test did not produce a diagnostic pre-patch failure (${classification}).`;
+    }
+  }
+
+  await persistRegressionArtifact();
 
   // --- Apply patch in the isolated workspace -------------------------------
   await applyProposal(proposal, input.repoPath);
@@ -356,56 +541,203 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     );
   }
 
-  // --- Relevant tests --------------------------------------------------------
-  const { commands, targeted } = resolveTestCommands(proposal);
-  let testsPassed = true;
+  // --- Repository validation --------------------------------------------------
+  // Discovered from package.json (test/typecheck/lint/build), executed in
+  // restricted containers. Unavailable categories run nothing and are
+  // reported truthfully — never as a fake pass.
+  const validation = await runRepositoryValidation(input.docker ?? realDockerAdapter, {
+    repoPath: input.repoPath,
+    timeoutMs: input.validationTimeoutMs,
+  });
 
-  for (const [index, command] of commands.entries()) {
-    const run = await runTestCommand(
-      command,
-      input.repoPath,
-      store,
-      index,
-      targeted,
-      input.docker ?? realDockerAdapter,
-    );
-    result.testRuns.push(run);
+  result.repositoryValidation = {
+    aggregate: validation.aggregate,
+    categories: validation.results.map((item) => ({
+      category: item.category,
+      status: item.status,
+    })),
+  };
 
-    if (run.exitCode !== 0) {
-      testsPassed = false;
+  for (const item of validation.results) {
+    if (item.argv === null) {
+      continue;
     }
+
+    const stdoutFile = path.join(store.dir, `validation-${item.category}-stdout.log`);
+    const stderrFile = path.join(store.dir, `validation-${item.category}-stderr.log`);
+    await writeFile(stdoutFile, item.stdout, "utf8");
+    await writeFile(stderrFile, item.stderr, "utf8");
+
+    result.testRuns.push({
+      command: item.argv.join(" "),
+      exitCode: item.exitCode ?? 1,
+      durationMs: item.durationMs ?? 0,
+      targeted: false,
+      timedOut: item.status === "timed_out",
+      stdoutFile,
+      stderrFile,
+    });
   }
 
+  // Structured artifact; the large bounded logs live in the per-category
+  // files above, not duplicated here.
+  await store.writeJson("repository-validation.json", {
+    investigationId: input.investigationId,
+    fixAttemptId,
+    repository: input.repositoryLabel ?? null,
+    sourceCommit: input.sourceCommit,
+    workspaceState: { patched: true, changedFiles: result.changedFiles },
+    packageManager: validation.packageManager,
+    aggregate: validation.aggregate,
+    results: validation.results.map(({ stdout, stderr, ...rest }) => ({
+      ...rest,
+      stdoutChars: stdout.length,
+      stderrChars: stderr.length,
+    })),
+    startedAt: validation.startedAt,
+    finishedAt: validation.finishedAt,
+  });
+
   await store.writeJson("test-results.json", {
-    commands,
-    targeted,
+    source: "repository-validation",
     runs: result.testRuns,
   });
 
-  if (
-    !check(
-      "relevant_tests_passed",
-      testsPassed,
-      commands.length === 0
-        ? "No relevant test command was available; recorded as passed with no coverage."
-        : result.testRuns
-            .map((run) => `${run.command} -> exit ${run.exitCode}`)
-            .join(" | "),
-    )
-  ) {
+  const validationLines = validation.results
+    .map((item) => formatValidationLine(item))
+    .join(" | ");
+
+  if (validation.aggregate === "failed") {
+    check("repository_validation", false, validationLines);
+
+    const failures = validation.results
+      .filter((item) => item.status === "failed" || item.status === "timed_out")
+      .map((item) => `${item.argv?.join(" ")} (${item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`})`)
+      .join(", ");
+
     return finish(
       "rejected_tests_failed",
-      `The original failure disappeared, but relevant tests failed: ${result.testRuns
-        .filter((run) => run.exitCode !== 0)
-        .map((run) => run.command)
-        .join(", ")}`,
+      `The original failure disappeared, but repository validation failed: ${failures}`,
+    );
+  }
+
+  if (validation.aggregate === "not_available") {
+    check(
+      "repository_validation",
+      true,
+      "Repository validation was unavailable: package.json declares no test, typecheck, lint, or build scripts. Verification relies on the exact reproduction replay.",
+    );
+  } else {
+    check("repository_validation", true, validationLines);
+  }
+
+  // --- Regression test: post-patch run (identical bytes, identical hash) -----
+  if (provenRegressionTest !== null) {
+    const expectedSha = regressionSummary.sha256!;
+    const materialized = await materializeTest(
+      input.repoPath,
+      provenRegressionTest,
+      expectedSha,
+    );
+    regressionSummary.hashMatched = materialized.ok;
+
+    let postClassification: PostPatchClassification | null = null;
+
+    if (materialized.ok) {
+      const postRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
+        repoPath: input.repoPath,
+        relativePath: provenRegressionTest.relativePath,
+        targetUrl: restart.baseUrl ?? input.plan.baseUrl,
+        appNetwork: restart.appNetwork ?? null,
+        timeoutMs: input.regressionTimeoutMs,
+      });
+
+      postClassification = classifyPostPatchRun(postRun);
+
+      await store.writeJson("regression-postpatch-result.json", {
+        investigationId: input.investigationId,
+        fixAttemptId,
+        classification: postClassification,
+        exitCode: postRun.exitCode,
+        timedOut: postRun.timedOut,
+        durationMs: postRun.durationMs,
+        stdout: boundOutput(postRun.stdout),
+        stderr: boundOutput(postRun.stderr),
+      });
+    }
+
+    // The generated test is verification evidence only: it must be gone
+    // before the final diff, and only the intended patch files may remain.
+    await materialized.remove();
+
+    const residue = (await runGit(input.repoPath, ["status", "--short"]))
+      .split("\n")
+      .filter((line) => line.trim() !== "")
+      .map((line) => line.slice(3).split(" -> ").pop()!.trim());
+    const unexpectedResidue = residue.filter(
+      (file) => !result.changedFiles.includes(file),
+    );
+
+    regressionSummary.postPatch = postClassification;
+
+    const proven =
+      materialized.ok &&
+      postClassification === "passed" &&
+      unexpectedResidue.length === 0;
+
+    regressionSummary.status = proven ? "proven" : "blocked";
+
+    if (!proven) {
+      regressionSummary.reason = !materialized.ok
+        ? "The post-patch test bytes did not hash to the recorded pre-patch value; the runs are not comparable."
+        : unexpectedResidue.length > 0
+          ? `Unexpected files remained in the workspace after the regression run: ${unexpectedResidue.join(", ")}`
+          : `The regression test did not pass on the patched source (${postClassification}).`;
+
+      await persistRegressionArtifact();
+      check("regression_test", false, regressionSummary.reason);
+
+      return finish(
+        "rejected_regression_test_failed",
+        `The exact reproduction replay PASSED after the patch, but the generated regression test "${provenRegressionTest.testName}" did not cleanly pass, so the fix was rejected: ${regressionSummary.reason}`,
+      );
+    }
+
+    await persistRegressionArtifact();
+    check(
+      "regression_test",
+      true,
+      `Generated test "${provenRegressionTest.testName}" failed as expected before the patch and passed after it (identical sha256 ${expectedSha.slice(0, 12)}…).`,
+    );
+  } else {
+    // Neutral, truthful: no generated test exists, so nothing may claim one
+    // passed. Exact replay (and repository validation when available)
+    // carries verification.
+    check(
+      "regression_test",
+      true,
+      `No generated regression test was available: ${regressionSummary.reason ?? "generation is unsupported for this repository"}. Verification relies on the exact reproduction replay${validation.aggregate === "passed" ? " and repository validation" : ""}.`,
     );
   }
 
   return finish(
     "verified",
-    "The patch was applied, the application restarted, the exact saved reproduction no longer fails, and relevant tests passed.",
+    validation.aggregate === "not_available"
+      ? "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay."
+      : "The patch was applied, the application restarted, the exact saved reproduction no longer fails, and all available repository validation commands passed.",
   );
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const MAX_BOUNDED_OUTPUT_CHARS = 10_000;
+
+function boundOutput(text: string): string {
+  return text.length > MAX_BOUNDED_OUTPUT_CHARS
+    ? `${text.slice(0, MAX_BOUNDED_OUTPUT_CHARS)}\n…[truncated ${text.length - MAX_BOUNDED_OUTPUT_CHARS} chars]`
+    : text;
 }
 
 async function applyProposal(proposal: FixProposal, repoPath: string) {
@@ -426,62 +758,6 @@ async function applyProposal(proposal: FixProposal, repoPath: string) {
     }
 
     await writeFile(absolutePath, contents, "utf8");
-  }
-}
-
-function resolveTestCommands(proposal: FixProposal) {
-  if (proposal.relevantTests.length > 0) {
-    return { commands: proposal.relevantTests, targeted: true };
-  }
-
-  return { commands: [] as string[], targeted: false };
-}
-
-// Model-proposed test commands never run on the host: each executes in its
-// own short-lived restricted container (same image, workspace mount, env
-// policy, and limits as the app container) so it cannot contaminate the
-// running application. The command was already validated by
-// validateFixProposalShape to be a plain npm/npx/node command with no shell
-// operators, so whitespace-splitting into argv is exact — no shell anywhere.
-async function runTestCommand(
-  command: string,
-  repoPath: string,
-  store: ArtifactStore,
-  index: number,
-  targeted: boolean,
-  docker: DockerAdapter,
-): Promise<TestRunRecord> {
-  const stdoutFile = path.join(store.dir, `test-${index + 1}-stdout.log`);
-  const stderrFile = path.join(store.dir, `test-${index + 1}-stderr.log`);
-  const runtime = await createRuntimeWorkspace(repoPath);
-
-  try {
-    const run = await runContainerCommand(docker, {
-      purpose: "test",
-      workspacePath: runtime.path,
-      env: buildTargetEnv(),
-      command: command.trim().split(/\s+/),
-      timeoutMs: TEST_COMMAND_TIMEOUT_MS,
-    });
-
-    const stderr = run.timedOut
-      ? `${run.stderr}\nTest command timed out after ${TEST_COMMAND_TIMEOUT_MS}ms and its container was force-removed.`
-      : run.stderr;
-
-    await writeFile(stdoutFile, run.stdout, "utf8");
-    await writeFile(stderrFile, stderr, "utf8");
-
-    return {
-      command,
-      exitCode: run.exitCode,
-      durationMs: run.durationMs,
-      targeted,
-      timedOut: run.timedOut,
-      stdoutFile,
-      stderrFile,
-    };
-  } finally {
-    await runtime.cleanup();
   }
 }
 
