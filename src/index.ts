@@ -141,16 +141,6 @@ export const createSherlockApp =
         return;
       }
 
-      // Rate limit only counts authorized commands, so an unauthorized user
-      // cannot exhaust an installation's budget.
-      if (!rateLimiter.tryAcquire(installationId)) {
-        console.warn(
-          `Rate limit reached for installation ${installationId}; not enqueueing.`,
-        );
-        await postComment(RATE_LIMITED_COMMENT);
-        return;
-      }
-
       const investigationId = createInvestigationId();
       const tenantId = deriveTenantIdFromInstallation(installationId);
 
@@ -175,7 +165,11 @@ export const createSherlockApp =
         deliveryId: context.id ?? null,
       };
 
-      const { jobId, deduplicated } = await getQueue().add(jobPayload);
+      // The queue atomically claims this command before invoking onClaim.
+      // Thus only an authorized claim winner consumes a rate-limit slot.
+      const { jobId, deduplicated, rateLimited } = await getQueue().add(jobPayload, {
+        onClaim: () => rateLimiter.tryAcquire(installationId),
+      });
 
       if (deduplicated) {
         // Redelivered webhook for the same comment: the original job (and
@@ -183,6 +177,14 @@ export const createSherlockApp =
         console.log(
           `[${investigationId}] Duplicate delivery for job ${jobId}; not enqueueing again.`,
         );
+        return;
+      }
+
+      if (rateLimited) {
+        console.warn(
+          `Rate limit reached for installation ${installationId}; not enqueueing.`,
+        );
+        await postComment(RATE_LIMITED_COMMENT);
         return;
       }
 

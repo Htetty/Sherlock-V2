@@ -50,17 +50,25 @@ function buildWebhookPayload(commentId: number) {
 // real BullMQ adapter.
 function createFakeQueue() {
   const jobs = new Map<string, InvestigationJobPayload>();
+  const claims = new Set<string>();
 
   const adapter: InvestigationQueueAdapter = {
-    add: async (payload) => {
+    add: async (payload, options) => {
       const jobId = buildInvestigationJobId(payload);
 
-      if (jobs.has(jobId)) {
-        return { jobId, deduplicated: true };
+      if (claims.has(jobId)) {
+        return { jobId, deduplicated: true, rateLimited: false };
+      }
+
+      claims.add(jobId);
+
+      if (options?.onClaim && !(await options.onClaim())) {
+        claims.delete(jobId);
+        return { jobId, deduplicated: false, rateLimited: true };
       }
 
       jobs.set(jobId, payload);
-      return { jobId, deduplicated: false };
+      return { jobId, deduplicated: false, rateLimited: false };
     },
     close: async () => {},
   };
@@ -160,6 +168,67 @@ describe("Sherlock webhook (queued investigations)", () => {
     });
 
     expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("concurrent duplicate deliveries queue once and consume one rate-limit slot", async () => {
+    const mock = mockGithub(1);
+    let rateLimitSlots = 0;
+    const concurrentProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    concurrentProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: {
+          tryAcquire: () => {
+            rateLimitSlots += 1;
+            return true;
+          },
+        },
+      }),
+    );
+
+    await Promise.all([
+      concurrentProbot.receive({
+        id: "delivery-concurrent-1",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+      concurrentProbot.receive({
+        id: "delivery-concurrent-2",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+    ]);
+
+    expect(fake.jobs.size).toBe(1);
+    expect(rateLimitSlots).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("the same delivery id does not collapse different comment commands", async () => {
+    const mock = mockGithub(2);
+
+    await probot.receive({
+      id: "delivery-shared",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    await probot.receive({
+      id: "delivery-shared",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4343) as any,
+    });
+
+    expect(fake.jobs.size).toBe(2);
     expect(mock.pendingMocks()).toStrictEqual([]);
   });
 

@@ -27,6 +27,10 @@ export const INVESTIGATION_JOB_RETENTION = {
   removeOnFail: { age: 14 * 24 * 60 * 60, count: 5_000 }, // 14 days
 } as const;
 
+export const WEBHOOK_COMMAND_CLAIM_PREFIX = "sherlock:webhook-command:";
+export const WEBHOOK_COMMAND_CLAIM_TTL_SECONDS =
+  INVESTIGATION_JOB_RETENTION.removeOnComplete.age;
+
 export type InvestigationJobPayload = {
   investigationId: string;
   tenantId: string;
@@ -80,7 +84,8 @@ export function buildInvestigationJobId(input: {
 export type InvestigationQueueAdapter = {
   add: (
     payload: InvestigationJobPayload,
-  ) => Promise<{ jobId: string; deduplicated: boolean }>;
+    options?: { onClaim?: () => boolean | Promise<boolean> },
+  ) => Promise<{ jobId: string; deduplicated: boolean; rateLimited: boolean }>;
   close: () => Promise<void>;
 };
 
@@ -105,20 +110,50 @@ export function createInvestigationQueue(connection: Redis): Queue {
 
 export function createInvestigationQueueAdapter(
   connection: Redis = createRedisConnection(),
+  queue: Pick<Queue, "add" | "close"> = createInvestigationQueue(connection),
 ): InvestigationQueueAdapter {
-  const queue = createInvestigationQueue(connection);
-
   return {
-    add: async (payload) => {
+    add: async (payload, options) => {
       const jobId = buildInvestigationJobId(payload);
-      const existing = await queue.getJob(jobId);
+      const claimKey = `${WEBHOOK_COMMAND_CLAIM_PREFIX}${jobId}`;
+      const claimValue = JSON.stringify({
+        investigationId: payload.investigationId,
+        jobId,
+        createdAt: new Date().toISOString(),
+      });
+      const claimed = await connection.set(
+        claimKey,
+        claimValue,
+        "EX",
+        WEBHOOK_COMMAND_CLAIM_TTL_SECONDS,
+        "NX",
+      );
 
-      if (existing) {
-        return { jobId, deduplicated: true };
+      if (claimed !== "OK") {
+        return { jobId, deduplicated: true, rateLimited: false };
       }
 
-      await queue.add(INVESTIGATION_JOB_NAME, payload, { jobId });
-      return { jobId, deduplicated: false };
+      const releaseClaim = () =>
+        connection.eval(
+          "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+          1,
+          claimKey,
+          claimValue,
+        );
+
+      try {
+        if (options?.onClaim && !(await options.onClaim())) {
+          await releaseClaim();
+          return { jobId, deduplicated: false, rateLimited: true };
+        }
+
+        // BullMQ's deterministic job id remains a second safety layer.
+        await queue.add(INVESTIGATION_JOB_NAME, payload, { jobId });
+        return { jobId, deduplicated: false, rateLimited: false };
+      } catch (error) {
+        await releaseClaim();
+        throw error;
+      }
     },
     close: async () => {
       await queue.close();
