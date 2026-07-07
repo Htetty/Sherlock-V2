@@ -55,17 +55,25 @@ function buildWebhookPayload(
 
 function createFakeQueue() {
   const jobs = new Map<string, InvestigationJobPayload>();
+  const claims = new Set<string>();
 
   const adapter: InvestigationQueueAdapter = {
-    add: async (payload) => {
+    add: async (payload, options) => {
       const jobId = buildInvestigationJobId(payload);
 
-      if (jobs.has(jobId)) {
-        return { jobId, deduplicated: true };
+      if (claims.has(jobId)) {
+        return { jobId, deduplicated: true, rateLimited: false };
+      }
+
+      claims.add(jobId);
+
+      if (options?.onClaim && !(await options.onClaim())) {
+        claims.delete(jobId);
+        return { jobId, deduplicated: false, rateLimited: true };
       }
 
       jobs.set(jobId, payload);
-      return { jobId, deduplicated: false };
+      return { jobId, deduplicated: false, rateLimited: false };
     },
     close: async () => {},
   };
