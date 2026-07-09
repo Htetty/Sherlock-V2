@@ -2,9 +2,9 @@
 // investigation's lifecycle, kept separate from the rich per-investigation
 // artifacts under artifacts/<id>/.
 //
-// This is the first slice: a typed interface plus in-memory, file, and no-op
-// implementations. There is intentionally NO Supabase/Postgres backend yet —
-// the interface is the seam a persistent store will later implement.
+// Implementations: no-op (default), in-memory, file, and Supabase/Postgres.
+// All fold events through the same applyEvent reducer, so redaction runs
+// before any backend persists a record.
 //
 // Design contract:
 //   - Injectable/testable: the pipeline takes a store via PipelineOptions and
@@ -462,14 +462,279 @@ export function createFileInvestigationStateStore(
   };
 }
 
+// --- Supabase / Postgres store --------------------------------------------
+// One folded, redacted aggregate row per investigation in a single table
+// (see supabase/migrations/*_create_investigation_states.sql). The row is the
+// same InvestigationStateRecord every other store persists, stored in a JSONB
+// `record` column, plus a handful of safe scalar columns for dashboard
+// listing/filtering. Writes reuse applyEvent (so redaction always runs before
+// persistence) and never include issue bodies, comments, tokens, env, raw
+// webhook payloads, or raw events.
+
+export const DEFAULT_STATE_STORE_TABLE = "investigation_states";
+
+// The exact set of columns the store writes. inserted_at / db_updated_at are
+// database-managed (defaults + trigger) and deliberately never sent.
+export type InvestigationStateRow = {
+  investigation_id: string;
+  tenant_id: string | null;
+  installation_id: number | null;
+  repo_owner: string | null;
+  repo_name: string | null;
+  issue_number: number | null;
+  status: InvestigationStateRecord["status"];
+  stage: string | null;
+  outcome: string | null;
+  created_at: string | null;
+  updated_at: string;
+  finished_at: string | null;
+  record: InvestigationStateRecord;
+};
+
+// Minimal seam the store depends on — only the three operations it needs.
+// The production adapter wraps a real Supabase client; tests supply a fake
+// implementing this interface, so no real network calls are made.
+export interface SupabaseStateStoreClient {
+  fetchByInvestigationId(
+    investigationId: string,
+  ): Promise<InvestigationStateRecord | null>;
+  upsert(row: InvestigationStateRow): Promise<void>;
+  listByUpdatedAtDesc(): Promise<InvestigationStateRecord[]>;
+}
+
+// Map a folded record to the persisted row. Only safe scalars are lifted out;
+// tenant/installation are not part of the record yet and are stored as null.
+function investigationStateRecordToRow(
+  record: InvestigationStateRecord,
+): InvestigationStateRow {
+  return {
+    investigation_id: record.investigationId,
+    tenant_id: null,
+    installation_id: null,
+    repo_owner: record.repoOwner ?? null,
+    repo_name: record.repoName ?? null,
+    issue_number: record.issueNumber ?? null,
+    status: record.status,
+    stage: record.stage,
+    outcome: record.outcome,
+    created_at: record.createdAt,
+    updated_at: record.updatedAt,
+    finished_at: record.finishedAt,
+    record,
+  };
+}
+
+// Build the store from an injected client. Injectable/testable: the same
+// record()/get()/list() flow runs against a fake client in tests and a real
+// Supabase client in production.
+export function createSupabaseInvestigationStateStore(
+  client: SupabaseStateStoreClient,
+): InvestigationStateStore {
+  const assertSafeId = (investigationId: string) => {
+    if (!isInvestigationId(investigationId)) {
+      throw new Error(
+        "Refusing Supabase state-store operation for unsafe investigation id.",
+      );
+    }
+  };
+
+  return {
+    async record(event) {
+      assertSafeId(event.investigationId);
+      const current = await client.fetchByInvestigationId(event.investigationId);
+      const next = applyEvent(current, event);
+      await client.upsert(investigationStateRecordToRow(next));
+    },
+    async get(investigationId) {
+      assertSafeId(investigationId);
+      return client.fetchByInvestigationId(investigationId);
+    },
+    async list() {
+      return client.listByUpdatedAtDesc();
+    },
+  };
+}
+
+// The subset of the Supabase JS client surface the adapter uses. Kept as a
+// local structural type so the module does not couple to the SDK's generics.
+type SupabaseResponse<T> = { data: T; error: { message: string } | null };
+
+interface SupabaseClientLike {
+  from(table: string): {
+    select(columns: string): {
+      eq(
+        column: string,
+        value: string,
+      ): {
+        maybeSingle(): Promise<SupabaseResponse<{ record: unknown } | null>>;
+      };
+      order(
+        column: string,
+        options: { ascending: boolean },
+      ): Promise<SupabaseResponse<{ record: unknown }[] | null>>;
+    };
+    upsert(
+      values: Record<string, unknown>,
+      options: { onConflict: string },
+    ): Promise<SupabaseResponse<unknown>>;
+  };
+}
+
+// Adapter around a real (or real-shaped) Supabase client. Every response is
+// checked for an error and mapped into the minimal client interface.
+export function createSupabaseStateStoreClient(
+  supabase: SupabaseClientLike,
+  table: string = DEFAULT_STATE_STORE_TABLE,
+): SupabaseStateStoreClient {
+  return {
+    async fetchByInvestigationId(investigationId) {
+      const { data, error } = await supabase
+        .from(table)
+        .select("record")
+        .eq("investigation_id", investigationId)
+        .maybeSingle();
+
+      if (error) {
+        throw new Error(`Supabase state-store read failed: ${error.message}`);
+      }
+
+      return data ? ((data.record as InvestigationStateRecord) ?? null) : null;
+    },
+    async upsert(row) {
+      const { error } = await supabase
+        .from(table)
+        .upsert(row as unknown as Record<string, unknown>, {
+          onConflict: "investigation_id",
+        });
+
+      if (error) {
+        throw new Error(`Supabase state-store write failed: ${error.message}`);
+      }
+    },
+    async listByUpdatedAtDesc() {
+      const { data, error } = await supabase
+        .from(table)
+        .select("record")
+        .order("updated_at", { ascending: false });
+
+      if (error) {
+        throw new Error(`Supabase state-store list failed: ${error.message}`);
+      }
+
+      return (data ?? []).map((entry) => entry.record as InvestigationStateRecord);
+    },
+  };
+}
+
+export function getSupabaseStateStoreTable(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  return env.SHERLOCK_STATE_STORE_TABLE ?? DEFAULT_STATE_STORE_TABLE;
+}
+
+// Names of the required Supabase env vars that are missing (empty when the
+// store is fully configured). Shared with the worker preflight.
+export function missingSupabaseStateStoreEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const missing: string[] = [];
+  if (!env.SUPABASE_URL) missing.push("SUPABASE_URL");
+  if (!env.SUPABASE_SERVICE_ROLE_KEY) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  return missing;
+}
+
+// When Supabase mode is selected but credentials are missing, return a store
+// that throws a clear error on every operation. record() failures are swallowed
+// by the pipeline/worker (best-effort, non-fatal); get()/list() surface the
+// misconfiguration to a dashboard/preflight.
+function createMisconfiguredSupabaseStore(
+  missing: string[],
+): InvestigationStateStore {
+  const fail = (): never => {
+    throw new Error(
+      `Supabase state store is selected (SHERLOCK_STATE_STORE=supabase) but ${missing.join(
+        " and ",
+      )} ${missing.length > 1 ? "are" : "is"} not set.`,
+    );
+  };
+
+  return {
+    async record() {
+      fail();
+    },
+    async get() {
+      return fail();
+    },
+    async list() {
+      return fail();
+    },
+  };
+}
+
+// Lazily constructs the real Supabase client on first use, so the SDK is only
+// loaded when a Supabase store is actually exercised and the env factory stays
+// synchronous. The service role key lives only on the backend/worker.
+function createLazySupabaseStateStoreClient(
+  url: string,
+  serviceRoleKey: string,
+  table: string,
+): SupabaseStateStoreClient {
+  let inner: SupabaseStateStoreClient | null = null;
+
+  const ensure = async (): Promise<SupabaseStateStoreClient> => {
+    if (!inner) {
+      const { createClient } = await import("@supabase/supabase-js");
+      const supabase = createClient(url, serviceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      }) as unknown as SupabaseClientLike;
+      inner = createSupabaseStateStoreClient(supabase, table);
+    }
+    return inner;
+  };
+
+  return {
+    async fetchByInvestigationId(investigationId) {
+      return (await ensure()).fetchByInvestigationId(investigationId);
+    },
+    async upsert(row) {
+      return (await ensure()).upsert(row);
+    },
+    async listByUpdatedAtDesc() {
+      return (await ensure()).listByUpdatedAtDesc();
+    },
+  };
+}
+
+export function createSupabaseInvestigationStateStoreFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): InvestigationStateStore {
+  const missing = missingSupabaseStateStoreEnv(env);
+
+  if (missing.length > 0) {
+    return createMisconfiguredSupabaseStore(missing);
+  }
+
+  return createSupabaseInvestigationStateStore(
+    createLazySupabaseStateStoreClient(
+      env.SUPABASE_URL as string,
+      env.SUPABASE_SERVICE_ROLE_KEY as string,
+      getSupabaseStateStoreTable(env),
+    ),
+  );
+}
+
 // Environment-driven factory used by the worker and HTTP server. Defaults to
 // the no-op store so production behavior is unchanged until state persistence
-// is explicitly enabled with SHERLOCK_STATE_STORE=file.
+// is explicitly enabled with SHERLOCK_STATE_STORE=file or =supabase.
 export function createInvestigationStateStoreFromEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): InvestigationStateStore {
   if (env.SHERLOCK_STATE_STORE === "file") {
     return createFileInvestigationStateStore(getStateStoreRoot(env));
+  }
+
+  if (env.SHERLOCK_STATE_STORE === "supabase") {
+    return createSupabaseInvestigationStateStoreFromEnv(env);
   }
 
   return createNoopInvestigationStateStore();

@@ -16,6 +16,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { redactSecrets } from "./services/report.js";
+import { missingSupabaseStateStoreEnv } from "./services/investigation-state-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -147,6 +148,27 @@ export async function runWorkerPreflight(
       "PASS",
       `REDIS_URL is not set; using the default ${DEFAULT_REDIS_URL}.`,
     );
+  }
+
+  // --- State store (only when Supabase persistence is explicitly selected) --
+  // Names only; the service role key value is never read or printed here.
+  if (env.SHERLOCK_STATE_STORE === "supabase") {
+    const missing = missingSupabaseStateStoreEnv(env);
+    if (missing.length === 0) {
+      add(
+        "state-store:supabase",
+        "PASS",
+        "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are set.",
+      );
+    } else {
+      add(
+        "state-store:supabase",
+        "FAIL",
+        `SHERLOCK_STATE_STORE=supabase but ${missing.join(" and ")} ${
+          missing.length > 1 ? "are" : "is"
+        } not set.`,
+      );
+    }
   }
 
   // --- Toolchain -----------------------------------------------------------

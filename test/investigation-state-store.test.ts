@@ -2,20 +2,48 @@ import { access, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { fileURLToPath } from "node:url";
 import {
   applyEvent,
   createFileInvestigationStateStore,
   createInMemoryInvestigationStateStore,
   createInvestigationStateStoreFromEnv,
   createNoopInvestigationStateStore,
+  createSupabaseInvestigationStateStore,
   resolveStateFilePath,
   safeRepoUrl,
   type InvestigationStateEvent,
   type InvestigationStateRecord,
+  type InvestigationStateRow,
   type InvestigationStateStore,
+  type SupabaseStateStoreClient,
 } from "../backend/services/investigation-state-store.js";
 import { runInvestigationPipeline } from "../backend/services/investigation.js";
 import { RepositoryError } from "../backend/services/repo-auth.js";
+
+// In-memory fake of the minimal Supabase client seam. No network calls; rows
+// are keyed by investigation_id exactly like the upsert on-conflict target.
+function createFakeSupabaseClient() {
+  const rows = new Map<string, InvestigationStateRow>();
+  const calls = { upsert: 0, fetch: 0, list: 0 };
+  const client: SupabaseStateStoreClient = {
+    async fetchByInvestigationId(investigationId) {
+      calls.fetch += 1;
+      return rows.get(investigationId)?.record ?? null;
+    },
+    async upsert(row) {
+      calls.upsert += 1;
+      rows.set(row.investigation_id, row);
+    },
+    async listByUpdatedAtDesc() {
+      calls.list += 1;
+      return [...rows.values()]
+        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+        .map((row) => row.record);
+    },
+  };
+  return { rows, calls, client };
+}
 
 const INV = "inv_123ABC456DEF";
 
@@ -231,6 +259,37 @@ describe("no-op and env factory", () => {
     } as NodeJS.ProcessEnv);
     expect(typeof enabled.get).toBe("function");
   });
+
+  test("env factory returns a Supabase store only when SHERLOCK_STATE_STORE=supabase", () => {
+    // Not selected: unrelated modes never take the Supabase branch.
+    expect(
+      createInvestigationStateStoreFromEnv({
+        SUPABASE_URL: "https://example.supabase.co",
+        SUPABASE_SERVICE_ROLE_KEY: "redact-me",
+      } as NodeJS.ProcessEnv).get,
+    ).toBeUndefined();
+
+    // Selected + configured: a real store with read helpers, constructed
+    // lazily (no client/network work until first use).
+    const configured = createInvestigationStateStoreFromEnv({
+      SHERLOCK_STATE_STORE: "supabase",
+      SUPABASE_URL: "https://example.supabase.co",
+      SUPABASE_SERVICE_ROLE_KEY: "redact-me",
+    } as NodeJS.ProcessEnv);
+    expect(typeof configured.get).toBe("function");
+    expect(typeof configured.list).toBe("function");
+  });
+
+  test("Supabase mode with missing env yields a store that fails clearly on get/list", async () => {
+    const store = createInvestigationStateStoreFromEnv({
+      SHERLOCK_STATE_STORE: "supabase",
+    } as NodeJS.ProcessEnv);
+
+    await expect(store.get?.(INV)).rejects.toThrow(/SUPABASE_URL/);
+    await expect(store.list?.()).rejects.toThrow(
+      /SUPABASE_SERVICE_ROLE_KEY/,
+    );
+  });
 });
 
 describe("metadata redaction", () => {
@@ -323,6 +382,167 @@ describe("file store path hardening", () => {
   });
 });
 
+describe("supabase store", () => {
+  test("record() folds events and upserts one aggregate row per investigation", async () => {
+    const fake = createFakeSupabaseClient();
+    const store = createSupabaseInvestigationStateStore(fake.client);
+
+    const events = lifecycleEvents();
+    for (const event of events) {
+      await store.record(event);
+    }
+
+    // One row for the investigation, upserted once per event.
+    expect(fake.rows.size).toBe(1);
+    expect(fake.calls.upsert).toBe(events.length);
+
+    const row = fake.rows.get(INV)!;
+    // Safe scalar columns are lifted out of the folded record...
+    expect(row.investigation_id).toBe(INV);
+    expect(row.status).toBe("finished");
+    expect(row.stage).toBe("fixing");
+    expect(row.outcome).toBe("verified_fix");
+    expect(row.repo_owner).toBe("acme");
+    expect(row.repo_name).toBe("web");
+    expect(row.issue_number).toBe(7);
+    expect(row.updated_at).toBe("2026-07-08T00:00:08.000Z");
+    // ...and the full folded record lives in the JSONB column.
+    expect(row.record.pullRequest?.number).toBe(42);
+  });
+
+  test("get() maps a stored row back to an InvestigationStateRecord", async () => {
+    const fake = createFakeSupabaseClient();
+    const store = createSupabaseInvestigationStateStore(fake.client);
+    for (const event of lifecycleEvents()) {
+      await store.record(event);
+    }
+
+    const record = await store.get?.(INV);
+    expect(record?.investigationId).toBe(INV);
+    expect(record?.outcome).toBe("verified_fix");
+    expect(await store.get?.("inv_DOESNOTEXIST0")).toBeNull();
+  });
+
+  test("list() returns records ordered by updated_at descending", async () => {
+    const fake = createFakeSupabaseClient();
+    const store = createSupabaseInvestigationStateStore(fake.client);
+
+    const older = "inv_0000000000A";
+    const newer = "inv_0000000000B";
+    await store.record({
+      type: "stage_changed",
+      investigationId: older,
+      at: "2026-07-08T00:00:00.000Z",
+      stage: "running",
+    });
+    await store.record({
+      type: "stage_changed",
+      investigationId: newer,
+      at: "2026-07-08T05:00:00.000Z",
+      stage: "running",
+    });
+
+    const records = await store.list?.();
+    expect(records?.map((record) => record.investigationId)).toEqual([
+      newer,
+      older,
+    ]);
+  });
+
+  test("record() rejects unsafe investigation ids before touching the client", async () => {
+    const fake = createFakeSupabaseClient();
+    const store = createSupabaseInvestigationStateStore(fake.client);
+
+    await expect(
+      store.record({
+        type: "stage_changed",
+        investigationId: "../escape",
+        at: "2026-07-08T00:00:00.000Z",
+        stage: "running",
+      }),
+    ).rejects.toThrow();
+    expect(fake.calls.upsert).toBe(0);
+  });
+
+  test("client errors surface from store methods (callers decide fatality)", async () => {
+    const failing: SupabaseStateStoreClient = {
+      async fetchByInvestigationId() {
+        return null;
+      },
+      async upsert() {
+        throw new Error("Supabase state-store write failed: db unreachable");
+      },
+      async listByUpdatedAtDesc() {
+        throw new Error("Supabase state-store list failed: db unreachable");
+      },
+    };
+    const store = createSupabaseInvestigationStateStore(failing);
+
+    await expect(store.record(lifecycleEvents()[0])).rejects.toThrow(/db unreachable/);
+    await expect(store.list?.()).rejects.toThrow(/db unreachable/);
+  });
+
+  test("persists no raw issue body, comment, token, or env fields", async () => {
+    const fake = createFakeSupabaseClient();
+    const store = createSupabaseInvestigationStateStore(fake.client);
+    for (const event of lifecycleEvents()) {
+      await store.record(event);
+    }
+
+    const row = fake.rows.get(INV)!;
+    // The persisted row's columns are exactly the safe, folded set.
+    expect(Object.keys(row).sort()).toEqual(
+      [
+        "created_at",
+        "finished_at",
+        "installation_id",
+        "issue_number",
+        "outcome",
+        "record",
+        "repo_name",
+        "repo_owner",
+        "stage",
+        "status",
+        "tenant_id",
+        "updated_at",
+        "investigation_id",
+      ].sort(),
+    );
+
+    const serialized = JSON.stringify(row);
+    for (const forbidden of [
+      "issueBody",
+      "triggerComment",
+      "installationToken",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "issue_body",
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
+  });
+});
+
+describe("supabase migration", () => {
+  test("migration file exists and enables RLS without a public read policy", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const migrationPath = path.join(
+      repoRoot,
+      "supabase",
+      "migrations",
+      "20260708000000_create_investigation_states.sql",
+    );
+
+    const sql = await readFile(migrationPath, "utf8");
+    expect(sql).toContain("create table if not exists public.investigation_states");
+    expect(sql.toLowerCase()).toContain("enable row level security");
+    // The investigation_id primary-key check is present.
+    expect(sql).toContain("^inv_[0-9A-Z]{10,}$");
+    // No anon read policy is granted.
+    expect(sql.toLowerCase()).not.toContain("to anon");
+    expect(sql.toLowerCase()).not.toContain("create policy");
+  });
+});
+
 describe("pipeline lifecycle writes", () => {
   const basePayload = {
     repoOwner: "acme",
@@ -380,5 +600,22 @@ describe("pipeline lifecycle writes", () => {
     expect(attempts).toBeGreaterThan(0);
     expect(result.outcome).toBe("environment_failed");
     expect(result.githubComment).toContain("environment");
+  });
+
+  test("misconfigured Supabase mode (missing env) stays non-fatal through recordState", async () => {
+    // Explicit Supabase selection with no credentials: every record() throws,
+    // but the pipeline swallows state writes and still completes normally.
+    const store = createInvestigationStateStoreFromEnv({
+      SHERLOCK_STATE_STORE: "supabase",
+    } as NodeJS.ProcessEnv);
+
+    const result = await runInvestigationPipeline(basePayload, {
+      stateStore: store,
+      cloneRepo: async () => {
+        throw new RepositoryError("access_denied", "no access", false);
+      },
+    });
+
+    expect(result.outcome).toBe("environment_failed");
   });
 });
