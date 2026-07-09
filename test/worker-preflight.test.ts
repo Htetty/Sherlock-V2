@@ -111,6 +111,40 @@ describe("worker preflight", () => {
     expect(viaMissingPath.ok).toBe(false);
   });
 
+  test("Supabase state-store env is validated only when that mode is selected", async () => {
+    // Not selected: no state-store check appears at all.
+    const noStore = await runWorkerPreflight(passingDeps());
+    expect(statusOf(noStore, "state-store:supabase")).toBeUndefined();
+
+    // Selected but missing credentials: mandatory FAIL, names only.
+    const missing = await runWorkerPreflight(
+      passingDeps({
+        env: { ...fullEnv, SHERLOCK_STATE_STORE: "supabase" } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(statusOf(missing, "state-store:supabase")).toBe("FAIL");
+    expect(missing.ok).toBe(false);
+    const detail = missing.checks.find(
+      (c) => c.name === "state-store:supabase",
+    )?.detail;
+    expect(detail).toContain("SUPABASE_URL");
+    expect(detail).toContain("SUPABASE_SERVICE_ROLE_KEY");
+
+    // Selected + configured: PASS. Placeholder credentials only.
+    const configured = await runWorkerPreflight(
+      passingDeps({
+        env: {
+          ...fullEnv,
+          SHERLOCK_STATE_STORE: "supabase",
+          SUPABASE_URL: "https://example.supabase.co",
+          SUPABASE_SERVICE_ROLE_KEY: "redact-me",
+        } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(statusOf(configured, "state-store:supabase")).toBe("PASS");
+    expect(configured.ok).toBe(true);
+  });
+
   test("git, Docker CLI, daemon, and target-image failures are mandatory failures", async () => {
     const gitMissing = await runWorkerPreflight(
       passingDeps({

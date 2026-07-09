@@ -11,7 +11,7 @@
 # are siblings, any bind-mounted clone path must exist from the DAEMON
 # host's perspective — see docs/production-worker.md.
 
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 
 # git for cloning; curl/ca-certificates for the Docker CLI and uv installs.
 RUN apt-get update && apt-get install -y --no-install-recommends \

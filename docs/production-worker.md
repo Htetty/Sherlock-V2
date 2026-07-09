@@ -10,7 +10,7 @@ host with `npm run worker:check`.
 
 | Dependency | Why | Check |
 | --- | --- | --- |
-| Node `^20.18.1 \|\| >=22` | worker runtime | — |
+| Node `>=22` | worker runtime (required by `@supabase/supabase-js`) | — |
 | `git` | repository cloning | mandatory |
 | Docker CLI + reachable daemon | target apps and all validation/regression commands run in restricted containers | mandatory |
 | Target image (`SHERLOCK_TARGET_IMAGE`, default `node:20-slim`) | base image for target containers | mandatory (pullable is enough) |
@@ -28,6 +28,10 @@ Required environment variables (values are never printed by any check):
 - `ANTHROPIC_API_KEY` — plan/fix/regression generation
 - `REDIS_URL` — optional; the default is reported explicitly when unset
 - `SHERLOCK_TARGET_IMAGE`, `ARTIFACTS_DIR`, `SHERLOCK_DATA_DIR` — optional overrides
+- `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable
+  investigation-state persistence (see "Investigation state store" below).
+  When `supabase`, also set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
+  (backend/worker only)
 
 ## Preflight: `npm run worker:check`
 
@@ -85,9 +89,57 @@ on the host, or run the worker directly on the daemon host). If the paths
 are not aligned, target containers see empty `/app` mounts and every
 investigation fails as `environment_failed`.
 
+## Investigation state store (optional)
+
+The worker records a small, dashboard-friendly summary of each investigation's
+lifecycle (status, stage, reproduction/fixer/PR outcomes, redacted errors)
+through the `InvestigationStateStore` abstraction. It is separate from the rich
+artifacts under `ARTIFACTS_DIR` and is **best-effort**: a failing store logs a
+warning and never fails an investigation.
+
+Select a backend with `SHERLOCK_STATE_STORE` (default: no-op, records nothing):
+
+| `SHERLOCK_STATE_STORE` | Backend | Notes |
+| --- | --- | --- |
+| unset / anything else | no-op | default; nothing persisted |
+| `file` | local JSON | one file per investigation under `SHERLOCK_STATE_STORE_DIR` (default `ARTIFACTS_DIR/_state`) |
+| `supabase` | Supabase/Postgres | durable; one folded row per investigation |
+
+### Supabase backend
+
+Environment variables (backend/worker only — never ship the service role key
+to browser/client code):
+
+- `SHERLOCK_STATE_STORE=supabase`
+- `SUPABASE_URL` — e.g. `https://example.supabase.co`
+- `SUPABASE_SERVICE_ROLE_KEY=redact-me` — service role key; backend-only
+- `SHERLOCK_STATE_STORE_TABLE` — optional, defaults to `investigation_states`
+
+Apply the migration in `supabase/migrations/` (via the Supabase CLI or SQL
+editor) to create `public.investigation_states`. The table stores only the
+folded, redacted `InvestigationStateRecord` (JSONB) plus safe scalar columns
+for listing/filtering — never issue bodies, trigger-comment bodies,
+installation tokens, environment variables, raw webhook payloads, or raw
+events.
+
+Security:
+
+- Row Level Security is **enabled with no policies**: `anon` and
+  `authenticated` roles are denied. The backend uses the service role key,
+  which bypasses RLS. Do **not** add a public anon read policy — dashboard
+  reads will come later through a backend API or explicit scoped policies.
+- The service role key is a backend/worker secret. Keep it out of any
+  client-side bundle or public config.
+- When `SHERLOCK_STATE_STORE=supabase` and `SUPABASE_URL` or
+  `SUPABASE_SERVICE_ROLE_KEY` is missing, runtime writes stay non-fatal
+  (swallowed by the pipeline) and `npm run worker:check` fails clearly
+  (`state-store:supabase`).
+
 ## Not included (deliberately, for now)
 
-- database or object storage (artifacts and memory stay on local disk)
+- object storage (artifacts and memory stay on local disk; only the compact
+  investigation *state* summary can be persisted to Supabase)
+- dashboard UI, auth UI, and billing
 - outbound network policy for target containers (documented risk)
 - durable webhook idempotency beyond Redis job retention
 - deployment-platform-specific compose/manifests (`compose.yml` remains
