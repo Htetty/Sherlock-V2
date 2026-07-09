@@ -411,7 +411,6 @@ export async function runFixerAgent(
       const message = await createMessage({
         model: MODEL,
         max_tokens: budgets.maxResponseTokens,
-        temperature: 0,
         system: buildSystemPrompt(budgets),
         tools: TOOLS,
         tool_choice: { type: "any", disable_parallel_tool_use: true },

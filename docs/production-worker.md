@@ -26,6 +26,8 @@ Required environment variables (values are never printed by any check):
 - `APP_ID` — GitHub App id
 - `PRIVATE_KEY` **or** `PRIVATE_KEY_PATH` — GitHub App private key
 - `ANTHROPIC_API_KEY` — plan/fix/regression generation
+- `ANTHROPIC_MODEL` — optional; overrides the default Anthropic model
+  (`claude-sonnet-5`) used for all model calls
 - `REDIS_URL` — optional; the default is reported explicitly when unset
 - `SHERLOCK_TARGET_IMAGE`, `ARTIFACTS_DIR`, `SHERLOCK_DATA_DIR` — optional overrides
 - `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable

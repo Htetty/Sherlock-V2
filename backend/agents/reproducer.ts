@@ -596,7 +596,6 @@ export async function runReproducerAgent(
       const message = await createMessage({
         model: MODEL,
         max_tokens: budgets.maxResponseTokens,
-        temperature: 0,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
         tool_choice: { type: "any", disable_parallel_tool_use: true },

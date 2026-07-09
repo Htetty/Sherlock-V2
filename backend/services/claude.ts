@@ -22,7 +22,17 @@ function getClient(): Anthropic {
   return client;
 }
 
-export const MODEL = "claude-sonnet-4-6";
+// Centralized Anthropic model selection. Every model call in the codebase
+// resolves through this — do not hardcode model IDs elsewhere. Override with
+// the ANTHROPIC_MODEL environment variable; otherwise fall back to the
+// confirmed default below.
+export const DEFAULT_MODEL = "claude-sonnet-5";
+
+export function resolveModel(env: NodeJS.ProcessEnv = process.env): string {
+  return env.ANTHROPIC_MODEL?.trim() || DEFAULT_MODEL;
+}
+
+export const MODEL = resolveModel();
 const MAX_PROMPT_LOG_CHARS = 8_000;
 const MAX_PROMPT_HTML_CHARS = 8_000;
 const MAX_PROMPT_API_BODY_CHARS = 4_000;
@@ -31,7 +41,14 @@ const MAX_PROMPT_API_BODY_CHARS = 4_000;
 export function createModelMessage(
   params: Anthropic.Messages.MessageCreateParamsNonStreaming,
 ): Promise<Anthropic.Messages.Message> {
-  return getClient().messages.create(params);
+  // Sonnet 5 turns on adaptive thinking whenever `thinking` is omitted (Sonnet
+  // 4.6 ran with thinking off). These prompts expect direct, deterministic
+  // output and parse the response text directly, so keep thinking disabled
+  // unless a caller opts in. Callers may still override by passing `thinking`.
+  return getClient().messages.create({
+    thinking: { type: "disabled" },
+    ...params,
+  });
 }
 
 export type AnalyzeIssueInput = {
@@ -160,7 +177,6 @@ Respond again with ONLY the JSON object matching the exact shape shown above. Do
     const message = await createModelMessage({
       model: MODEL,
       max_tokens: 2_500,
-      temperature: 0,
       messages: [
         {
           role: "user",
@@ -350,7 +366,6 @@ Patched files (if any): ${input.changedFiles.join(", ") || "(none)"}
   const message = await createModelMessage({
     model: MODEL,
     max_tokens: 400,
-    temperature: 0,
     messages: [
       {
         role: "user",
