@@ -239,6 +239,21 @@ export type PullRequestCommentSummary = {
   reason?: string | null;
 };
 
+const MAX_ANALYSIS_CHARS = 900;
+
+export function formatAnalysisComment(analysis: unknown): string | null {
+  const text = extractAnalysisText(analysis);
+
+  if (!text) {
+    return null;
+  }
+
+  return [
+    "Analysis:",
+    truncate(redactSecrets(text.replace(/\s+\n/g, "\n").trim()), MAX_ANALYSIS_CHARS),
+  ].join("\n");
+}
+
 export function formatPullRequestComment(summary: PullRequestCommentSummary): string {
   const lines: string[] = [];
 
@@ -272,6 +287,24 @@ export function formatPullRequestComment(summary: PullRequestCommentSummary): st
   }
 
   return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
+}
+
+function extractAnalysisText(analysis: unknown): string | null {
+  if (typeof analysis === "string") {
+    return analysis;
+  }
+
+  if (
+    analysis &&
+    typeof analysis === "object" &&
+    "type" in analysis &&
+    (analysis as { type?: unknown }).type === "text" &&
+    typeof (analysis as { text?: unknown }).text === "string"
+  ) {
+    return (analysis as unknown as { text: string }).text;
+  }
+
+  return null;
 }
 
 function truncate(text: string, maxChars: number) {

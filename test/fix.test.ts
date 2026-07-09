@@ -8,7 +8,7 @@ delete process.env.ANTHROPIC_API_KEY;
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, readFile, writeFile, stat, symlink } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -134,6 +134,7 @@ process.exit(status === 401 ? 0 : 1);
 // and lifecycle the real adapter would receive.
 function createHostEmulatingDocker() {
   const containerNames: string[] = [];
+  const workspaces: string[] = [];
   const removed: string[] = [];
 
   const adapter: DockerAdapter = {
@@ -142,6 +143,7 @@ function createHostEmulatingDocker() {
       containerNames.push(args[args.indexOf("--name") + 1]);
       const volume = args[args.indexOf("-v") + 1];
       const cwd = volume.slice(0, volume.lastIndexOf(":"));
+      workspaces.push(cwd);
       const imageIndex = args.indexOf(CONTAINER_DEFAULTS.image);
       const argv = args.slice(imageIndex + 1);
 
@@ -161,7 +163,7 @@ function createHostEmulatingDocker() {
     },
   };
 
-  return { adapter, containerNames, removed };
+  return { adapter, containerNames, workspaces, removed };
 }
 
 let runningApps: ChildProcess[] = [];
@@ -400,11 +402,16 @@ describe("verified fix loop", () => {
         ],
       });
 
-      // The validation command ran in its own short-lived container (not
-      // the app container) and was force-removed afterwards.
-      expect(docker.containerNames).toHaveLength(1);
-      expect(docker.containerNames[0]).toMatch(/^sherlock-validate-test-/);
+      // Verification installed dependencies in a .git-less runtime copy, then
+      // validation ran in that runtime copy instead of the trusted clone.
+      expect(docker.containerNames).toHaveLength(2);
+      expect(docker.containerNames[0]).toMatch(/^sherlock-install-verification-/);
+      expect(docker.containerNames[1]).toMatch(/^sherlock-validate-test-/);
+      expect(docker.workspaces[0]).not.toBe(setup.repoPath);
+      expect(docker.workspaces[1]).toBe(docker.workspaces[0]);
+      await expect(access(path.join(docker.workspaces[0], ".git"))).rejects.toThrow();
       expect(docker.removed).toContain(docker.containerNames[0]);
+      expect(docker.removed).toContain(docker.containerNames[1]);
 
       // The exact saved plan was replayed (hash recorded, steps untouched).
       const replayCheck = attempt.checks.find((c) => c.name === "exact_plan_replayed");
@@ -476,6 +483,47 @@ describe("verified fix loop", () => {
   );
 
   test(
+    "patch replacement text treats dollar tokens literally",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation({
+        test: "node check-login.mjs",
+      });
+      const docker = createHostEmulatingDocker();
+      const tokenLine = "      // Replacement tokens must stay literal: $& $1 $` $'";
+
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: setup.plan,
+        originalOutcome: setup.original.outcome,
+        proposal: correctProposal({
+          files: [
+            {
+              path: "server.mjs",
+              edits: [
+                {
+                  oldText: BUGGY_RESPONSE,
+                  newText: `${tokenLine}\n${FIXED_RESPONSE}`,
+                },
+              ],
+            },
+          ],
+        }),
+        restart: setup.restart,
+        docker: docker.adapter,
+      });
+
+      expect(attempt.outcome).toBe("verified");
+      const source = await readFile(path.join(setup.repoPath, "server.mjs"), "utf8");
+      expect(source).toContain(tokenLine);
+      expect(source).not.toContain(`${BUGGY_RESPONSE} $1`);
+    },
+  );
+
+  test(
     "a patch that fixes the bug but fails repository validation is rejected_tests_failed",
     { timeout: 120_000 },
     async () => {
@@ -516,8 +564,9 @@ describe("verified fix loop", () => {
 
       // Each validation command got its own uniquely named short-lived
       // container, and both were cleaned up.
-      expect(docker.containerNames).toHaveLength(2);
-      expect(new Set(docker.containerNames).size).toBe(2);
+      expect(docker.containerNames).toHaveLength(3);
+      expect(new Set(docker.containerNames).size).toBe(3);
+      expect(docker.containerNames[0]).toMatch(/^sherlock-install-verification-/);
 
       for (const name of docker.containerNames) {
         expect(docker.removed).toContain(name);
@@ -599,6 +648,7 @@ describe("verified fix loop", () => {
 
       // Forced cleanup ran for the timed-out container.
       expect(docker.removed).toContain(docker.containerNames[0]);
+      expect(docker.removed).toContain(docker.containerNames[1]);
     },
   );
 

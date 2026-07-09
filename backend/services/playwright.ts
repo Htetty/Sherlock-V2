@@ -25,6 +25,9 @@ const STEP_SETTLE_MS = 1_000;
 const BASE_URL_PROBE_TIMEOUT_MS = 10_000;
 const MAX_EVENTS = 1_000;
 const MAX_HTTP_RESPONSES = 300;
+const MAX_CONSOLE_ERRORS = 100;
+const MAX_PAGE_ERRORS = 50;
+const MAX_NETWORK_FAILURES = 300;
 const MAX_API_RESPONSE_BODY_CHARS = 64 * 1024;
 const MAX_RESULT_HTML_CHARS = 64 * 1024;
 
@@ -70,6 +73,12 @@ export type ApiResponseRecord = HttpResponseRecord & {
   originalBodyLength?: number;
 };
 
+export type EvidenceTruncation = {
+  consoleErrorsDropped: number;
+  pageErrorsDropped: number;
+  networkFailuresDropped: number;
+};
+
 export type AssertionResult = {
   assertion: PlanAssertion;
   observed: string | null;
@@ -101,6 +110,7 @@ export type ReproductionResult = {
   assertion: AssertionResult | null;
   events: PlaywrightEvent[];
   html: string;
+  evidenceTruncation?: EvidenceTruncation;
   htmlTruncated?: boolean;
   originalHtmlLength?: number;
 };
@@ -117,6 +127,7 @@ export type SessionEvidence = {
   apiResponses: ApiResponseRecord[];
   events: PlaywrightEvent[];
   screenshots: string[];
+  truncation: EvidenceTruncation;
 };
 
 function createSessionEvidence(): SessionEvidence {
@@ -128,6 +139,11 @@ function createSessionEvidence(): SessionEvidence {
     apiResponses: [],
     events: [],
     screenshots: [],
+    truncation: {
+      consoleErrorsDropped: 0,
+      pageErrorsDropped: 0,
+      networkFailuresDropped: 0,
+    },
   };
 }
 
@@ -144,25 +160,43 @@ function attachEvidenceListeners(page: Page, evidence: SessionEvidence) {
     recordEvent("console", `[${message.type()}] ${message.text()}`);
 
     if (message.type() === "error") {
-      evidence.consoleErrors.push(message.text());
+      pushCapped(
+        evidence.consoleErrors,
+        message.text(),
+        MAX_CONSOLE_ERRORS,
+        evidence.truncation,
+        "consoleErrorsDropped",
+      );
     }
   });
 
   page.on("pageerror", (error) => {
     recordEvent("pageerror", error.message);
-    evidence.pageErrors.push(error.message);
+    pushCapped(
+      evidence.pageErrors,
+      error.message,
+      MAX_PAGE_ERRORS,
+      evidence.truncation,
+      "pageErrorsDropped",
+    );
   });
 
   page.on("requestfailed", (request) => {
     const failure = request.failure()?.errorText ?? "unknown failure";
     recordEvent("requestfailed", `${request.method()} ${request.url()} ${failure}`);
-    evidence.networkFailures.push({
-      method: request.method(),
-      url: request.url(),
-      status: null,
-      statusText: "",
-      failure,
-    });
+    pushCapped(
+      evidence.networkFailures,
+      {
+        method: request.method(),
+        url: request.url(),
+        status: null,
+        statusText: "",
+        failure,
+      },
+      MAX_NETWORK_FAILURES,
+      evidence.truncation,
+      "networkFailuresDropped",
+    );
   });
 
   page.on("response", (response) => {
@@ -182,15 +216,36 @@ function attachEvidenceListeners(page: Page, evidence: SessionEvidence) {
     }
 
     if (!response.ok()) {
-      evidence.networkFailures.push({
-        method,
-        url: response.url(),
-        status: response.status(),
-        statusText: response.statusText(),
-        failure: `HTTP ${response.status()}`,
-      });
+      pushCapped(
+        evidence.networkFailures,
+        {
+          method,
+          url: response.url(),
+          status: response.status(),
+          statusText: response.statusText(),
+          failure: `HTTP ${response.status()}`,
+        },
+        MAX_NETWORK_FAILURES,
+        evidence.truncation,
+        "networkFailuresDropped",
+      );
     }
   });
+}
+
+function pushCapped<T>(
+  target: T[],
+  value: T,
+  maxItems: number,
+  truncation: EvidenceTruncation,
+  counter: keyof EvidenceTruncation,
+) {
+  if (target.length < maxItems) {
+    target.push(value);
+    return;
+  }
+
+  truncation[counter] += 1;
 }
 
 // Performs one step's action. Shared verbatim between executeReproductionPlan
@@ -371,6 +426,7 @@ export async function executeReproductionPlan(
     assertion: null,
     events: evidence.events,
     html: "",
+    evidenceTruncation: evidence.truncation,
   };
 
   const probeTimeoutMs = options.probeTimeoutMs ?? BASE_URL_PROBE_TIMEOUT_MS;

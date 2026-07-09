@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import {
+  formatAnalysisComment,
   formatResultComment,
   redactSecrets,
 } from "../backend/services/report.js";
@@ -58,6 +59,20 @@ describe("formatResultComment", () => {
     expect(comment).not.toContain("sk-ant-abc123");
     expect(comment).not.toContain("supersecret");
     expect(comment).not.toContain("eyJtoken");
+    expect(comment).toContain("[REDACTED]");
+  });
+});
+
+describe("formatAnalysisComment", () => {
+  test("surfaces bounded text analysis and redacts secrets", () => {
+    const comment = formatAnalysisComment({
+      type: "text",
+      text: "Likely cause: handler uses DATABASE_URL=postgres://u:secret@db/app and returns stale cache.",
+    });
+
+    expect(comment).toContain("Analysis:");
+    expect(comment).toContain("Likely cause");
+    expect(comment).not.toContain("secret");
     expect(comment).toContain("[REDACTED]");
   });
 });

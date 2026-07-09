@@ -247,7 +247,7 @@ Provide:
 
   const message = await createModelMessage({
     model: MODEL,
-    max_tokens: 500,
+    max_tokens: 900,
     messages: [
       {
         role: "user",

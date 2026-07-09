@@ -8,7 +8,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { readJsonArtifact, type ArtifactStore } from "./artifacts.js";
 import type { FixAttemptResult } from "./fix.js";
+import { parseGitStatusPorcelainZ } from "./git-status.js";
 import type { ReproductionPlan } from "./plan.js";
+import { createGitAuthContext, redactGitFailure, type GitAuthContext } from "./repo-auth.js";
 import { redactSecrets } from "./report.js";
 
 const execFileAsync = promisify(execFile);
@@ -87,8 +89,8 @@ export type PullRequestInput = {
   issueTitle: string;
   plan: ReproductionPlan;
   github: GitHubClient | null;
-  // Remote used for collision checks and push. Production passes an
-  // x-access-token URL; tests pass a local bare repository path.
+  // Remote used for collision checks and push. Production may pass an
+  // x-access-token URL; it is normalized before any git argv is built.
   pushUrl: string | null;
 };
 
@@ -241,14 +243,22 @@ export async function createFixPullRequest(
   }
 
   // --- Push (never force, never the default branch) ----------------------------
+  const remote = input.pushUrl ? await createPushRemote(input.pushUrl) : null;
+
   try {
+    if (!remote) {
+      return finish("push_failed", "No push remote was provided.");
+    }
+
     await runGit(input.repoPath, [
       "push",
-      input.pushUrl,
+      remote.url,
       `refs/heads/${branch}:refs/heads/${branch}`,
-    ]);
+    ], remote.auth);
   } catch (error) {
     return finish("push_failed", formatError(error));
+  } finally {
+    await remote?.auth?.cleanup().catch(() => {});
   }
 
   return openPullRequest(input, result, finish);
@@ -318,7 +328,7 @@ async function checkPreconditions(input: PullRequestInput): Promise<string | nul
 
   try {
     head = (await runGit(input.repoPath, ["rev-parse", "HEAD"])).trim();
-    status = await runGit(input.repoPath, ["status", "--short"]);
+      status = await runGit(input.repoPath, ["status", "--porcelain=v1", "-z"]);
   } catch (error) {
     return `The repository workspace is unavailable: ${formatError(error)}`;
   }
@@ -328,11 +338,7 @@ async function checkPreconditions(input: PullRequestInput): Promise<string | nul
   }
 
   const approved = new Set(input.fixAttempt.changedFiles);
-  // `git status --short` lines are "XY <path>" (or "XY <old> -> <new>").
-  const dirty = status
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => line.slice(3).split(" -> ").pop()!.trim());
+  const dirty = parseGitStatusPorcelainZ(status);
   const unrelated = dirty.filter((file) => !approved.has(file));
 
   if (unrelated.length > 0) {
@@ -375,19 +381,23 @@ async function remoteBranchExists(input: PullRequestInput, branch: string) {
     return false;
   }
 
+  const remote = await createPushRemote(input.pushUrl);
+
   try {
     const output = await runGit(input.repoPath, [
       "ls-remote",
       "--heads",
-      input.pushUrl,
+      remote.url,
       `refs/heads/${branch}`,
-    ]);
+    ], remote.auth);
 
     return output.trim() !== "";
   } catch {
     // If the remote cannot be queried, proceed; the push itself will surface
     // the real error and be classified as push_failed.
     return false;
+  } finally {
+    await remote.auth?.cleanup().catch(() => {});
   }
 }
 
@@ -626,14 +636,60 @@ export function createGitHubRestClient(options: {
   };
 }
 
-async function runGit(repoPath: string, args: string[]) {
-  const { stdout } = await execFileAsync("git", args, {
-    cwd: repoPath,
-    timeout: 60_000,
-    maxBuffer: 8 * 1024 * 1024,
-  });
+async function runGit(repoPath: string, args: string[], auth?: GitAuthContext | null) {
+  try {
+    const { stdout } = await execFileAsync("git", args, {
+      cwd: repoPath,
+      env: auth ? { ...process.env, ...auth.env } : process.env,
+      timeout: 60_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
 
-  return stdout;
+    return stdout;
+  } catch (error) {
+    if (error instanceof Error) {
+      const token = auth?.env.SHERLOCK_GIT_TOKEN ?? null;
+      error.message = redactGitFailure(error.message, token);
+    }
+
+    throw error;
+  }
+}
+
+async function createPushRemote(pushUrl: string): Promise<{
+  url: string;
+  auth: GitAuthContext | null;
+}> {
+  const parsed = parseTokenRemote(pushUrl);
+
+  if (!parsed) {
+    return { url: pushUrl, auth: null };
+  }
+
+  return {
+    url: parsed.url,
+    auth: await createGitAuthContext(parsed.token),
+  };
+}
+
+function parseTokenRemote(pushUrl: string): { url: string; token: string } | null {
+  let url: URL;
+
+  try {
+    url = new URL(pushUrl);
+  } catch {
+    return null;
+  }
+
+  if (url.protocol !== "https:" || url.username !== "x-access-token" || !url.password) {
+    return null;
+  }
+
+  const token = decodeURIComponent(url.password);
+  url.username = "";
+  url.password = "";
+
+  return { url: url.toString(), token };
 }
 
 function formatError(error: unknown) {

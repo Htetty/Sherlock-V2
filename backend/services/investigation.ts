@@ -71,6 +71,7 @@ import {
 } from "./artifacts.js";
 import {
   formatFixComment,
+  formatAnalysisComment,
   formatPullRequestComment,
   formatResultComment,
   type InvestigationSummary,
@@ -1131,8 +1132,11 @@ export async function runInvestigationPipeline(
           })
         : null;
 
+    const analysisComment = !fixAttempt || fixAttempt.outcome !== "verified"
+      ? formatAnalysisComment(claudeAnalysis)
+      : null;
     const extraComment =
-      [fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
+      [analysisComment, fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
 
     // Final outcome semantics: a reproduced bug whose patch was verified
     // finishes as verified_fix. The original reproduction outcome is

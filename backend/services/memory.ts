@@ -3,12 +3,14 @@
 // Contract: docs/fable/08-memory-prompt.md
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { ReproductionPlan } from "./plan.js";
 
 const MAX_MATCHES = 3;
+const DEFAULT_MAX_MEMORY_ENTRIES = 100;
+const memoryWriteLocks = new Map<string, Promise<void>>();
 
 export type MemoryOutcome =
   | "verified"
@@ -60,11 +62,38 @@ export async function loadMemory(repoUrl: string): Promise<MemoryEntry[]> {
 }
 
 export async function appendMemory(repoUrl: string, entry: MemoryEntry) {
-  const entries = await loadMemory(repoUrl);
-  entries.push(entry);
+  const filePath = memoryPath(repoUrl);
+  const previous = memoryWriteLocks.get(filePath) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    const entries = await loadMemory(repoUrl);
+    entries.push(entry);
 
-  await mkdir(path.dirname(memoryPath(repoUrl)), { recursive: true });
-  await writeFile(memoryPath(repoUrl), JSON.stringify(entries, null, 2));
+    const bounded = entries.slice(-getMaxMemoryEntries());
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(tmpPath, JSON.stringify(bounded, null, 2));
+    await rename(tmpPath, filePath);
+  });
+
+  const guarded = next.catch(() => {});
+  memoryWriteLocks.set(filePath, guarded);
+
+  try {
+    await next;
+  } finally {
+    if (memoryWriteLocks.get(filePath) === guarded) {
+      memoryWriteLocks.delete(filePath);
+    }
+  }
+}
+
+function getMaxMemoryEntries(): number {
+  const configured = Number(process.env.SHERLOCK_MAX_MEMORY_ENTRIES);
+
+  return Number.isFinite(configured) && configured > 0
+    ? Math.floor(configured)
+    : DEFAULT_MAX_MEMORY_ENTRIES;
 }
 
 // Top matches by issue-term overlap. Zero-overlap entries are excluded -

@@ -380,7 +380,7 @@ export async function validatePatchSafety(
         continue;
       }
 
-      patched = patched.replace(edit.oldText, edit.newText);
+      patched = patched.replace(edit.oldText, () => edit.newText);
       changedLines += countLines(edit.oldText) + countLines(edit.newText);
     }
   }

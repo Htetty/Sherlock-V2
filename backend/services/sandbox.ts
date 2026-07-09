@@ -27,6 +27,7 @@ export type { DockerAdapter } from "./container.js";
 const SANDBOX_STARTUP_TIMEOUT_MS = 30_000;
 const INSTALL_TIMEOUT_MS = 180_000;
 const MAX_APP_OUTPUT_CHARS = 256 * 1024;
+const MAX_PORT_BIND_RETRIES = 2;
 
 // Probot (3000) and the Sherlock backend (4000) must never be handed out as a
 // target-application sandbox port: a collision makes reproduction silently
@@ -94,11 +95,13 @@ export async function runSandboxInvestigation({
   startupTimeoutMs = SANDBOX_STARTUP_TIMEOUT_MS,
   docker = realDockerAdapter,
   probe = defaultProbe,
+  portBindRetry = 0,
 }: {
   repoPath: string;
   startupTimeoutMs?: number;
   docker?: DockerAdapter;
   probe?: UrlProbe;
+  portBindRetry?: number;
 }): Promise<SandboxSession> {
   // Container-only policy: without Docker there is no safe way to run the
   // target repository's code, so the environment fails outright.
@@ -156,6 +159,20 @@ export async function runSandboxInvestigation({
       return attachRuntimeCleanup(first.session, runtime);
     }
 
+    if (
+      portBindRetry < MAX_PORT_BIND_RETRIES &&
+      isPortBindFailure(`${first.stdout}\n${first.stderr}`)
+    ) {
+      await runtime.cleanup().catch(() => {});
+      return runSandboxInvestigation({
+        repoPath,
+        startupTimeoutMs,
+        docker,
+        probe,
+        portBindRetry: portBindRetry + 1,
+      });
+    }
+
     // Hardcoded-port fallback: the app ignored PORT. Look for the fixed
     // internal port it logged (bounded detection rules); that port is only
     // ever used as the container-internal side of the mapping — the public
@@ -205,6 +222,10 @@ export async function runSandboxInvestigation({
     await runtime.cleanup().catch(() => {});
     throw error;
   }
+}
+
+function isPortBindFailure(output: string): boolean {
+  return /port is already allocated|bind: address already in use|address already in use/i.test(output);
 }
 
 type AttemptResult = {
@@ -282,18 +303,31 @@ async function startApplicationAttempt(input: {
   };
 }
 
-// Ports the app itself claims to be listening on in its startup output.
+// Ports the app itself claims to be listening on in its startup output. Keep
+// this strict: generic "port 5432" database/cache errors are not app listeners.
 const LOGGED_PORT_PATTERNS = [
-  /(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})/gi,
-  /\bport[:\s]+(\d{1,5})\b/gi,
+  /\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})\b/i,
+  /\b(?:listening|running|serving|started|ready|available)\b[^\n]{0,80}\b(?:on|at)?\s*(?:https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):|port\s+)(\d{1,5})\b/i,
+  /\blocal:\s*https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{1,5})\b/i,
 ];
+const NON_APP_PORT_LOG = /\b(postgres|postgresql|mysql|mariadb|redis|mongo|mongodb|database|db|cache)\b/i;
 
 function detectFixedInternalPort(
   output: string,
   allocatedPort: number,
 ): number | null {
-  for (const pattern of LOGGED_PORT_PATTERNS) {
-    for (const match of output.matchAll(pattern)) {
+  for (const line of output.split(/\r?\n/)) {
+    if (NON_APP_PORT_LOG.test(line)) {
+      continue;
+    }
+
+    for (const pattern of LOGGED_PORT_PATTERNS) {
+      const match = line.match(pattern);
+
+      if (!match) {
+        continue;
+      }
+
       const candidate = Number(match[1]);
 
       if (candidate > 0 && candidate < 65_536 && candidate !== allocatedPort) {

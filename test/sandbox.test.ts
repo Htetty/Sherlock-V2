@@ -256,4 +256,55 @@ describe("container-only sandbox", () => {
     expect(caught?.message).toContain("Attempted command: docker run");
     expect(caught?.message).not.toContain(repoPath);
   });
+
+  test("does not treat database/cache ports as app listener ports", async () => {
+    const repoPath = await createFixtureRepo();
+    const { adapter } = createFakeDocker([
+      "Postgres connection failed at postgres://localhost:5432\nRedis unavailable on port 6379",
+    ]);
+
+    let caught: Error | null = null;
+
+    try {
+      await runSandboxInvestigation({
+        repoPath,
+        startupTimeoutMs: 500,
+        docker: adapter,
+        probe: async () => false,
+      });
+    } catch (error) {
+      caught = error as Error;
+    }
+
+    expect(caught).toBeInstanceOf(SandboxUnreachableError);
+    expect(caught?.message).toContain("no fixed internal port could be detected");
+  });
+
+  test("retries with a new runtime workspace when Docker reports a host-port bind conflict", async () => {
+    const repoPath = await createFixtureRepo();
+    const { adapter, spawned } = createFakeDocker([
+      "docker: Error response from daemon: Bind for 127.0.0.1 failed: port is already allocated",
+      "",
+    ]);
+    let probeCount = 0;
+
+    const session = await runSandboxInvestigation({
+      repoPath,
+      startupTimeoutMs: 500,
+      docker: adapter,
+      probe: async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        probeCount += 1;
+        return probeCount > 1;
+      },
+    });
+
+    const installs = spawned.filter((args) =>
+      args[args.indexOf("--name") + 1].startsWith("sherlock-install-"),
+    );
+    expect(installs).toHaveLength(2);
+    expect(mountedWorkspace(installs[0])).not.toBe(mountedWorkspace(installs[1]));
+
+    await session.stop();
+  });
 });

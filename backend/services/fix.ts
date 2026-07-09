@@ -8,11 +8,16 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createArtifactStore, createFixAttemptId } from "./artifacts.js";
-import { realDockerAdapter, type DockerAdapter } from "./container.js";
+import {
+  buildTargetEnv,
+  realDockerAdapter,
+  runContainerCommand,
+  type DockerAdapter,
+} from "./container.js";
 import {
   renderProposedPatch,
   resolveWorkspaceFilePath,
@@ -20,6 +25,7 @@ import {
   validatePatchSafety,
   type FixProposal,
 } from "./fix-proposal.js";
+import { parseGitStatusPorcelainZ } from "./git-status.js";
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
 import {
@@ -43,6 +49,7 @@ import {
   type RegressionTestProposal,
   type RegressionTestSummary,
 } from "./regression-test.js";
+import { createRuntimeWorkspace, type RuntimeWorkspace } from "./runtime-workspace.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -341,24 +348,34 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         "utf8",
       );
 
-      const materialized = await materializeTest(input.repoPath, testProposal, sha256);
+      const preRuntime = await prepareVerificationRuntime(
+        input.repoPath,
+        input.docker ?? realDockerAdapter,
+        input.validationTimeoutMs,
+      );
+      const materialized = await materializeTest(preRuntime.path, testProposal, sha256);
 
       if (!materialized.ok) {
         await materialized.remove();
+        await preRuntime.cleanup();
         feedback = "The materialized test bytes did not match the proposal hash.";
         regressionSummary.reason = feedback;
         continue;
       }
 
-      const preRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
-        repoPath: input.repoPath,
-        relativePath: testProposal.relativePath,
-        targetUrl: input.plan.baseUrl,
-        appNetwork: input.appNetwork ?? null,
-        timeoutMs: input.regressionTimeoutMs,
-      });
-
-      await materialized.remove();
+      let preRun;
+      try {
+        preRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
+          repoPath: preRuntime.path,
+          relativePath: testProposal.relativePath,
+          targetUrl: input.plan.baseUrl,
+          appNetwork: input.appNetwork ?? null,
+          timeoutMs: input.regressionTimeoutMs,
+        });
+      } finally {
+        await materialized.remove();
+        await preRuntime.cleanup();
+      }
       // Restore the pristine pre-patch workspace (a test could have written
       // residue) and prove it: generation must never contaminate the source.
       await runGit(input.repoPath, ["checkout", "--", "."]);
@@ -545,10 +562,21 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
   // Discovered from package.json (test/typecheck/lint/build), executed in
   // restricted containers. Unavailable categories run nothing and are
   // reported truthfully — never as a fake pass.
-  const validation = await runRepositoryValidation(input.docker ?? realDockerAdapter, {
-    repoPath: input.repoPath,
-    timeoutMs: input.validationTimeoutMs,
-  });
+  const validationRuntime = await prepareVerificationRuntime(
+    input.repoPath,
+    input.docker ?? realDockerAdapter,
+    input.validationTimeoutMs,
+  );
+  let validation: RepositoryValidation;
+
+  try {
+    validation = await runRepositoryValidation(input.docker ?? realDockerAdapter, {
+      repoPath: validationRuntime.path,
+      timeoutMs: input.validationTimeoutMs,
+    });
+  } finally {
+    await validationRuntime.cleanup();
+  }
 
   result.repositoryValidation = {
     aggregate: validation.aggregate,
@@ -634,8 +662,13 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
   // --- Regression test: post-patch run (identical bytes, identical hash) -----
   if (provenRegressionTest !== null) {
     const expectedSha = regressionSummary.sha256!;
-    const materialized = await materializeTest(
+    const postRuntime = await prepareVerificationRuntime(
       input.repoPath,
+      input.docker ?? realDockerAdapter,
+      input.validationTimeoutMs,
+    );
+    const materialized = await materializeTest(
+      postRuntime.path,
       provenRegressionTest,
       expectedSha,
     );
@@ -643,37 +676,45 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 
     let postClassification: PostPatchClassification | null = null;
 
+    if (!materialized.ok) {
+      await materialized.remove();
+      await postRuntime.cleanup();
+    }
+
     if (materialized.ok) {
-      const postRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
-        repoPath: input.repoPath,
-        relativePath: provenRegressionTest.relativePath,
-        targetUrl: restart.baseUrl ?? input.plan.baseUrl,
-        appNetwork: restart.appNetwork ?? null,
-        timeoutMs: input.regressionTimeoutMs,
-      });
+      try {
+        const postRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
+          repoPath: postRuntime.path,
+          relativePath: provenRegressionTest.relativePath,
+          targetUrl: restart.baseUrl ?? input.plan.baseUrl,
+          appNetwork: restart.appNetwork ?? null,
+          timeoutMs: input.regressionTimeoutMs,
+        });
 
-      postClassification = classifyPostPatchRun(postRun);
+        postClassification = classifyPostPatchRun(postRun);
 
-      await store.writeJson("regression-postpatch-result.json", {
-        investigationId: input.investigationId,
-        fixAttemptId,
-        classification: postClassification,
-        exitCode: postRun.exitCode,
-        timedOut: postRun.timedOut,
-        durationMs: postRun.durationMs,
-        stdout: boundOutput(postRun.stdout),
-        stderr: boundOutput(postRun.stderr),
-      });
+        await store.writeJson("regression-postpatch-result.json", {
+          investigationId: input.investigationId,
+          fixAttemptId,
+          classification: postClassification,
+          exitCode: postRun.exitCode,
+          timedOut: postRun.timedOut,
+          durationMs: postRun.durationMs,
+          stdout: boundOutput(postRun.stdout),
+          stderr: boundOutput(postRun.stderr),
+        });
+      } finally {
+        await materialized.remove();
+        await postRuntime.cleanup();
+      }
     }
 
     // The generated test is verification evidence only: it must be gone
     // before the final diff, and only the intended patch files may remain.
-    await materialized.remove();
 
-    const residue = (await runGit(input.repoPath, ["status", "--short"]))
-      .split("\n")
-      .filter((line) => line.trim() !== "")
-      .map((line) => line.slice(3).split(" -> ").pop()!.trim());
+    const residue = parseGitStatusPorcelainZ(
+      await runGit(input.repoPath, ["status", "--porcelain=v1", "-z"]),
+    );
     const unexpectedResidue = residue.filter(
       (file) => !result.changedFiles.includes(file),
     );
@@ -754,11 +795,42 @@ async function applyProposal(proposal: FixProposal, repoPath: string) {
     let contents = await readFile(absolutePath, "utf8");
 
     for (const edit of file.edits) {
-      contents = contents.replace(edit.oldText, edit.newText);
+      contents = contents.replace(edit.oldText, () => edit.newText);
     }
 
     await writeFile(absolutePath, contents, "utf8");
   }
+}
+
+async function prepareVerificationRuntime(
+  trustedRepoPath: string,
+  docker: DockerAdapter,
+  timeoutMs?: number,
+): Promise<RuntimeWorkspace> {
+  const runtime = await createRuntimeWorkspace(trustedRepoPath);
+
+  try {
+    await access(path.join(runtime.path, "package.json"));
+  } catch {
+    return runtime;
+  }
+
+  const install = await runContainerCommand(docker, {
+    purpose: "install-verification",
+    workspacePath: runtime.path,
+    env: buildTargetEnv(),
+    command: ["npm", "install"],
+    timeoutMs: timeoutMs ?? 180_000,
+  });
+
+  if (install.exitCode !== 0 || install.timedOut) {
+    await runtime.cleanup();
+    throw new Error(
+      `Verification dependency installation failed (exit ${install.exitCode}${install.timedOut ? ", timed out" : ""}): ${boundOutput(install.stderr || install.stdout)}`,
+    );
+  }
+
+  return runtime;
 }
 
 // Hash of the plan's behavior (steps + assertion, excluding baseUrl) proving
