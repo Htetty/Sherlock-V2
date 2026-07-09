@@ -15,6 +15,12 @@ import type {
 } from "../services/investigation.js";
 import { RepositoryError } from "../services/repo-auth.js";
 import { redactSecrets } from "../services/report.js";
+import {
+  safeRepoUrl,
+  type InvestigationStateEvent,
+  type InvestigationStateEventInput,
+  type InvestigationStateStore,
+} from "../services/investigation-state-store.js";
 import type { InvestigationJobPayload } from "./investigation-queue.js";
 
 export type InvestigationJobLike = {
@@ -45,6 +51,11 @@ export type WorkerDeps = {
     body: string;
   }) => Promise<void>;
   reportStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Lifecycle state store. Worker-level writes (queued/running before the
+  // pipeline runs, and a terminal failure when setup fails before the pipeline)
+  // go through here so an investigation that dies during token/auth setup still
+  // leaves a state record. Optional and best-effort: never fails the job.
+  stateStore?: InvestigationStateStore;
   log?: (message: string) => void;
 };
 
@@ -129,6 +140,22 @@ export async function processInvestigationJob(
   const payload = job.data;
   const log = deps.log ?? (() => {});
 
+  // Best-effort, non-fatal worker-level state writes. A failing store must
+  // never fail the job (which would trigger a spurious retry).
+  const recordState = async (event: InvestigationStateEventInput) => {
+    try {
+      await deps.stateStore?.record({
+        ...event,
+        investigationId: payload.investigationId,
+        at: new Date().toISOString(),
+      } as InvestigationStateEvent);
+    } catch (stateError) {
+      log(
+        `[${payload.investigationId}] Worker state write failed ("${event.type}"); continuing: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+      );
+    }
+  };
+
   const reportStage = async (stage: InvestigationStage) => {
     try {
       await deps.reportStage?.(stage);
@@ -137,7 +164,27 @@ export async function processInvestigationJob(
     }
   };
 
+  // Set once the pipeline returns; distinguishes a pre-pipeline/worker-setup
+  // failure (record a terminal worker outcome) from a post-pipeline failure
+  // (the pipeline already recorded its own final outcome — do not overwrite).
+  let pipelineResult: InvestigationPipelineResult | null = null;
+
   try {
+    // Worker-level state before any setup runs, so an investigation that dies
+    // during token/auth setup still leaves a created + terminal record. The
+    // repo URL is derived from owner/name, never a caller-supplied URL.
+    await recordState({
+      type: "created",
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      repoUrl: safeRepoUrl(payload.repositoryOwner, payload.repositoryName),
+      issueNumber: payload.issueNumber,
+      issueTitle: payload.issueTitle,
+      issueUrl: payload.issueUrl,
+      triggeredBy: payload.triggeredBy,
+    });
+    await recordState({ type: "stage_changed", stage: "running" });
+
     await reportStage("running");
     log(`[${payload.investigationId}] Job started for ${payload.repositoryOwner}/${payload.repositoryName}#${payload.issueNumber} (tenant ${payload.tenantId}).`);
 
@@ -161,6 +208,7 @@ export async function processInvestigationJob(
       },
       { onStage: reportStage },
     );
+    pipelineResult = result;
 
     await deps.postIssueComment({
       installationId: payload.installationId,
@@ -182,6 +230,15 @@ export async function processInvestigationJob(
       log(
         `[${payload.investigationId}] Transient failure (attempt ${job.attemptsMade + 1}/${attemptsAllowed}), will retry: ${error instanceof Error ? error.message : String(error)}`,
       );
+      // Record the failed attempt (best-effort) so a retryable pre-pipeline
+      // failure is visible in state, without recording a terminal outcome —
+      // then rethrow unchanged so BullMQ retries with backoff.
+      await recordState({
+        type: "error",
+        stage: "worker",
+        message: error instanceof Error ? error.message : String(error),
+        retryable: true,
+      });
       throw error;
     }
 
@@ -189,6 +246,21 @@ export async function processInvestigationJob(
     // pipeline's own cleanup already stopped sandboxes and containers),
     // report to GitHub, and stop retrying.
     await reportStage("failed");
+
+    // Record a terminal worker-level state. Always append the error; only own
+    // the final outcome when the pipeline never produced one (a pre-pipeline
+    // or worker-setup failure), so a post-pipeline failure — e.g. GitHub
+    // comment posting — cannot overwrite the pipeline's real outcome.
+    const failureMessage = error instanceof Error ? error.message : String(error);
+    await recordState({ type: "error", stage: "worker", message: failureMessage });
+    if (!pipelineResult) {
+      await recordState({
+        type: "final_outcome",
+        outcome: "failed",
+        error: failureMessage,
+      });
+    }
+
     await deps
       .postIssueComment({
         installationId: payload.installationId,

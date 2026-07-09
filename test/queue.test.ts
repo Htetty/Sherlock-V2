@@ -19,6 +19,7 @@ import {
   type WorkerDeps,
 } from "../backend/queue/process-investigation.js";
 import type { InvestigationStage } from "../backend/services/investigation.js";
+import { createInMemoryInvestigationStateStore } from "../backend/services/investigation-state-store.js";
 
 const jobPayload: InvestigationJobPayload = {
   investigationId: "inv_0TEST123ABC",
@@ -181,6 +182,139 @@ describe("investigation worker processing", () => {
     expect(formatWorkerFailureComment("inv_X", new Error("api_key: sekret"))).not.toContain(
       "sekret",
     );
+  });
+});
+
+describe("worker-level state store writes", () => {
+  test("records created + terminal failed when installation-token setup fails before the pipeline", async () => {
+    const stateStore = createInMemoryInvestigationStateStore();
+    let pipelineRan = false;
+
+    const deps: WorkerDeps = {
+      stateStore,
+      runPipeline: async (payload) => {
+        pipelineRan = true;
+        return {
+          investigationId: payload.investigationId!,
+          outcome: "verified_fix",
+          summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
+          githubComment: "unused",
+        };
+      },
+      // Auth/setup failure before the pipeline; non-transient => permanent.
+      getInstallationToken: async () => {
+        throw new Error("installation token minting failed: bad credentials");
+      },
+      postIssueComment: async () => {},
+      reportStage: () => {},
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(pipelineRan).toBe(false);
+
+    const record = await stateStore.get?.(jobPayload.investigationId);
+    expect(record).toBeTruthy();
+    // Worker-level created state exists with a derived (safe) repo URL.
+    expect(record?.repoOwner).toBe("hiimbex");
+    expect(record?.repoUrl).toBe("https://github.com/hiimbex/testing-things");
+    // Terminal worker outcome recorded even though the pipeline never ran.
+    expect(record?.status).toBe("finished");
+    expect(record?.outcome).toBe("failed");
+    expect(record?.errors.length).toBeGreaterThan(0);
+    expect(record?.errors.some((entry) => entry.stage === "worker")).toBe(true);
+  });
+
+  test("records a retryable attempt error (but no final outcome) when transient token setup fails on a non-final attempt", async () => {
+    const stateStore = createInMemoryInvestigationStateStore();
+    let pipelineRan = false;
+
+    // Transient/retryable infrastructure signal (ECONNRESET) raised during
+    // pre-pipeline token/auth setup.
+    const transientError = Object.assign(new Error("socket hang up"), {
+      code: "ECONNRESET",
+    });
+
+    const deps: WorkerDeps = {
+      stateStore,
+      runPipeline: async (payload) => {
+        pipelineRan = true;
+        return {
+          investigationId: payload.investigationId!,
+          outcome: "verified_fix",
+          summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
+          githubComment: "unused",
+        };
+      },
+      getInstallationToken: async () => {
+        throw transientError;
+      },
+      postIssueComment: async () => {},
+      reportStage: () => {},
+    };
+
+    // Non-final attempt: rethrown exactly as-is so BullMQ retries with backoff.
+    await expect(
+      processInvestigationJob(
+        { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        deps,
+      ),
+    ).rejects.toBe(transientError);
+
+    expect(pipelineRan).toBe(false);
+
+    const record = await stateStore.get?.(jobPayload.investigationId);
+    expect(record).toBeTruthy();
+    // The failed attempt is visible: a worker-stage error flagged retryable.
+    const retryableError = record?.errors.find(
+      (entry) => entry.stage === "worker" && entry.retryable === true,
+    );
+    expect(retryableError).toBeTruthy();
+    // No terminal outcome yet — the job will retry.
+    expect(record?.status).toBe("running");
+    expect(record?.outcome).toBeNull();
+    expect(record?.finishedAt).toBeNull();
+  });
+
+  test("a post-pipeline failure does not overwrite the pipeline's own final outcome", async () => {
+    // The pipeline (stub) returns a result but records nothing itself; a later
+    // comment-post failure must not cause the worker to stamp a final outcome.
+    const stateStore = createInMemoryInvestigationStateStore();
+
+    const deps: WorkerDeps = {
+      stateStore,
+      runPipeline: async (payload) => ({
+        investigationId: payload.investigationId!,
+        outcome: "verified_fix",
+        summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
+        githubComment: "RESULT",
+      }),
+      getInstallationToken: async () => ({ token: "t", permissions: null }),
+      // Non-transient failure AFTER the pipeline produced a result.
+      postIssueComment: async () => {
+        throw new Error("GitHub comment API is down");
+      },
+      reportStage: () => {},
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    const record = await stateStore.get?.(jobPayload.investigationId);
+    // Worker recorded the error but did NOT claim a terminal outcome, because
+    // the pipeline already owns the outcome for a completed run.
+    expect(record?.errors.length).toBeGreaterThan(0);
+    expect(record?.status).toBe("running");
+    expect(record?.outcome).toBeNull();
   });
 });
 
