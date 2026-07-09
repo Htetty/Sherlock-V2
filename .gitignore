@@ -1,14 +1,28 @@
 node_modules
 npm-debug.log
+
+# Secrets / local env
 *.pem
 !mock-cert.pem
-.env.*
 .env
+.env.*
+!.env.example
+
+# Build / test output
 coverage
 lib
-fable
 dist
+
+# Local tool output
+fable
+
+# OS files
 .DS_Store
 
+# Sherlock runtime artifacts
 artifacts
+.sherlock-state
+_state
+
+# Local/private project notes
 PROJECT_OVERVIEW.md
