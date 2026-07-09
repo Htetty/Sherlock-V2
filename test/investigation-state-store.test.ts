@@ -144,25 +144,27 @@ describe("applyEvent reducer", () => {
   });
 
   test("accumulates error events and redacts secrets from their messages", () => {
+    const secret = "SECRET_TOKEN=redact-me";
     let record = applyEvent(null, {
       type: "error",
       investigationId: INV,
       at: "2026-07-08T00:00:00.000Z",
       stage: "fixing",
-      message: "boom with token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      message: `boom with ${secret}`,
     });
     record = applyEvent(record, {
       type: "final_outcome",
       investigationId: INV,
       at: "2026-07-08T00:00:01.000Z",
       outcome: "execution_failed",
-      error: "final failure ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+      error: `final failure ${secret}`,
     });
 
     expect(record.errors).toHaveLength(2);
     expect(record.status).toBe("finished");
     for (const entry of record.errors) {
-      expect(entry.message).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+      expect(entry.message).not.toContain("redact-me");
+      expect(entry.message).toContain("[REDACTED]");
     }
   });
 });
@@ -232,7 +234,7 @@ describe("no-op and env factory", () => {
 });
 
 describe("metadata redaction", () => {
-  const SECRET = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  const SECRET = "SECRET_TOKEN=redact-me";
 
   test("scrubs secrets from all free-text metadata in the created event", () => {
     const record = applyEvent(null, {
@@ -242,7 +244,7 @@ describe("metadata redaction", () => {
       repoOwner: "acme",
       repoName: "web",
       // A caller-supplied URL that smuggles credentials must not be stored.
-      repoUrl: "https://user:hunter2pass@github.com/acme/web",
+      repoUrl: "https://user:redact-me@github.com/acme/web",
       issueNumber: 7,
       issueTitle: `Login breaks when token ${SECRET} is set`,
       issueUrl: "https://github.com/acme/web/issues/7",
@@ -251,9 +253,9 @@ describe("metadata redaction", () => {
 
     const serialized = JSON.stringify(record);
     expect(serialized).not.toContain(SECRET);
-    expect(serialized).not.toContain("hunter2pass");
+    expect(serialized).not.toContain("redact-me");
     expect(record.issueTitle).toContain("[REDACTED]");
-    expect(record.repoUrl).not.toContain("hunter2pass");
+    expect(record.repoUrl).not.toContain("redact-me");
     // Non-secret identifiers survive untouched.
     expect(record.repoOwner).toBe("acme");
     expect(record.triggeredBy).toBe("octocat");
