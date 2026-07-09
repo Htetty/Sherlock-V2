@@ -15,6 +15,7 @@ import {
   runInvestigationPipeline,
   type InvestigationPipelineInput,
 } from "./services/investigation.js";
+import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
 
 export function isSyncInvestigationEndpointEnabled(
   env: NodeJS.ProcessEnv = process.env,
@@ -48,6 +49,7 @@ export function createApp(env: NodeJS.ProcessEnv = process.env) {
     try {
       const result = await runInvestigationPipeline(
         req.body as InvestigationPipelineInput,
+        { stateStore: createInvestigationStateStoreFromEnv(env) },
       );
       res.json(result);
     } catch (error) {

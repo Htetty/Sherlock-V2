@@ -75,6 +75,13 @@ import {
   formatResultComment,
   type InvestigationSummary,
 } from "./report.js";
+import {
+  createNoopInvestigationStateStore,
+  safeRepoUrl,
+  type InvestigationStateEvent,
+  type InvestigationStateEventInput,
+  type InvestigationStateStore,
+} from "./investigation-state-store.js";
 
 export type InvestigationStage =
   | "queued"
@@ -124,6 +131,10 @@ export type PipelineOptions = {
   // Injectable for tests; production always uses the real authenticated
   // clone flow.
   cloneRepo?: typeof cloneRepoForInvestigation;
+  // Investigation lifecycle state store (dashboard-friendly summary records).
+  // Defaults to the no-op store, so leaving this unset preserves behavior.
+  // Writes are best-effort: a failing store never fails the investigation.
+  stateStore?: InvestigationStateStore;
 };
 
 export type ReproducerFallbackCase =
@@ -156,9 +167,28 @@ export async function runInvestigationPipeline(
     console.log(`[${investigationId}] ${message}`);
   };
 
+  const stateStore = options.stateStore ?? createNoopInvestigationStateStore();
+
+  // State-store writes are best-effort telemetry: a failing store must never
+  // break an investigation. Every lifecycle write goes through here so the
+  // non-fatal guarantee lives in exactly one place.
+  const recordState = async (event: InvestigationStateEventInput) => {
+    try {
+      await stateStore.record({
+        ...event,
+        investigationId,
+        at: new Date().toISOString(),
+      } as InvestigationStateEvent);
+    } catch (error) {
+      log(`State store write failed ("${event.type}"); continuing: ${formatError(error)}`);
+    }
+  };
+
   // Stage reporting is best-effort telemetry; a broken reporter (e.g. a
   // Redis blip during updateProgress) must never fail the investigation.
   const reportStage = async (stage: InvestigationStage) => {
+    await recordState({ type: "stage_changed", stage });
+
     try {
       await options.onStage?.(stage);
     } catch (error) {
@@ -170,6 +200,33 @@ export async function runInvestigationPipeline(
   let sandboxSession: SandboxSession | null = null;
   let store: ArtifactStore | null = null;
   let investigationRecord: Record<string, unknown> = { investigationId };
+
+  // Wraps finishInvestigation so every terminal path — success or early
+  // failure return — records the final outcome (and any error) into the state
+  // store exactly once, alongside the existing artifact write.
+  const finish = async (
+    summary: InvestigationSummary,
+    extra: Partial<InvestigationPipelineResult> = {},
+    extraComment: string | null = null,
+  ): Promise<InvestigationPipelineResult> => {
+    const finished = await finishInvestigation(
+      store as ArtifactStore,
+      investigationRecord,
+      summary,
+      extra,
+      extraComment,
+    );
+
+    await recordState({
+      type: "final_outcome",
+      outcome: summary.outcome,
+      originalOutcome: summary.originalOutcome ?? null,
+      pullRequestStatus: summary.pullRequestStatus ?? null,
+      error: summary.error ?? null,
+    });
+
+    return finished;
+  };
 
   try {
     log("Investigation started.");
@@ -194,6 +251,19 @@ export async function runInvestigationPipeline(
     };
     await store.writeJson("investigation.json", investigationRecord);
 
+    await recordState({
+      type: "created",
+      repoOwner: payload.repoOwner,
+      repoName: payload.repoName,
+      // Derived from the validated owner/name, never the webhook-supplied URL,
+      // so a credential can never ride in via a crafted repoUrl.
+      repoUrl: safeRepoUrl(payload.repoOwner, payload.repoName),
+      issueNumber: payload.issueNumber,
+      issueTitle: payload.issueTitle,
+      issueUrl: payload.issueUrl,
+      triggeredBy: payload.triggeredBy,
+    });
+
     try {
       // Clone target is derived from the validated owner/name, never the
       // webhook-supplied URL; the short-lived installation token (minted by
@@ -214,7 +284,7 @@ export async function runInvestigationPipeline(
         throw error;
       }
 
-      return await finishInvestigation(store, investigationRecord, {
+      return await finish({
         investigationId,
         outcome: "environment_failed",
         stage: "git clone",
@@ -245,7 +315,7 @@ export async function runInvestigationPipeline(
         repoPath: repoContext.repoPath,
       });
     } catch (error) {
-      return await finishInvestigation(store, investigationRecord, {
+      return await finish({
         investigationId,
         outcome: "environment_failed",
         stage: "application startup",
@@ -370,7 +440,7 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "plan_failed" || reproResult.status === "exhausted") {
-          return await finishInvestigation(store!, investigationRecord, {
+          return await finish({
             investigationId,
             outcome: "plan_failed",
             planErrors: [reproResult.reason],
@@ -378,7 +448,7 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "environment_failed") {
-          return await finishInvestigation(store!, investigationRecord, {
+          return await finish({
             investigationId,
             outcome: "environment_failed",
             stage: "reproduction replay",
@@ -387,7 +457,7 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "failed" || !reproResult.plan || !reproResult.result) {
-          return await finishInvestigation(store!, investigationRecord, {
+          return await finish({
             investigationId,
             outcome: "execution_failed",
             error: reproResult.reason,
@@ -537,7 +607,7 @@ export async function runInvestigationPipeline(
             return terminal;
           }
         } else {
-          return await finishInvestigation(store, investigationRecord, {
+          return await finish({
             investigationId,
             outcome: "plan_failed",
             planErrors,
@@ -585,7 +655,7 @@ export async function runInvestigationPipeline(
 
     if (!plan || !result) {
       // Defensive: every path above either accepts a plan/result or returns.
-      return await finishInvestigation(store, investigationRecord, {
+      return await finish({
         investigationId,
         outcome: "execution_failed",
         error: "No reproduction path produced a plan and result.",
@@ -594,6 +664,14 @@ export async function runInvestigationPipeline(
 
     investigationRecord.reproductionPath = reproductionPath;
     log(`Accepted reproduction path: ${reproductionPath}`);
+
+    await recordState({
+      type: "reproduction",
+      path: reproductionPath,
+      mode: reproductionMode,
+      outcome: result.outcome,
+      commit: repoContext.commit,
+    });
 
     log(`Validated plan: ${plan.steps.length} step(s), assertion ${plan.assertion.type}`);
     for (const step of plan.steps) {
@@ -634,6 +712,7 @@ export async function runInvestigationPipeline(
     // verification checks, so the diagnostic call is skipped entirely.
     let fixAttempt: FixAttemptResult | null = null;
     let fixerStatus: FixerAgentStatus | null = null;
+    let fixerAttemptCount = 0;
 
     if (result.outcome === "reproduced") {
       try {
@@ -718,6 +797,7 @@ export async function runInvestigationPipeline(
 
         fixAttempt = agentResult.fixAttempt;
         fixerStatus = agentResult.status;
+        fixerAttemptCount = agentResult.attempts.length;
         await costShape.update({
           fixerTurns: agentResult.turns,
           fixerPatchAttempts: agentResult.attempts.length,
@@ -770,6 +850,45 @@ export async function runInvestigationPipeline(
         }
       } catch (error) {
         log(`Fix attempt failed unexpectedly: ${formatError(error)}`);
+        await recordState({
+          type: "error",
+          stage: "fixing",
+          message: formatError(error),
+        });
+      }
+
+      // Fixer attempts summary + repository validation and regression proof
+      // results (dashboard-friendly; derived from the returned fix attempt).
+      await recordState({
+        type: "fixer_attempts",
+        status: fixerStatus,
+        attempts: fixerAttemptCount,
+        outcome: fixAttempt?.outcome ?? null,
+        changedFiles: fixAttempt?.changedFiles ?? [],
+        verifiedFixAttemptId:
+          fixAttempt?.outcome === "verified" ? fixAttempt.fixAttemptId : null,
+      });
+
+      if (fixAttempt?.repositoryValidation) {
+        await recordState({
+          type: "repository_validation",
+          aggregate: fixAttempt.repositoryValidation.aggregate,
+          categories: fixAttempt.repositoryValidation.categories.map((item) => ({
+            category: item.category,
+            status: item.status,
+          })),
+        });
+      }
+
+      if (fixAttempt?.regressionTest) {
+        await recordState({
+          type: "regression_proof",
+          status: fixAttempt.regressionTest.status,
+          testName: fixAttempt.regressionTest.testName,
+          prePatch: fixAttempt.regressionTest.prePatch,
+          postPatch: fixAttempt.regressionTest.postPatch,
+          hashMatched: fixAttempt.regressionTest.hashMatched,
+        });
       }
     }
 
@@ -850,8 +969,21 @@ export async function runInvestigationPipeline(
         log(
           `Pull request flow finished: ${pullRequest.status}${pullRequest.pullRequestUrl ? ` (${pullRequest.pullRequestUrl})` : ""}`,
         );
+
+        await recordState({
+          type: "pull_request",
+          status: pullRequest.status,
+          number: pullRequest.pullRequestNumber,
+          url: pullRequest.pullRequestUrl,
+          branch: pullRequest.branch,
+        });
       } catch (error) {
         log(`Pull request flow failed unexpectedly: ${formatError(error)}`);
+        await recordState({
+          type: "error",
+          stage: "opening_pull_request",
+          message: formatError(error),
+        });
       }
     }
 
@@ -1019,9 +1151,7 @@ export async function runInvestigationPipeline(
       );
     }
 
-    return await finishInvestigation(
-      store,
-      investigationRecord,
+    return await finish(
       {
         ...summary,
         ...(reproductionMode ? { reproductionMode } : {}),
@@ -1045,6 +1175,12 @@ export async function runInvestigationPipeline(
 
     console.error(`[${investigationId}] Investigation failed:`, error);
 
+    await recordState({
+      type: "error",
+      stage: "pipeline",
+      message: formatError(error),
+    });
+
     const summary: InvestigationSummary = {
       investigationId,
       outcome: "execution_failed",
@@ -1052,8 +1188,17 @@ export async function runInvestigationPipeline(
     };
 
     if (store) {
-      return await finishInvestigation(store, investigationRecord, summary);
+      return await finish(summary);
     }
+
+    // No artifact store was created yet, so finish() (which requires a store)
+    // cannot run; record the final outcome directly to keep the state record
+    // complete.
+    await recordState({
+      type: "final_outcome",
+      outcome: summary.outcome,
+      error: summary.error ?? null,
+    });
 
     return {
       investigationId,

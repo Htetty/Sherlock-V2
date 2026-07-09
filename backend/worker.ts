@@ -25,6 +25,7 @@ import {
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
+import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
 import {
   describeWorkerError,
   enforceStartupChecks,
@@ -47,8 +48,14 @@ async function getInstallationOctokit(installationId: number) {
   return probot.auth(installationId);
 }
 
+// Lifecycle state store (no-op unless SHERLOCK_STATE_STORE=file); shared
+// across jobs. Never carries secrets and never fails an investigation.
+const stateStore = createInvestigationStateStoreFromEnv();
+
 const deps: Omit<WorkerDeps, "reportStage"> = {
-  runPipeline: runInvestigationPipeline,
+  stateStore,
+  runPipeline: (payload, pipelineOptions) =>
+    runInvestigationPipeline(payload, { ...pipelineOptions, stateStore }),
   getInstallationToken: async (installationId) => {
     const octokit = await getInstallationOctokit(installationId);
     // Single token request: @octokit/auth-app's installation auth result
