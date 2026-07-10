@@ -114,11 +114,20 @@ export function isTransientInfrastructureError(error: unknown): boolean {
   return TRANSIENT_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
 }
 
+// Single choke point for rendering a worker-path error as text. Everything a
+// failure message can reach — worker logs, the BullMQ failed reason, the
+// Supabase state record, the GitHub failure comment — must go through this
+// (or redactSecrets directly) so a raw error that happens to embed a token,
+// connection string, or env assignment never leaves the process verbatim.
+export function safeErrorMessage(error: unknown): string {
+  return redactSecrets(error instanceof Error ? error.message : String(error));
+}
+
 export function formatWorkerFailureComment(
   investigationId: string,
   error: unknown,
 ): string {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = safeErrorMessage(error);
 
   return redactSecrets(
     [
@@ -151,7 +160,7 @@ export async function processInvestigationJob(
       } as InvestigationStateEvent);
     } catch (stateError) {
       log(
-        `[${payload.investigationId}] Worker state write failed ("${event.type}"); continuing: ${stateError instanceof Error ? stateError.message : String(stateError)}`,
+        `[${payload.investigationId}] Worker state write failed ("${event.type}"); continuing: ${safeErrorMessage(stateError)}`,
       );
     }
   };
@@ -227,19 +236,22 @@ export async function processInvestigationJob(
     const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
 
     if (isTransientInfrastructureError(error) && !isFinalAttempt) {
+      const transientMessage = safeErrorMessage(error);
       log(
-        `[${payload.investigationId}] Transient failure (attempt ${job.attemptsMade + 1}/${attemptsAllowed}), will retry: ${error instanceof Error ? error.message : String(error)}`,
+        `[${payload.investigationId}] Transient failure (attempt ${job.attemptsMade + 1}/${attemptsAllowed}), will retry: ${transientMessage}`,
       );
       // Record the failed attempt (best-effort) so a retryable pre-pipeline
-      // failure is visible in state, without recording a terminal outcome —
-      // then rethrow unchanged so BullMQ retries with backoff.
+      // failure is visible in state, without recording a terminal outcome.
       await recordState({
         type: "error",
         stage: "worker",
-        message: error instanceof Error ? error.message : String(error),
+        message: transientMessage,
         retryable: true,
       });
-      throw error;
+      // Rethrow a sanitized copy: any non-Unrecoverable error triggers the
+      // job's bounded backoff retry, but the message becomes the attempt's
+      // stored BullMQ failed reason, so it must not carry the raw text.
+      throw new Error(transientMessage);
     }
 
     // Final failure: preserve the investigation id and artifacts (the
@@ -251,7 +263,7 @@ export async function processInvestigationJob(
     // the final outcome when the pipeline never produced one (a pre-pipeline
     // or worker-setup failure), so a post-pipeline failure — e.g. GitHub
     // comment posting — cannot overwrite the pipeline's real outcome.
-    const failureMessage = error instanceof Error ? error.message : String(error);
+    const failureMessage = safeErrorMessage(error);
     await recordState({ type: "error", stage: "worker", message: failureMessage });
     if (!pipelineResult) {
       await recordState({
@@ -271,12 +283,11 @@ export async function processInvestigationJob(
       })
       .catch((commentError: unknown) => {
         log(
-          `[${payload.investigationId}] Could not post failure comment: ${commentError instanceof Error ? commentError.message : String(commentError)}`,
+          `[${payload.investigationId}] Could not post failure comment: ${safeErrorMessage(commentError)}`,
         );
       });
 
-    throw new UnrecoverableError(
-      `[${payload.investigationId}] ${error instanceof Error ? error.message : String(error)}`,
-    );
+    // The message becomes the job's stored BullMQ failed reason; redacted.
+    throw new UnrecoverableError(`[${payload.investigationId}] ${failureMessage}`);
   }
 }

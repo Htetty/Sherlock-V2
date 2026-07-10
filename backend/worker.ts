@@ -118,7 +118,7 @@ worker.on("completed", (job) => {
 });
 
 worker.on("failed", (job, error) => {
-  console.error(`[queue] Job ${job?.id} failed: ${error.message}`);
+  console.error(`[queue] Job ${job?.id} failed: ${describeWorkerError(error)}`);
 });
 
 // Redis/worker infrastructure errors surface asynchronously; log them

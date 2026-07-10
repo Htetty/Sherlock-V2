@@ -22,6 +22,29 @@ docker build -t sherlock-backend .
 docker run -e APP_ID=<app-id> -e PRIVATE_KEY=<pem-value> sherlock-backend
 ```
 
+## Production deployment
+
+A full single-host/staging deployment (separate **api**, **worker**, and
+**redis** services, persistent volumes, Docker secrets, health/readiness
+endpoints) is defined in
+[docker-compose.prod.yml](docker-compose.prod.yml):
+
+```sh
+cp .env.production.example .env.production      # fill in real values (gitignored)
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+(`--env-file` is required: it feeds the compose host settings — ports, volume
+paths, the private-key path — into `${...}` interpolation, which the
+container-level `env_file:` cannot do. Staging: `--env-file .env.staging`.)
+
+The api exposes `GET /healthz` (liveness) and `GET /readyz` (config readiness;
+variable names only, never values) on the container-internal health port. See
+[docs/deployment.md](docs/deployment.md) for the architecture diagram, required
+services and env vars, the Supabase migration and GitHub webhook URL setup,
+how to view logs, restart/scale services, switch to managed Redis, add
+domain/HTTPS, the known limitations, the hardening checklist, and CI/CD notes.
+
 ## Production worker
 
 The investigation worker has its own production image (`Dockerfile.worker`)

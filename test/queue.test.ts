@@ -116,8 +116,9 @@ describe("investigation worker processing", () => {
       expect(isTransientInfrastructureError(permanent)).toBe(false);
     }
 
-    // Transient failure on a non-final attempt: rethrown as-is (BullMQ
-    // retries with backoff), no failure comment posted.
+    // Transient failure on a non-final attempt: rethrown as a sanitized,
+    // non-Unrecoverable error (BullMQ retries with backoff), no failure
+    // comment posted.
     const comments: string[] = [];
     const stages: InvestigationStage[] = [];
     const transientError = Object.assign(new Error("socket hang up"), {
@@ -140,12 +141,17 @@ describe("investigation worker processing", () => {
       },
     });
 
-    await expect(
-      processInvestigationJob(
-        { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
-        failingDeps(transientError),
-      ),
-    ).rejects.toBe(transientError);
+    const transientRejection = await processInvestigationJob(
+      { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
+      failingDeps(transientError),
+    ).then(
+      () => {
+        throw new Error("expected the job to reject");
+      },
+      (rejection: unknown) => rejection as Error,
+    );
+    expect(transientRejection).not.toBeInstanceOf(UnrecoverableError);
+    expect(transientRejection.message).toBe("socket hang up");
     expect(comments).toHaveLength(0);
 
     // Same transient failure on the final attempt: reported and permanent.
@@ -258,13 +264,14 @@ describe("worker-level state store writes", () => {
       reportStage: () => {},
     };
 
-    // Non-final attempt: rethrown exactly as-is so BullMQ retries with backoff.
+    // Non-final attempt: rethrown as a sanitized, non-Unrecoverable error so
+    // BullMQ retries with backoff.
     await expect(
       processInvestigationJob(
         { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
         deps,
       ),
-    ).rejects.toBe(transientError);
+    ).rejects.toThrowError("socket hang up");
 
     expect(pipelineRan).toBe(false);
 
@@ -279,6 +286,77 @@ describe("worker-level state store writes", () => {
     expect(record?.status).toBe("running");
     expect(record?.outcome).toBeNull();
     expect(record?.finishedAt).toBeNull();
+  });
+
+  test("failure paths redact secret-bearing errors from logs, state records, and thrown reasons", async () => {
+    const stateStore = createInMemoryInvestigationStateStore();
+    const logs: string[] = [];
+    const comments: string[] = [];
+    // Placeholder-only "secret" values; the assertion is that neither survives.
+    const secretBearingMessage =
+      "clone failed: Authorization: Bearer example-secret while DATABASE_URL=postgres://admin:redact-me@db/app";
+
+    const makeDeps = (error: unknown): WorkerDeps => ({
+      stateStore,
+      runPipeline: async () => {
+        throw error;
+      },
+      getInstallationToken: async () => ({ token: "t", permissions: null }),
+      postIssueComment: async ({ body }) => {
+        comments.push(body);
+      },
+      reportStage: () => {},
+      log: (message) => {
+        logs.push(message);
+      },
+    });
+
+    // Transient path (non-final attempt): log, state record, and the rethrown
+    // retry error are all redacted.
+    const transient = Object.assign(new Error(secretBearingMessage), {
+      code: "ECONNRESET",
+    });
+    const retryRejection = await processInvestigationJob(
+      { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
+      makeDeps(transient),
+    ).then(
+      () => {
+        throw new Error("expected the job to reject");
+      },
+      (rejection: unknown) => rejection as Error,
+    );
+    expect(retryRejection.message).toContain("[REDACTED]");
+    expect(retryRejection.message).not.toContain("example-secret");
+    expect(retryRejection.message).not.toContain("redact-me");
+
+    // Permanent path (final attempt): the UnrecoverableError message becomes
+    // the BullMQ failed reason and must be redacted too.
+    const finalRejection = await processInvestigationJob(
+      { data: jobPayload, attemptsMade: 2, opts: { attempts: 3 } },
+      makeDeps(new Error(secretBearingMessage)),
+    ).then(
+      () => {
+        throw new Error("expected the job to reject");
+      },
+      (rejection: unknown) => rejection as Error,
+    );
+    expect(finalRejection).toBeInstanceOf(UnrecoverableError);
+    expect(finalRejection.message).toContain("inv_0TEST123ABC");
+    expect(finalRejection.message).toContain("[REDACTED]");
+    expect(finalRejection.message).not.toContain("example-secret");
+    expect(finalRejection.message).not.toContain("redact-me");
+
+    // Nothing that left the worker carries either raw value: worker logs,
+    // GitHub comments, and every stored state-record error message are clean.
+    const record = await stateStore.get?.(jobPayload.investigationId);
+    const escaped = [
+      ...logs,
+      ...comments,
+      ...(record?.errors ?? []).map((entry) => entry.message),
+    ].join("\n");
+    expect(escaped).not.toContain("example-secret");
+    expect(escaped).not.toContain("redact-me");
+    expect(escaped).toContain("[REDACTED]");
   });
 
   test("a post-pipeline failure does not overwrite the pipeline's own final outcome", async () => {
