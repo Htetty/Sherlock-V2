@@ -160,6 +160,10 @@ describe("compose smoke test", () => {
     expect(override).toContain("ports: !reset []");
     expect(override).toContain('WEBHOOK_PROXY_URL: ""');
     expect(override.match(/REDIS_URL: redis:\/\/redis:6379/g)).toHaveLength(2);
+    // the fixed-name sandbox network is renamed so the smoke project never
+    // collides with (or attaches to) the real stack's sherlock-sandbox
+    expect(override).toContain("SHERLOCK_SANDBOX_NETWORK: sherlock-smoke-sandbox");
+    expect(override).toContain("name: sherlock-smoke-sandbox");
     expect(smokeOverrideYaml()).toBe(override);
     // temp override is cleaned up
     expect(removed).toEqual([FAKE_OVERRIDE_PATH]);

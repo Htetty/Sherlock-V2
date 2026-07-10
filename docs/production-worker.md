@@ -57,16 +57,28 @@ error handler instead of failing silently.
 ```bash
 docker build -f Dockerfile.worker -t sherlock-worker .
 
+# Shared sandbox network: a containerized worker cannot reach sibling target
+# containers via localhost, so both sides attach here and the worker probes
+# target apps by container name (docker-compose.prod.yml wires this up
+# automatically; only manual `docker run` needs these two steps).
+docker network create sherlock-sandbox
+
 docker run -d --name sherlock-worker \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  --network sherlock-sandbox \
+  -e SHERLOCK_SANDBOX_NETWORK=sherlock-sandbox \
   -e APP_ID=... \
   -e PRIVATE_KEY="$(cat private-key.pem)" \
   -e ANTHROPIC_API_KEY=... \
   -e REDIS_URL=redis://redis-host:6379 \
   sherlock-worker
 
-# one-off host verification with the same image
+# one-off host verification with the same image (--network is required: the
+# preflight verifies this container is actually ATTACHED to the sandbox
+# network, not just that the network exists)
 docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  --network sherlock-sandbox \
+  -e SHERLOCK_SANDBOX_NETWORK=sherlock-sandbox \
   -e APP_ID=... -e PRIVATE_KEY=... -e ANTHROPIC_API_KEY=... -e REDIS_URL=... \
   sherlock-worker npm run worker:check
 ```

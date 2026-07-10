@@ -12,17 +12,20 @@ import { appendBoundedText } from "./bounded-text.js";
 import { buildLaunchConfig, formatSanitizedCommand } from "./launch.js";
 import {
   buildTargetEnv,
+  getSandboxAddressing,
+  isContainerizedWorker,
   realDockerAdapter,
   runContainerCommand,
   startAppContainer,
   type DockerAdapter,
+  type SandboxAddressing,
 } from "./container.js";
 import {
   createRuntimeWorkspace,
   type RuntimeWorkspace,
 } from "./runtime-workspace.js";
 
-export type { DockerAdapter } from "./container.js";
+export type { DockerAdapter, SandboxAddressing } from "./container.js";
 
 const SANDBOX_STARTUP_TIMEOUT_MS = 30_000;
 const INSTALL_TIMEOUT_MS = 180_000;
@@ -96,12 +99,16 @@ export async function runSandboxInvestigation({
   docker = realDockerAdapter,
   probe = defaultProbe,
   portBindRetry = 0,
+  addressing = getSandboxAddressing(),
+  containerized = isContainerizedWorker(),
 }: {
   repoPath: string;
   startupTimeoutMs?: number;
   docker?: DockerAdapter;
   probe?: UrlProbe;
   portBindRetry?: number;
+  addressing?: SandboxAddressing;
+  containerized?: boolean;
 }): Promise<SandboxSession> {
   // Container-only policy: without Docker there is no safe way to run the
   // target repository's code, so the environment fails outright.
@@ -115,8 +122,20 @@ export async function runSandboxInvestigation({
     );
   }
 
+  // A containerized worker's localhost is the worker container itself, never
+  // the Docker host, so host-loopback addressing can only produce opaque
+  // probe timeouts. Fail immediately with the actual misconfiguration.
+  if (containerized && addressing.mode === "host") {
+    throw new SandboxUnreachableError(
+      [
+        "The Sherlock worker is running inside a container but SHERLOCK_SANDBOX_NETWORK is not set.",
+        "A containerized worker cannot reach sibling target-app containers through localhost; it must share a Docker network with them.",
+        "Set SHERLOCK_SANDBOX_NETWORK to a Docker bridge network the worker container is attached to (docker-compose.prod.yml configures this).",
+      ].join("\n"),
+    );
+  }
+
   const hostPort = await getAvailablePort();
-  const baseUrl = `http://localhost:${hostPort}`;
   const runtime = await createRuntimeWorkspace(repoPath);
 
   try {
@@ -153,6 +172,7 @@ export async function runSandboxInvestigation({
       internalPort: hostPort,
       strategy: "container-dynamic-port",
       installOutput: install,
+      addressing,
     });
 
     if (first.session) {
@@ -170,13 +190,16 @@ export async function runSandboxInvestigation({
         docker,
         probe,
         portBindRetry: portBindRetry + 1,
+        addressing,
+        containerized,
       });
     }
 
     // Hardcoded-port fallback: the app ignored PORT. Look for the fixed
-    // internal port it logged (bounded detection rules); that port is only
-    // ever used as the container-internal side of the mapping — the public
-    // base URL stays on the allocated host port.
+    // internal port it logged (bounded detection rules). Under host
+    // addressing that port is only ever the container-internal side of the
+    // mapping — the public base URL stays on the allocated host port; under
+    // network addressing the base URL targets the detected port directly.
     const internalPort = detectFixedInternalPort(
       `${first.stdout}\n${first.stderr}`,
       hostPort,
@@ -185,7 +208,7 @@ export async function runSandboxInvestigation({
     if (internalPort === null) {
       throw new SandboxUnreachableError(
         [
-          `Target application did not become reachable at ${baseUrl} and no fixed internal port could be detected from its startup output.`,
+          `Target application did not become reachable at ${first.baseUrl} and no fixed internal port could be detected from its startup output.`,
           `Attempted command: ${first.sanitizedCommand}`,
           `stdout (tail): ${tail(first.stdout)}`,
           `stderr (tail): ${tail(first.stderr)}`,
@@ -203,6 +226,7 @@ export async function runSandboxInvestigation({
       internalPort,
       strategy: "container-fixed-port",
       installOutput: install,
+      addressing,
     });
 
     if (second.session) {
@@ -211,7 +235,11 @@ export async function runSandboxInvestigation({
 
     throw new SandboxUnreachableError(
       [
-        `Target application (fixed internal port ${internalPort}) did not become reachable at ${baseUrl} through container port mapping ${hostPort}:${internalPort}.`,
+        `Target application (fixed internal port ${internalPort}) did not become reachable at ${second.baseUrl} ${
+          addressing.mode === "network"
+            ? `over the shared sandbox network "${addressing.network}"`
+            : `through container port mapping ${hostPort}:${internalPort}`
+        }.`,
         `Attempted command: ${second.sanitizedCommand}`,
         `stdout (tail): ${tail(second.stdout)}`,
         `stderr (tail): ${tail(second.stderr)}`,
@@ -230,6 +258,7 @@ function isPortBindFailure(output: string): boolean {
 
 type AttemptResult = {
   session: SandboxSession | null;
+  baseUrl: string;
   stdout: string;
   stderr: string;
   sanitizedCommand: string;
@@ -244,18 +273,34 @@ async function startApplicationAttempt(input: {
   internalPort: number;
   strategy: SandboxStrategy;
   installOutput: { stdout: string; stderr: string };
+  addressing: SandboxAddressing;
 }): Promise<AttemptResult> {
-  const baseUrl = `http://localhost:${input.hostPort}`;
-  // Launch flags/env are built against the container-internal port; the
-  // public base URL always stays on the allocated host port.
+  // Launch flags/env are built against the container-internal port; under
+  // host addressing the public base URL stays on the allocated host port,
+  // under network addressing it targets the container-internal port directly.
   const launch = await buildLaunchConfig(input.repoPath, input.internalPort);
 
   const app = startAppContainer(input.docker, {
     workspacePath: input.repoPath,
     env: buildTargetEnv({ port: input.internalPort }),
     command: [launch.command, ...launch.args],
-    portMapping: { hostPort: input.hostPort, containerPort: input.internalPort },
+    // Host addressing publishes the allocated host port on the host loopback.
+    // Network addressing publishes NOTHING: the app container joins the
+    // shared sandbox network and the worker reaches it by container name.
+    ...(input.addressing.mode === "network"
+      ? { network: { attachNetwork: input.addressing.network } }
+      : {
+          portMapping: {
+            hostPort: input.hostPort,
+            containerPort: input.internalPort,
+          },
+        }),
   });
+
+  const baseUrl =
+    input.addressing.mode === "network"
+      ? `http://${app.containerName}:${input.internalPort}`
+      : `http://localhost:${input.hostPort}`;
 
   const output: SandboxResult = {
     baseUrl,
@@ -285,6 +330,7 @@ async function startApplicationAttempt(input: {
 
     return {
       session: null,
+      baseUrl,
       stdout: output.stdout,
       stderr: output.stderr,
       sanitizedCommand: app.sanitizedCommand,
@@ -297,6 +343,7 @@ async function startApplicationAttempt(input: {
 
   return {
     session: { result: output, stop: app.stop },
+    baseUrl,
     stdout: output.stdout,
     stderr: output.stderr,
     sanitizedCommand: app.sanitizedCommand,

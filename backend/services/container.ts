@@ -23,6 +23,7 @@
 
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { promisify } from "node:util";
 import { appendBoundedText } from "./bounded-text.js";
 
@@ -45,9 +46,11 @@ export const CONTAINER_DEFAULTS = {
 //
 // Phases differ in what network they legitimately need:
 // - dependency install: outbound network (package registries) — always.
-// - app runtime: stays on the default bridge because localhost-only port
-//   publishing (-p 127.0.0.1:...) does not work without it. Its outbound
-//   access is a DOCUMENTED LIMITATION of the strict policy.
+// - app runtime: default bridge under host addressing (localhost-only port
+//   publishing, -p 127.0.0.1:..., does not work without it), or the shared
+//   sandbox bridge network under network addressing (see SandboxAddressing).
+//   Either way its outbound access is a DOCUMENTED LIMITATION of the strict
+//   policy.
 // - repository-validation commands: no network at all under strict.
 // - generated regression tests: under strict they either get no network
 //   (no app access needed) or join the app container's network namespace
@@ -79,7 +82,54 @@ export function getSandboxNetworkPolicy(
 // default (bridge) — required for installs and the published app port.
 export type ContainerNetwork =
   | "none"
-  | { joinContainer: string };
+  | { joinContainer: string }
+  | { attachNetwork: string };
+
+// --- Sandbox addressing -------------------------------------------------------
+//
+// How the worker reaches the target application:
+// - "host" (default): the app container publishes its port on the host
+//   loopback and the worker probes http://localhost:<hostPort>. Correct only
+//   when the worker process runs directly on the Docker host (local dev).
+// - "network": SHERLOCK_SANDBOX_NETWORK names a Docker bridge network shared
+//   by the worker container and every target app container. The app publishes
+//   NO host port; the worker probes http://<containerName>:<port> over that
+//   network via Docker DNS. Required when the worker itself runs in a
+//   container (docker-compose.prod.yml): its localhost is the worker
+//   container, not the Docker host, so host mode can never reach a sibling.
+//   Only the worker and short-lived target containers attach to this network;
+//   Sherlock's api/redis must stay off it so target code cannot reach them.
+
+export type SandboxAddressing =
+  | { mode: "host" }
+  | { mode: "network"; network: string };
+
+export function getSandboxAddressing(
+  env: NodeJS.ProcessEnv = process.env,
+): SandboxAddressing {
+  const network = (env.SHERLOCK_SANDBOX_NETWORK ?? "").trim();
+
+  return network === "" ? { mode: "host" } : { mode: "network", network };
+}
+
+// A containerized worker left in host mode fails every probe with an opaque
+// timeout; detecting the situation lets the sandbox fail with the real cause.
+// SHERLOCK_WORKER_CONTAINERIZED overrides in either direction; otherwise the
+// Docker-created /.dockerenv marker decides.
+export function isContainerizedWorker(
+  env: NodeJS.ProcessEnv = process.env,
+  fileExists: (path: string) => boolean = existsSync,
+): boolean {
+  if (env.SHERLOCK_WORKER_CONTAINERIZED === "true") {
+    return true;
+  }
+
+  if (env.SHERLOCK_WORKER_CONTAINERIZED === "false") {
+    return false;
+  }
+
+  return fileExists("/.dockerenv");
+}
 
 // --- Target environment construction ----------------------------------------
 //
@@ -216,8 +266,10 @@ export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
 
   if (spec.network === "none") {
     args.push("--network=none");
-  } else if (spec.network) {
+  } else if (spec.network && "joinContainer" in spec.network) {
     args.push(`--network=container:${spec.network.joinContainer}`);
+  } else if (spec.network) {
+    args.push(`--network=${spec.network.attachNetwork}`);
   }
 
   // --add-host is invalid with a container-mode netns and pointless with

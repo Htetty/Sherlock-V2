@@ -116,7 +116,7 @@ export function validateReproductionPlan(value: unknown): PlanValidationResult {
 
   if (typeof plan.baseUrl !== "string" || !isSafeBaseUrl(plan.baseUrl)) {
     errors.push(
-      "Plan baseUrl must be an http(s) URL pointing at localhost or 127.0.0.1.",
+      "Plan baseUrl must be an http(s) URL pointing at localhost, 127.0.0.1, or the sandbox app container.",
     );
   }
 
@@ -411,13 +411,21 @@ export function isDomTargetIntent(value: unknown): value is DomTargetIntent {
   );
 }
 
+// Under network addressing (containerized worker; see SandboxAddressing in
+// container.ts) the sandbox base URL names the target app container on the
+// shared sandbox network instead of localhost. Container names come from
+// createContainerName("app") in container.ts: sherlock-app-<uuid>.
+const SANDBOX_APP_CONTAINER_HOSTNAME = /^sherlock-app-[0-9a-f-]{36}$/i;
+
 function isSafeBaseUrl(value: string) {
   try {
     const url = new URL(value);
 
     return (
       (url.protocol === "http:" || url.protocol === "https:") &&
-      (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+      (url.hostname === "localhost" ||
+        url.hostname === "127.0.0.1" ||
+        SANDBOX_APP_CONTAINER_HOSTNAME.test(url.hostname))
     );
   } catch {
     return false;

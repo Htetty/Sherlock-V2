@@ -313,6 +313,57 @@ describe("regression container execution", () => {
     );
   });
 
+  test("network addressing (containerized worker): fallback attaches to the sandbox network and keeps the container-name URL", async () => {
+    const spawnedByCall: string[][] = [];
+    const adapter: DockerAdapter = {
+      isAvailable: async () => true,
+      spawnContainer: (args) => {
+        spawnedByCall.push(args);
+        const proc = new EventEmitter() as any;
+        proc.stdout = new EventEmitter();
+        proc.stderr = new EventEmitter();
+        proc.exitCode = null;
+        proc.kill = () => true;
+        setImmediate(() => proc.emit("close", 0));
+        return proc as ChildProcessWithoutNullStreams;
+      },
+      removeContainer: async () => {},
+    };
+    const containerUrl = "http://sherlock-app-2b8ee9ba-6a11-4b53-9d6d-0d47a29f1a01:3000";
+
+    // No identified app container: the test container must join the shared
+    // sandbox network, because only Docker DNS on that network can resolve
+    // the app container's name — a host-gateway alias never could.
+    await runRegressionTest(adapter, {
+      repoPath: "/tmp/ws",
+      relativePath: "t.mjs",
+      targetUrl: containerUrl,
+      networkPolicy: "permissive",
+      sandboxNetwork: "sherlock-sandbox",
+      timeoutMs: 5_000,
+    });
+
+    const attached = spawnedByCall[0];
+    expect(attached).toContain("--network=sherlock-sandbox");
+    expect(attached.join(" ")).toContain(`-e SHERLOCK_TARGET_URL=${containerUrl}`);
+    expect(attached.join(" ")).not.toContain("--add-host");
+    expect(attached.join(" ")).not.toContain("host.docker.internal");
+
+    // Strict with an identified app container still prefers joining its
+    // network namespace over the shared network.
+    await runRegressionTest(adapter, {
+      repoPath: "/tmp/ws",
+      relativePath: "t.mjs",
+      targetUrl: containerUrl,
+      appNetwork: { containerName: "sherlock-app-xyz", internalPort: 3000 },
+      networkPolicy: "strict",
+      sandboxNetwork: "sherlock-sandbox",
+      timeoutMs: 5_000,
+    });
+    expect(spawnedByCall[1]).toContain("--network=container:sherlock-app-xyz");
+    expect(spawnedByCall[1].join(" ")).not.toContain("--network=sherlock-sandbox");
+  });
+
   test("timeout forces cleanup and reports timed-out state", async () => {
     const removed: string[] = [];
     const adapter: DockerAdapter = {

@@ -161,6 +161,23 @@ describe("validateReproductionPlan", () => {
     expect(result.ok).toBe(false);
   });
 
+  test("accepts the sandbox app container hostname (network addressing) but no other remote host", () => {
+    // Under a containerized worker the sandbox base URL names the target app
+    // container on the shared sandbox network (container.ts createContainerName).
+    const containerHost = validateReproductionPlan({
+      ...validPlan,
+      baseUrl: "http://sherlock-app-2b8ee9ba-6a11-4b53-9d6d-0d47a29f1a01:51234",
+    });
+    expect(containerHost.ok).toBe(true);
+
+    // Names that merely resemble the prefix stay rejected.
+    const lookalike = validateReproductionPlan({
+      ...validPlan,
+      baseUrl: "http://sherlock-app-evil.example.com:51234",
+    });
+    expect(lookalike.ok).toBe(false);
+  });
+
   test("rejects a plan with the wrong version", () => {
     const result = validateReproductionPlan({ ...validPlan, version: 999 });
 
