@@ -103,6 +103,24 @@ describe("webhook command Redis claim", () => {
     }
   });
 
+  test("a deduplicated redelivery never invokes onClaim, so it consumes no rate-limit quota", async () => {
+    const { redis } = createRedisMock();
+    const { queue, added } = createQueueMock();
+    const adapter = createInvestigationQueueAdapter(redis, queue);
+    let onClaimCalls = 0;
+    const onClaim = () => {
+      onClaimCalls += 1;
+      return true;
+    };
+
+    await adapter.add(payload, { onClaim });
+    const redelivery = await adapter.add(payload, { onClaim });
+
+    expect(redelivery.deduplicated).toBe(true);
+    expect(onClaimCalls).toBe(1);
+    expect(added).toHaveLength(1);
+  });
+
   test("enqueue failure compare-deletes its claim and permits retry", async () => {
     const { redis, values } = createRedisMock();
     let attempts = 0;

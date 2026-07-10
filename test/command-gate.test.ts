@@ -1,6 +1,7 @@
 // Authorized-command gate: exact-command parsing, bot filtering, repository
-// permission checks, and the in-process rate limiter. GitHub permission
-// lookups and the queue are injected; nock covers the comment-posting API.
+// permission checks, and rate-limit rejection behavior. GitHub permission
+// lookups, the queue, and the rate limiter are injected; nock covers the
+// comment-posting API. Limiter internals are tested in rate-limit.test.ts.
 import nock from "nock";
 import fs from "node:fs";
 import path from "node:path";
@@ -9,12 +10,11 @@ import { Probot, ProbotOctokit } from "probot";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createSherlockApp, type GetRepositoryRole } from "../src/index.js";
 import {
-  createInstallationRateLimiter,
   isAuthorizedRole,
   isBotUser,
   parseSherlockCommand,
-  type InstallationRateLimiter,
 } from "../src/command-gate.js";
+import type { InvestigationRateLimiter } from "../backend/services/rate-limit.js";
 import {
   buildInvestigationJobId,
   type InvestigationJobPayload,
@@ -97,7 +97,7 @@ function mockCommentPost(expectedText: string) {
 function buildProbot(deps: {
   queue: InvestigationQueueAdapter;
   getRepositoryRole?: GetRepositoryRole;
-  rateLimiter?: InstallationRateLimiter;
+  rateLimiter?: InvestigationRateLimiter;
 }) {
   const probot = new Probot({
     appId: 123,
@@ -109,7 +109,22 @@ function buildProbot(deps: {
     })),
   });
 
-  probot.load(createSherlockApp(deps));
+  probot.load(
+    createSherlockApp({
+      // Default to a permissive limiter: the production default would open a
+      // real Redis connection. Limiter behavior itself is rate-limit.test.ts.
+      rateLimiter: {
+        checkAndConsumeInvestigationRateLimit: async (tenantKey) => ({
+          allowed: true,
+          tenantKey,
+          count: 1,
+          limit: 10,
+          windowSeconds: 3600,
+        }),
+      },
+      ...deps,
+    }),
+  );
   return probot;
 }
 
@@ -275,32 +290,31 @@ describe("authorized command gate", () => {
     expect(fake.jobs.size).toBe(0);
     expect(failureMock.pendingMocks()).toStrictEqual([]);
 
-    // Rate limiter unit behavior: bounded window with injected clock.
-    let currentTime = 0;
-    const limiter = createInstallationRateLimiter({
-      maxCommands: 2,
-      windowMs: 10_000,
-      now: () => currentTime,
-    });
-
-    expect(limiter.tryAcquire(2)).toBe(true);
-    expect(limiter.tryAcquire(2)).toBe(true);
-    expect(limiter.tryAcquire(2)).toBe(false); // budget exhausted
-    expect(limiter.tryAcquire(7)).toBe(true); // other installations unaffected
-    currentTime = 11_000; // window elapsed
-    expect(limiter.tryAcquire(2)).toBe(true);
-
-    // Exhausted limiter at the webhook level: comment posted, no job.
+    // Exhausted limiter at the webhook level: comment posted, no job. The
+    // limiter is keyed by the tenant derived from the installation id.
+    const limitedTenants: string[] = [];
     const limited = createFakeQueue();
     const limitedProbot = buildProbot({
       queue: limited.adapter,
       getRepositoryRole: async () => ({ roleName: "admin" }),
-      rateLimiter: { tryAcquire: () => false },
+      rateLimiter: {
+        checkAndConsumeInvestigationRateLimit: async (tenantKey) => {
+          limitedTenants.push(tenantKey);
+          return {
+            allowed: false,
+            tenantKey,
+            count: 11,
+            limit: 10,
+            windowSeconds: 3600,
+          };
+        },
+      },
     });
     const limitMock = mockCommentPost("too many investigation requests");
 
     await receiveComment(limitedProbot);
     expect(limited.jobs.size).toBe(0);
+    expect(limitedTenants).toEqual(["tenant-gh-2"]);
     expect(limitMock.pendingMocks()).toStrictEqual([]);
   });
 });

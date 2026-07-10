@@ -14,6 +14,21 @@ import {
   type InvestigationJobPayload,
   type InvestigationQueueAdapter,
 } from "../backend/queue/investigation-queue.js";
+import type { InvestigationRateLimiter } from "../backend/services/rate-limit.js";
+
+// Permissive limiter fake: these tests focus on queueing behavior, and the
+// default (injected only when absent) would open a real Redis connection.
+function allowAllRateLimiter(): InvestigationRateLimiter {
+  return {
+    checkAndConsumeInvestigationRateLimit: async (tenantKey) => ({
+      allowed: true,
+      tenantKey,
+      count: 1,
+      limit: 10,
+      windowSeconds: 3600,
+    }),
+  };
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -111,6 +126,7 @@ describe("Sherlock webhook (queued investigations)", () => {
         // Authorization is covered in command-gate.test.ts; these tests
         // focus on queueing behavior.
         getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: allowAllRateLimiter(),
       }),
     );
   });
@@ -188,9 +204,15 @@ describe("Sherlock webhook (queued investigations)", () => {
         queue: fake.adapter,
         getRepositoryRole: async () => ({ roleName: "write" }),
         rateLimiter: {
-          tryAcquire: () => {
+          checkAndConsumeInvestigationRateLimit: async (tenantKey) => {
             rateLimitSlots += 1;
-            return true;
+            return {
+              allowed: true,
+              tenantKey,
+              count: rateLimitSlots,
+              limit: 10,
+              windowSeconds: 3600,
+            };
           },
         },
       }),

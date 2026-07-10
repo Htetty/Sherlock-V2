@@ -7,16 +7,20 @@ import { Probot } from "probot";
 import { createInvestigationId } from "../backend/services/artifacts.js";
 import {
   createInvestigationQueueAdapter,
+  createRedisConnection,
   deriveTenantIdFromInstallation,
   type InvestigationJobPayload,
   type InvestigationQueueAdapter,
 } from "../backend/queue/investigation-queue.js";
 import {
-  createInstallationRateLimiter,
+  asScriptRunner,
+  createInvestigationRateLimiter,
+  type InvestigationRateLimiter,
+} from "../backend/services/rate-limit.js";
+import {
   isAuthorizedRole,
   isBotUser,
   parseSherlockCommand,
-  type InstallationRateLimiter,
   type RepositoryRole,
 } from "./command-gate.js";
 
@@ -60,7 +64,7 @@ const defaultGetRepositoryRole: GetRepositoryRole = async (octokit, params) => {
 export type SherlockAppDeps = {
   queue?: InvestigationQueueAdapter;
   getRepositoryRole?: GetRepositoryRole;
-  rateLimiter?: InstallationRateLimiter;
+  rateLimiter?: InvestigationRateLimiter;
 };
 
 // Dependencies are injectable so webhook tests run without Redis or the
@@ -69,12 +73,25 @@ export const createSherlockApp =
   (deps: SherlockAppDeps = {}) =>
   (app: Probot) => {
     let queue = deps.queue ?? null;
+    let rateLimiter = deps.rateLimiter ?? null;
     const getRepositoryRole = deps.getRepositoryRole ?? defaultGetRepositoryRole;
-    const rateLimiter = deps.rateLimiter ?? createInstallationRateLimiter();
 
     const getQueue = () => {
       queue ??= createInvestigationQueueAdapter();
       return queue;
+    };
+
+    // Redis-backed limiter shared across all backend/worker processes; its
+    // decisions are logged inside the service (tenant key, count, limit).
+    const getRateLimiter = () => {
+      if (!rateLimiter) {
+        let redis: ReturnType<typeof asScriptRunner> | null = null;
+        rateLimiter = createInvestigationRateLimiter(
+          () => (redis ??= asScriptRunner(createRedisConnection())),
+        );
+      }
+
+      return rateLimiter;
     };
 
     app.on("issue_comment.created", async (context) => {
@@ -166,9 +183,15 @@ export const createSherlockApp =
       };
 
       // The queue atomically claims this command before invoking onClaim.
-      // Thus only an authorized claim winner consumes a rate-limit slot.
+      // Thus only an authorized claim winner (never a deduplicated
+      // redelivery) consumes a rate-limit slot.
       const { jobId, deduplicated, rateLimited } = await getQueue().add(jobPayload, {
-        onClaim: () => rateLimiter.tryAcquire(installationId),
+        onClaim: async () => {
+          const decision =
+            await getRateLimiter().checkAndConsumeInvestigationRateLimit(tenantId);
+
+          return decision.allowed;
+        },
       });
 
       if (deduplicated) {

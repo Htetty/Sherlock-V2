@@ -7,12 +7,16 @@
 // verification — are successful pipeline *results*, never retries. Any other
 // error fails permanently via UnrecoverableError.
 
-import { UnrecoverableError } from "bullmq";
+import { DelayedError, UnrecoverableError } from "bullmq";
 import type {
   InvestigationPipelineInput,
   InvestigationPipelineResult,
   InvestigationStage,
 } from "../services/investigation.js";
+import {
+  buildRepoConcurrencyKey,
+  type InvestigationConcurrencyGate,
+} from "../services/rate-limit.js";
 import { RepositoryError } from "../services/repo-auth.js";
 import { redactSecrets } from "../services/report.js";
 import {
@@ -131,6 +135,69 @@ export function formatWorkerFailureComment(
       "Any artifacts collected before the failure were preserved on the Sherlock server.",
     ].join("\n"),
   );
+}
+
+// How long a concurrency-blocked job waits before the queue retries it.
+// Intentional delay through the queue — never a drop and never a failure.
+export const CONCURRENCY_BLOCKED_RETRY_DELAY_MS = 30_000;
+
+export type ConcurrencyHooks = {
+  gate: InvestigationConcurrencyGate;
+  // Moves this job back to the delayed set (BullMQ job.moveToDelayed with
+  // the worker token); processInvestigationJobWithConcurrency then throws
+  // DelayedError so BullMQ treats the job as rescheduled, not failed.
+  delayJob: (delayMs: number) => Promise<void>;
+  retryDelayMs?: number;
+};
+
+// Wraps job processing with the Redis-backed concurrency gate: acquire a
+// tenant+repo slot before the pipeline runs, always release it afterwards
+// (success, logical outcome, or throw), and delay the job when no slot is
+// free. With hooks=null behavior is identical to processInvestigationJob.
+export async function processInvestigationJobWithConcurrency(
+  job: InvestigationJobLike,
+  deps: WorkerDeps,
+  hooks: ConcurrencyHooks | null,
+): Promise<{ investigationId: string; outcome: string }> {
+  if (!hooks) {
+    return processInvestigationJob(job, deps);
+  }
+
+  const log = deps.log ?? (() => {});
+  const slot = {
+    tenantKey: job.data.tenantId,
+    repoKey: buildRepoConcurrencyKey(
+      job.data.repositoryOwner,
+      job.data.repositoryName,
+    ),
+    investigationId: job.data.investigationId,
+  };
+
+  const decision = await hooks.gate.acquireInvestigationConcurrency(slot);
+
+  if (!decision.acquired) {
+    const delayMs = hooks.retryDelayMs ?? CONCURRENCY_BLOCKED_RETRY_DELAY_MS;
+
+    log(
+      `[${slot.investigationId}] Concurrency limit reached (${decision.blockedBy}: ${decision.blockedBy === "repo" ? decision.repoActive : decision.tenantActive} active, limit ${decision.limit}); delaying job by ${delayMs}ms.`,
+    );
+    await hooks.delayJob(delayMs);
+    throw new DelayedError(
+      `Investigation ${slot.investigationId} delayed: ${decision.blockedBy} concurrency limit reached.`,
+    );
+  }
+
+  try {
+    return await processInvestigationJob(job, deps);
+  } finally {
+    // Slot release must survive every exit path; a failed release only
+    // falls back to the TTL-based stale eviction, never a permanent block.
+    await hooks.gate.releaseInvestigationConcurrency(slot).catch((error: unknown) => {
+      log(
+        `[${slot.investigationId}] Could not release concurrency slot (stale-slot TTL will reclaim it): ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
 }
 
 export async function processInvestigationJob(

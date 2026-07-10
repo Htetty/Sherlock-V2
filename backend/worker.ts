@@ -20,12 +20,16 @@ import {
   type InvestigationJobPayload,
 } from "./queue/investigation-queue.js";
 import {
-  processInvestigationJob,
+  processInvestigationJobWithConcurrency,
   type WorkerDeps,
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
+import {
+  asScriptRunner,
+  createInvestigationConcurrencyGate,
+} from "./services/rate-limit.js";
 import {
   describeWorkerError,
   enforceStartupChecks,
@@ -100,16 +104,32 @@ if (!proceed) {
   process.exit(1);
 }
 
+// Redis-backed tenant/repo concurrency, shared across every worker process
+// on this queue. Slots carry a TTL, so a crashed worker cannot permanently
+// hold one; a blocked job is intentionally delayed, never dropped.
+const concurrencyGate = createInvestigationConcurrencyGate(() =>
+  asScriptRunner(connection),
+);
+
 const worker = new Worker<InvestigationJobPayload>(
   INVESTIGATION_QUEUE_NAME,
-  async (job: Job<InvestigationJobPayload>) =>
-    processInvestigationJob(job, {
-      ...deps,
-      reportStage: async (stage) => {
-        console.log(`[${job.data.investigationId}] Stage: ${stage}`);
-        await job.updateProgress({ stage });
+  async (job: Job<InvestigationJobPayload>, token?: string) =>
+    processInvestigationJobWithConcurrency(
+      job,
+      {
+        ...deps,
+        reportStage: async (stage) => {
+          console.log(`[${job.data.investigationId}] Stage: ${stage}`);
+          await job.updateProgress({ stage });
+        },
       },
-    }),
+      {
+        gate: concurrencyGate,
+        delayJob: async (delayMs) => {
+          await job.moveToDelayed(Date.now() + delayMs, token);
+        },
+      },
+    ),
   { connection, concurrency },
 );
 

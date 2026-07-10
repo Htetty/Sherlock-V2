@@ -173,6 +173,10 @@ function scriptedModel(script: Anthropic.Messages.Message[]): {
 // message of the NEXT call's params.
 function lastToolResultText(params: RecordedCall): string {
   const last = params.messages[params.messages.length - 1];
+  if (!Array.isArray(last.content)) {
+    return "";
+  }
+
   const blocks = last.content as Array<{ type: string; content?: unknown }>;
   const block = blocks.find((item) => item.type === "tool_result");
 
@@ -339,6 +343,75 @@ describe("fixer agent loop", () => {
     expect(result.fixAttempt?.outcome).not.toBe("verified");
   });
 
+  test("repairs confidence accidentally embedded in rootCause before verification", async () => {
+    const input = await makeInput();
+    const malformedProposal = {
+      ...PROPOSAL_INPUT,
+      confidence: undefined,
+      rootCause:
+        `${PROPOSAL_INPUT.rootCause}</rootCause>\n<parameter name="confidence">0.85`,
+    };
+    delete (malformedProposal as Record<string, unknown>).confidence;
+    const model = scriptedModel([toolUseMessage("propose_patch", malformedProposal)]);
+
+    const verifierCalls: unknown[] = [];
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async (attemptInput) => {
+        verifierCalls.push(attemptInput.proposal);
+        return attemptResult("verified", "Replay clean.");
+      },
+    });
+
+    expect(result.status).toBe("verified");
+    expect(result.failureCode).toBeNull();
+    expect(verifierCalls).toHaveLength(1);
+    expect(verifierCalls[0]).toMatchObject({
+      confidence: 0.85,
+      rootCause: PROPOSAL_INPUT.rootCause,
+    });
+  });
+
+  test("classifies exhausted no-patch exploration as fixer_no_patch_attempt", async () => {
+    const input = await makeInput();
+    const model = scriptedModel(
+      Array.from({ length: FIXER_BUDGETS.maxModelTurns }, () =>
+        toolUseMessage("read_file", { path: "server.js" }),
+      ),
+    );
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        throw new Error("verifier must not run without a patch");
+      },
+    });
+
+    expect(result.status).toBe("exhausted");
+    expect(result.attempts).toHaveLength(0);
+    expect(result.failureCode).toBe("fixer_no_patch_attempt");
+
+    const blockedFeedback = model.calls
+      .map(lastToolResultText)
+      .find((text) => text.includes("Exploration budget exhausted"));
+    expect(blockedFeedback).toContain(
+      "Exploration budget exhausted. You must now call propose_patch or submit_blocked.",
+    );
+
+    const summary = JSON.parse(
+      await readFile(path.join(input.investigationDir, "fix-agent", "summary.json"), "utf8"),
+    ) as {
+      failureCode: string | null;
+      patchAttempts: number;
+      turns: number;
+    };
+    expect(summary).toMatchObject({
+      failureCode: "fixer_no_patch_attempt",
+      patchAttempts: 0,
+      turns: FIXER_BUDGETS.maxModelTurns,
+    });
+  });
+
   test("rejects path traversal and absolute paths without touching the filesystem", async () => {
     const input = await makeInput();
     const model = scriptedModel([
@@ -398,6 +471,29 @@ describe("fixer agent loop", () => {
     const input = await makeInput();
     const model = scriptedModel([
       toolUseMessage("read_file", { path: "server.js", startLine: 2, endLine: 3 }),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        throw new Error("verifier must not run in this test");
+      },
+    });
+
+    expect(result.status).toBe("blocked");
+
+    const span = lastToolResultText(model.calls[1]);
+    expect(span).toContain("[server.js lines 2-3 of 5]");
+    expect(span).toContain("// BUG: returns 500");
+    expect(span).toContain("return { status: 500 };");
+    expect(span).not.toContain("export function login");
+  });
+
+  test("read_file accepts comma string ranges without dumping the full file", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("read_file", { path: "server.js", startLine: "2, 3" }),
       toolUseMessage("submit_blocked", { reason: "done" }),
     ]);
 
@@ -486,5 +582,96 @@ describe("fixer agent loop", () => {
     const secondCall = model.calls[1];
     const nudge = secondCall.messages[secondCall.messages.length - 1];
     expect(nudge.content).toBe("Respond with exactly one tool call.");
+  });
+
+  test("read_file of a fully hydrated file is rejected without consuming budget", async () => {
+    const input = await makeInput({
+      initialSourceFiles: [
+        { path: "server.js", contents: "hydrated contents", truncated: false },
+      ],
+    });
+    const model = scriptedModel([
+      toolUseMessage("read_file", { path: "server.js" }),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+    ]);
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    expect(result.status).toBe("verified");
+
+    // The redundant read was rejected with an instructive error...
+    const feedback = lastToolResultText(model.calls[1]);
+    expect(feedback).toContain("REDUNDANT read_file rejected");
+    expect(feedback).toContain("server.js");
+
+    // ...and the read_file budget was NOT consumed.
+    const summary = JSON.parse(
+      await readFile(
+        path.join(input.investigationDir, "fix-agent", "summary.json"),
+        "utf8",
+      ),
+    ) as { counters: { readFile: number } };
+    expect(summary.counters.readFile).toBe(0);
+
+    // The hydrated file list and strict rules are in the system prompt.
+    expect(String(model.calls[0].system)).toContain("REJECTED automatically: server.js");
+  });
+
+  test("truncated hydrated files may still be read", async () => {
+    const input = await makeInput({
+      initialSourceFiles: [
+        { path: "server.js", contents: "partial contents", truncated: true },
+      ],
+    });
+    const model = scriptedModel([
+      toolUseMessage("read_file", { path: "server.js" }),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+    ]);
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    expect(result.status).toBe("verified");
+    expect(lastToolResultText(model.calls[1])).toContain("BUG: returns 500");
+  });
+
+  test("pastInvestigations memory reaches the initial message with memory-first rules", async () => {
+    const input = await makeInput({
+      pastInvestigations:
+        'PAST: "Login returns 500 for unknown users" -> verified\n  verified fix diff (patched files are UNCHANGED since this fix — reapply this exact change unless current evidence contradicts it):\n    diff --git a/server.js b/server.js',
+    });
+    const model = scriptedModel([toolUseMessage("propose_patch", PROPOSAL_INPUT)]);
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    expect(result.status).toBe("verified");
+
+    const initial = model.calls[0].messages[0].content as string;
+    expect(initial).toContain("PAST INVESTIGATIONS (this repo — READ BEFORE ANY TOOL CALL)");
+    expect(initial).toContain("verified fix diff");
+    expect(initial).toContain("Adapt it into propose_patch");
+    expect(String(model.calls[0].system)).toContain("MEMORY FIRST");
+  });
+
+  test("without memory the initial message omits the past section", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([toolUseMessage("propose_patch", PROPOSAL_INPUT)]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    const initial = model.calls[0].messages[0].content as string;
+    expect(initial).not.toContain("PAST INVESTIGATIONS");
+    expect(String(model.calls[0].system)).not.toContain("MEMORY FIRST");
   });
 });

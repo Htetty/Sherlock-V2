@@ -10,6 +10,8 @@ import type { ReproductionPlan } from "./plan.js";
 
 const MAX_MATCHES = 3;
 const DEFAULT_MAX_MEMORY_ENTRIES = 100;
+// Bound stored/rendered fix diffs so memory.json and prompts stay small.
+export const MAX_FIX_DIFF_CHARS = 20_000;
 const memoryWriteLocks = new Map<string, Promise<void>>();
 
 export type MemoryOutcome =
@@ -36,7 +38,18 @@ export type MemoryEntry = {
   // candidates — no migration required. NEVER trusted without a fresh
   // executeReproductionPlan() replay.
   reproductionPlan?: ReproductionPlan;
+  // The exact verified git diff (bounded). Optional and backward compatible.
+  // Lets the fixer reuse HOW the same bug was fixed, not just where.
+  fixDiff?: string;
 };
+
+export function boundFixDiff(diff: string): string {
+  if (diff.length <= MAX_FIX_DIFF_CHARS) {
+    return diff;
+  }
+
+  return `${diff.slice(0, MAX_FIX_DIFF_CHARS)}\n[FIX DIFF TRUNCATED]`;
+}
 
 export function dataDir(): string {
   return process.env.SHERLOCK_DATA_DIR ?? path.join(homedir(), ".sherlock");
@@ -172,10 +185,28 @@ export async function renderPastInvestigations(
       );
     }
 
+    // Verified fixes carry the exact diff that worked. A fresh (non-stale)
+    // diff is the strongest possible hint: the same bug was already fixed.
+    if (entry.outcome === "verified" && entry.fixDiff) {
+      lines.push(
+        staleFile
+          ? `  verified fix diff (STALE — patched files changed since; adapt, do not apply blindly):`
+          : `  verified fix diff (patched files are UNCHANGED since this fix — reapply this exact change unless current evidence contradicts it):`,
+        indentBlock(boundFixDiff(entry.fixDiff), "    "),
+      );
+    }
+
     blocks.push(lines.join("\n"));
   }
 
   return blocks.join("\n\n");
+}
+
+function indentBlock(text: string, prefix: string): string {
+  return text
+    .split("\n")
+    .map((line) => `${prefix}${line}`)
+    .join("\n");
 }
 
 // Staleness by patched-file hashes. Useful but insufficient for replay (a

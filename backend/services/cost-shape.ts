@@ -22,6 +22,7 @@ export type CostShape = {
   reproducerTurns: number;
   fixerTurns: number;
   fixerPatchAttempts: number;
+  fixerFailureCode: string | null;
   budgetProfile: BudgetProfileName;
   compactionEvents: number;
 };
@@ -49,6 +50,7 @@ export function createCostShapeTracker(
     reproducerTurns: 0,
     fixerTurns: 0,
     fixerPatchAttempts: 0,
+    fixerFailureCode: null,
     budgetProfile,
     compactionEvents: 0,
   };

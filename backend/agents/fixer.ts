@@ -31,7 +31,11 @@ import {
   type RestartResult,
 } from "../services/fix.js";
 import type { AppNetworkTarget } from "../services/regression-test.js";
-import { FIX_PROPOSAL_VERSION, PATCH_LIMITS } from "../services/fix-proposal.js";
+import {
+  FIX_PROPOSAL_VERSION,
+  PATCH_LIMITS,
+  validateFixProposalShape,
+} from "../services/fix-proposal.js";
 import { queryGraphNeighbors, type GraphContext } from "../services/graphContext.js";
 import type { ReproductionPlan } from "../services/plan.js";
 import type { ReproductionResult } from "../services/playwright.js";
@@ -63,10 +67,11 @@ const FIXER_SHARED_LIMITS = {
 
 export const STANDARD_FIXER_BUDGETS = {
   ...FIXER_SHARED_LIMITS,
-  maxModelTurns: 16,
-  maxReadFileCalls: 8,
-  maxGrepCalls: 4,
-  maxGraphCalls: 4,
+  maxModelTurns: 10,
+  maxReadFileCalls: 4,
+  maxGrepCalls: 2,
+  maxGraphCalls: 3,
+  maxExplorationBeforeFirstPatch: 6,
   maxPatchAttempts: 2,
 };
 
@@ -76,6 +81,7 @@ export const DEEP_FIXER_BUDGETS = {
   maxReadFileCalls: 20,
   maxGrepCalls: 10,
   maxGraphCalls: 10,
+  maxExplorationBeforeFirstPatch: 12,
   maxPatchAttempts: 3,
 };
 
@@ -121,6 +127,9 @@ export type FixerAgentInput = {
   reproductionResult: ReproductionResult;
   graphContext: GraphContext;
   initialSourceFiles: SourceFile[];
+  // Rendered PAST INVESTIGATIONS memory (renderPastInvestigations), including
+  // verified fix diffs and staleness markers. Empty string when no matches.
+  pastInvestigations?: string;
   restart: () => Promise<RestartResult>;
   // --- Verification extras (dev: repo validation + regression tests) ------
   // "owner/name" used in validation artifacts; never a URL or secret.
@@ -137,6 +146,12 @@ export type FixerAgentInput = {
 };
 
 export type FixerAgentStatus = "verified" | "blocked" | "exhausted" | "failed";
+export type FixerFailureCode =
+  | "fixer_no_patch_attempt"
+  | "proposal_format_invalid"
+  | "fixer_patch_failed_verification"
+  | "fixer_patch_rejected_safety"
+  | "fixer_patch_failed_tests";
 
 export type FixerAgentAttempt = {
   index: number;
@@ -150,6 +165,7 @@ export type FixerAgentResult = {
   fixAttempt: FixAttemptResult | null;
   status: FixerAgentStatus;
   reason: string;
+  failureCode: FixerFailureCode | null;
   attempts: FixerAgentAttempt[];
   // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
   turns: number;
@@ -314,10 +330,20 @@ export async function runFixerAgent(
     grep: 0,
     graph: 0,
     patchAttempts: 0,
+    malformedPatchProposals: 0,
     evidenceBytes: 0,
   };
   const attempts: FixerAgentAttempt[] = [];
   const transcript: unknown[] = [];
+
+  // Files whose FULL contents are already in the initial message. Re-reading
+  // them is deterministically rejected (no budget consumed) — the model must
+  // use the provided context instead of rediscovering it with tools.
+  const hydratedFullFiles = new Set(
+    input.initialSourceFiles
+      .filter((file) => !file.truncated)
+      .map((file) => path.normalize(file.path).split(path.sep).join("/")),
+  );
   let toolCallIndex = 0;
   let lastAttempt: FixAttemptResult | null = null;
   let nudged = false;
@@ -359,27 +385,43 @@ export async function runFixerAgent(
     reason: string,
     fixAttempt: FixAttemptResult | null,
   ): Promise<FixerAgentResult> => {
+    const failureCode = classifyFixerFailure(
+      status,
+      counters.patchAttempts,
+      counters.malformedPatchProposals,
+      fixAttempt,
+    );
     const result: FixerAgentResult = {
       fixAttempt,
       status,
       reason,
+      failureCode,
       attempts,
       turns: counters.turns,
       compactionEvents: compactor.events,
     };
-    transcript.push({ type: "final_result", status, reason, attempts });
+    transcript.push({ type: "final_result", status, reason, failureCode, attempts });
     await store.writeJson("transcript.json", transcript);
     await store.writeJson("summary.json", {
       status,
       reason,
+      failureCode,
       attempts,
       fixAttemptId: fixAttempt?.fixAttemptId ?? null,
       fixOutcome: fixAttempt?.outcome ?? null,
+      patchAttempts: counters.patchAttempts,
+      readFile: counters.readFile,
+      grep: counters.grep,
+      graph: counters.graph,
+      turns: counters.turns,
       counters,
       compactionEvents: compactor.events,
       durationMs: Date.now() - startedAt,
     });
     log(`finished: ${status} — ${reason}`);
+    if (failureCode) {
+      log(`failure code: ${failureCode}`);
+    }
     return result;
   };
 
@@ -411,7 +453,10 @@ export async function runFixerAgent(
       const message = await createMessage({
         model: MODEL,
         max_tokens: budgets.maxResponseTokens,
-        system: buildSystemPrompt(budgets),
+        system: buildSystemPrompt(budgets, {
+          hydratedFullFiles: [...hydratedFullFiles],
+          hasMemory: Boolean(input.pastInvestigations?.trim()),
+        }),
         tools: TOOLS,
         tool_choice: { type: "any", disable_parallel_tool_use: true },
         messages: [...messages],
@@ -473,12 +518,49 @@ export async function runFixerAgent(
 
       // Terminal-capable action: propose_patch.
       if (toolUse.name === "propose_patch") {
-        counters.patchAttempts += 1;
-
         const proposal = {
           version: FIX_PROPOSAL_VERSION,
           ...(toolUse.input as Record<string, unknown>),
         };
+        const repairedProposal = repairMalformedProposal(proposal);
+        const shape = validateFixProposalShape(repairedProposal);
+
+        if (!shape.ok) {
+          counters.malformedPatchProposals += 1;
+          const feedback = formatProposalShapeError(shape.errors, repairedProposal);
+          await recordToolCall("propose_patch", proposal, feedback);
+          transcript.push({
+            type: "proposal_format_invalid",
+            turn: counters.turns,
+            errors: shape.errors,
+          });
+
+          if (counters.malformedPatchProposals >= 2) {
+            return await finish(
+              "failed",
+              `The model produced invalid propose_patch input twice: ${shape.errors.join(" ")}`,
+              lastAttempt,
+            );
+          }
+
+          messages.push(
+            { role: "assistant", content: message.content },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: feedback,
+                  is_error: true,
+                },
+              ],
+            },
+          );
+          continue;
+        }
+
+        counters.patchAttempts += 1;
 
         const attempt = await verify({
           investigationId: input.investigationId,
@@ -487,12 +569,12 @@ export async function runFixerAgent(
           sourceCommit: input.sourceCommit,
           plan: input.plan,
           originalOutcome: input.reproductionResult.outcome,
-          proposal,
+          proposal: shape.proposal,
           restart: input.restart,
           repositoryLabel: input.repositoryLabel,
           appNetwork: input.appNetwork ?? null,
           generateRegressionTest: input.buildRegressionTestGenerator
-            ? input.buildRegressionTestGenerator(proposal)
+            ? input.buildRegressionTestGenerator(shape.proposal)
             : null,
         });
 
@@ -515,7 +597,7 @@ export async function runFixerAgent(
         log(`patch attempt ${counters.patchAttempts}: ${attempt.outcome}`);
 
         const feedback = formatAttemptFeedback(attempt);
-        await recordToolCall("propose_patch", proposal, feedback);
+        await recordToolCall("propose_patch", shape.proposal, feedback);
 
         if (attempt.outcome === "verified") {
           // Keep the patched workspace: the PR flow commits from it.
@@ -572,29 +654,46 @@ export async function runFixerAgent(
       // Inspection tools: read_file / grep.
       let resultText: string;
       let isError = false;
+      const inspectionGate = shouldBlockInspectionTool(toolUse.name, counters, budgets);
 
-      if (toolUse.name === "read_file") {
-        counters.readFile += 1;
-        if (counters.readFile > budgets.maxReadFileCalls) {
-          resultText = "read_file budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-          resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
+      if (inspectionGate.blocked) {
+        resultText = inspectionGate.reason;
+        isError = true;
+      } else if (toolUse.name === "read_file") {
+        const requestedRaw = (toolUse.input as { path?: unknown })?.path;
+        const requestedNormalized =
+          typeof requestedRaw === "string" && requestedRaw
+            ? path.normalize(requestedRaw).split(path.sep).join("/")
+            : null;
+
+        if (requestedNormalized && hydratedFullFiles.has(requestedNormalized)) {
+          // Deterministic redundancy gate: the full file is in the initial
+          // context. Reject without consuming the read_file budget.
+          resultText = `REDUNDANT read_file rejected: ${requestedNormalized} is already provided IN FULL in the initial context under "Selected source/config files with contents", and every non-verified patch is rolled back, so that content is still exact. Use it directly (including for verbatim oldText). If the evidence is sufficient, call propose_patch now.`;
           isError = true;
         } else {
-          const readInput = toolUse.input as {
-            path?: unknown;
-            startLine?: unknown;
-            endLine?: unknown;
-          };
-          const outcome = await execReadFile(input.repoPath, readInput?.path, {
-            startLine: typeof readInput?.startLine === "number" ? readInput.startLine : undefined,
-            endLine: typeof readInput?.endLine === "number" ? readInput.endLine : undefined,
-          });
-          resultText = outcome.text;
-          isError = !outcome.ok;
-          if (outcome.ok) {
-            counters.evidenceBytes += resultText.length;
+          counters.readFile += 1;
+          if (counters.readFile > budgets.maxReadFileCalls) {
+            resultText = "read_file budget exhausted — propose a patch or call submit_blocked.";
+            isError = true;
+          } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+            resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
+            isError = true;
+          } else {
+            const readInput = toolUse.input as {
+              path?: unknown;
+              startLine?: unknown;
+              endLine?: unknown;
+            };
+            const lineRange = parseReadLineRange(readInput?.startLine, readInput?.endLine);
+            const outcome = lineRange.ok
+              ? await execReadFile(input.repoPath, readInput?.path, lineRange.range)
+              : { ok: false, text: lineRange.error };
+            resultText = outcome.text;
+            isError = !outcome.ok;
+            if (outcome.ok) {
+              counters.evidenceBytes += resultText.length;
+            }
           }
         }
       } else if (toolUse.name === "get_graph_neighbors") {
@@ -714,6 +813,55 @@ async function rollbackWorkspace(
 // --- Tool implementations ----------------------------------------------------------
 
 type ToolOutcome = { ok: boolean; text: string };
+
+function parseReadLineRange(
+  startLine: unknown,
+  endLine: unknown,
+): { ok: true; range: { startLine?: number; endLine?: number } } | { ok: false; error: string } {
+  if (typeof startLine === "string" && endLine === undefined) {
+    const pair = startLine.match(/^\s*(\d+)\s*,\s*(\d+)\s*$/);
+
+    if (pair) {
+      return {
+        ok: true,
+        range: { startLine: Number(pair[1]), endLine: Number(pair[2]) },
+      };
+    }
+  }
+
+  const start = parseOptionalLineNumber(startLine, "startLine");
+  if (!start.ok) return start;
+
+  const end = parseOptionalLineNumber(endLine, "endLine");
+  if (!end.ok) return end;
+
+  return { ok: true, range: { startLine: start.value, endLine: end.value } };
+}
+
+function parseOptionalLineNumber(
+  value: unknown,
+  label: string,
+): { ok: true; value?: number } | { ok: false; error: string } {
+  if (value === undefined || value === null) {
+    return { ok: true };
+  }
+
+  const parsed =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\s*\d+\s*$/.test(value)
+        ? Number(value.trim())
+        : NaN;
+
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return {
+      ok: false,
+      error: `read_file ${label} must be a positive integer. Use {"startLine": 88, "endLine": 116}, not ${JSON.stringify(value)}.`,
+    };
+  }
+
+  return { ok: true, value: parsed };
+}
 
 async function execReadFile(
   repoPath: string,
@@ -945,10 +1093,33 @@ function globToRegExp(glob: string): RegExp {
 
 // --- Prompt ----------------------------------------------------------------------
 
-const buildSystemPrompt = (budgets: FixerBudgets) => `You are Sherlock's fixer agent. A bug has already been deterministically reproduced in an isolated workspace; your job is to find the root cause and land the smallest safe fix.
+type SystemPromptContext = {
+  hydratedFullFiles: string[];
+  hasMemory: boolean;
+};
+
+const buildSystemPrompt = (
+  budgets: FixerBudgets,
+  context: SystemPromptContext,
+) => `You are Sherlock's fixer agent. A bug has already been deterministically reproduced in an isolated workspace; your job is to find the root cause and land the smallest safe fix.
+
+What you CAN do:
+- read_file, grep, get_graph_neighbors — ONLY to obtain a specific missing fact that blocks patching.
+- propose_patch — as soon as you can state a plausible minimal change. This is your primary move.
+- submit_blocked — when a safe fix is impossible with the available evidence and attempts.
+
+What you CANNOT do:
+- You cannot re-read files whose FULL contents are already in the initial context. ${context.hydratedFullFiles.length > 0 ? `These files are fully provided and read_file on them is REJECTED automatically: ${context.hydratedFullFiles.join(", ")}. Their contents in the initial message are exact and stay exact (non-verified patches are rolled back) — copy oldText verbatim from there.` : "(No fully hydrated files this run.)"}
+- You cannot use tools to look around, confirm generally, build confidence, or rediscover anything already present in the provided evidence, hydrated files, graph context, or past investigations.
+- You cannot declare success — only the deterministic verifier can.
 
 Rules:
-- Inspect files with read_file and grep. The provided graph context is a map, not the territory — when evidence is missing, read files; never guess.
+- You already receive the reproduced failure, assertion result, observed evidence, Graphify-ranked context, hydrated source files, and${context.hasMemory ? "" : " (this run: none matched)"} PAST INVESTIGATIONS memory. Treat all of it as evidence, not background noise.
+${context.hasMemory ? `- MEMORY FIRST: if a PAST INVESTIGATIONS entry is a verified fix for this same issue and its diff is not marked STALE, adapt that diff and call propose_patch on your FIRST turn — zero exploration calls. If it is marked STALE, verify only the changed region, then patch.\n` : ""}- Before calling any non-patch tool, decide what exact fact is missing, whether it is already present in the provided evidence, how the result will change your patch, and whether you can patch now without it. If you can patch now, patch now.
+- A non-patch tool call is allowed only when it answers a concrete unknown that blocks patching.
+- Your goal is not to maximize certainty. Your goal is to make the smallest defensible patch once the evidence is sufficient. Extra tool calls are harmful unless they remove a specific blocker to patching.
+- If the reproduction evidence names a concrete function and the hydrated context includes that function, propose a patch within the next 1-2 turns.
+- Inspect files with read_file and grep only when exact edit context or symbol location is missing AND the file is not fully hydrated. The provided graph context is a map, not the territory — when evidence is missing, read files; never guess.
 - For structural questions ("who calls X", "what does this handler import"), prefer get_graph_neighbors over grep: it returns real call/import edges with confidence tags. Follow a NODE line's file:line pointer with a ranged read_file to read just that span.
 - Propose the smallest patch that fixes the root cause. No refactors, no new files.
 - Each oldText must appear EXACTLY ONCE in the target file, copied verbatim including whitespace.
@@ -956,8 +1127,154 @@ Rules:
 - Never modify UI text, roles, labels, placeholders, or testids referenced by the saved reproduction plan — the EXACT plan is replayed after every patch, and changing those strings breaks verification.
 - relevantTests must be plain npm/npx/node commands (no shell operators); use an empty array if the repository has no runnable tests.
 - propose_patch runs the full deterministic verification (safety validation, apply, restart, exact replay, tests) and returns the result. Only that verifier decides success — a failed attempt is rolled back and you receive the evidence. You have at most ${budgets.maxPatchAttempts} patch attempts; revise using the returned evidence.
+- When calling propose_patch, provide normal JSON tool fields only. Do not include XML tags, pseudo-tool markup, closing tags, or <parameter ...> text inside string fields.
+- propose_patch.confidence must be a top-level numeric field between 0 and 1, for example confidence: 0.85. Never write confidence inside rootCause or any other string field.
+- propose_patch.rootCause must contain only the root-cause explanation. It must not contain markup such as </rootCause> or <parameter name="confidence">0.85.
+- You have at most ${budgets.maxExplorationBeforeFirstPatch} non-patch tool calls before the first patch attempt. If that exploration budget is exhausted, only propose_patch or submit_blocked is allowed.
+- If ${budgets.maxModelTurns - 2} model turns have passed and no patch has been proposed, only propose_patch or submit_blocked is allowed.
 - If a safe fix is not possible, call submit_blocked with a clear reason.
 - Respond with exactly one tool call per turn.`;
+
+type FixerCounters = {
+  turns: number;
+  readFile: number;
+  grep: number;
+  graph: number;
+  patchAttempts: number;
+};
+
+const EXPLORATION_BUDGET_EXHAUSTED =
+  "Exploration budget exhausted. You must now call propose_patch or submit_blocked.";
+
+function shouldBlockInspectionTool(
+  toolName: string,
+  counters: FixerCounters,
+  budgets: FixerBudgets,
+): { blocked: true; reason: string } | { blocked: false } {
+  if (!["read_file", "grep", "get_graph_neighbors"].includes(toolName)) {
+    return { blocked: false };
+  }
+
+  if (counters.patchAttempts > 0) {
+    return { blocked: false };
+  }
+
+  const explorationCalls = counters.readFile + counters.grep + counters.graph;
+  const remainingTurns = budgets.maxModelTurns - counters.turns;
+
+  if (
+    explorationCalls >= budgets.maxExplorationBeforeFirstPatch ||
+    remainingTurns <= 2
+  ) {
+    return { blocked: true, reason: EXPLORATION_BUDGET_EXHAUSTED };
+  }
+
+  return { blocked: false };
+}
+
+function classifyFixerFailure(
+  status: FixerAgentStatus,
+  patchAttempts: number,
+  malformedPatchProposals: number,
+  fixAttempt: FixAttemptResult | null,
+): FixerFailureCode | null {
+  if (status === "verified" || fixAttempt?.outcome === "verified") {
+    return null;
+  }
+
+  if (malformedPatchProposals > 0 && patchAttempts === 0 && status === "failed") {
+    return "proposal_format_invalid";
+  }
+
+  if (
+    patchAttempts === 0 &&
+    (status === "exhausted" || status === "blocked" || status === "failed")
+  ) {
+    return "fixer_no_patch_attempt";
+  }
+
+  if (fixAttempt?.outcome === "rejected_patch_invalid") {
+    return "fixer_patch_rejected_safety";
+  }
+
+  if (fixAttempt?.outcome === "rejected_tests_failed") {
+    return "fixer_patch_failed_tests";
+  }
+
+  if (patchAttempts > 0 && (status === "exhausted" || status === "failed")) {
+    return "fixer_patch_failed_verification";
+  }
+
+  return null;
+}
+
+function repairMalformedProposal(proposal: Record<string, unknown>): Record<string, unknown> {
+  if (typeof proposal.confidence === "number" || typeof proposal.rootCause !== "string") {
+    return proposal;
+  }
+
+  const match = proposal.rootCause.match(/<parameter\s+name=["']confidence["']>\s*([01](?:\.\d+)?)/i);
+
+  if (!match) {
+    return proposal;
+  }
+
+  const confidence = Number(match[1]);
+
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+    return proposal;
+  }
+
+  return {
+    ...proposal,
+    confidence,
+    rootCause: proposal.rootCause
+      .replace(/<\/rootCause>/gi, "")
+      .replace(/<parameter\s+name=["']confidence["']>\s*[01](?:\.\d+)?/gi, "")
+      .replace(/<\/parameter>/gi, "")
+      .trim(),
+  };
+}
+
+function formatProposalShapeError(
+  errors: string[],
+  proposal: Record<string, unknown>,
+): string {
+  const rootCause = typeof proposal.rootCause === "string" ? proposal.rootCause : "";
+  const placedConfidenceInRootCause =
+    /<parameter\s+name=["']confidence["']>/i.test(rootCause) ||
+    /<\/rootCause>/i.test(rootCause);
+
+  return [
+    placedConfidenceInRootCause
+      ? "Invalid propose_patch input: confidence must be a top-level number between 0 and 1. You placed confidence or tool markup inside rootCause. Retry propose_patch with the same patch and valid fields."
+      : "Invalid propose_patch input. Retry propose_patch with valid top-level fields.",
+    `Validation errors: ${errors.join(" ")}`,
+    "Do not call read_file, grep, or get_graph_neighbors just to fix proposal formatting.",
+  ].join("\n");
+}
+
+function formatFixerMemorySection(pastInvestigations: string | undefined): string {
+  if (!pastInvestigations?.trim()) {
+    return "";
+  }
+
+  return `
+PAST INVESTIGATIONS (this repo — READ BEFORE ANY TOOL CALL):
+
+${pastInvestigations}
+
+How you MUST use these:
+- If a verified entry matches this issue and includes a fix diff with patched
+  files marked UNCHANGED, that diff IS the fix. Adapt it into propose_patch on
+  your FIRST turn. Do not re-derive the root cause with read_file, grep, or
+  get_graph_neighbors first.
+- If the diff is marked STALE, use it as a strong starting hypothesis: read
+  only the changed region of the patched file(s), then patch.
+- Treat "blocked"/"failed" entries as approaches that already failed — do not
+  repeat them unchanged.
+`;
+}
 
 function buildInitialMessage(input: FixerAgentInput): string {
   const result = input.reproductionResult;
@@ -965,6 +1282,7 @@ function buildInitialMessage(input: FixerAgentInput): string {
   return `A bug was reproduced. Investigate and fix it.
 
 Repository commit: ${input.sourceCommit}
+${formatFixerMemorySection(input.pastInvestigations)}
 
 Saved reproduction plan (replayed exactly after each patch):
 ${JSON.stringify(input.plan, null, 2)}

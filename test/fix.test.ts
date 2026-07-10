@@ -1069,7 +1069,7 @@ assert.ok(!body.includes("nope"), "REGRESSION_EXPECTED_FAILURE: archived task re
   );
 
   test(
-    "a regression test that still fails after the patch blocks verification",
+    "a regression test that still fails after the patch is recorded but does not override a passing replay",
     { timeout: 120_000 },
     async () => {
       const setup = await setupReproducedInvestigation();
@@ -1096,13 +1096,16 @@ assert.ok(source.includes("unicorn"), "REGRESSION_EXPECTED_FAILURE: fails before
           ),
       });
 
-      expect(attempt.outcome).toBe("rejected_regression_test_failed");
+      expect(attempt.outcome).toBe("verified");
       expect(attempt.regressionTest?.status).toBe("blocked");
       expect(attempt.regressionTest?.prePatch).toBe("failed_as_expected");
       expect(attempt.regressionTest?.postPatch).toBe("failed");
       expect(attempt.regressionTest?.hashMatched).toBe(true);
+      const regressionCheck = attempt.checks.find((c) => c.name === "regression_test");
+      expect(regressionCheck?.passed).toBe(true);
+      expect(regressionCheck?.detail).toContain("was blocked after the exact replay passed");
 
-      // The generated test never remains in the workspace, even on rejection.
+      // The generated test never remains in the workspace, even when blocked.
       await expect(
         stat(path.join(setup.repoPath, "sherlock-regression.test.mjs")),
       ).rejects.toThrow();

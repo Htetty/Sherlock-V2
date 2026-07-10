@@ -30,6 +30,17 @@ Required environment variables (values are never printed by any check):
   (`claude-sonnet-5`) used for all model calls
 - `REDIS_URL` — optional; the default is reported explicitly when unset
 - `SHERLOCK_TARGET_IMAGE`, `ARTIFACTS_DIR`, `SHERLOCK_DATA_DIR` — optional overrides
+- Rate limiting / concurrency is Redis-backed and shared across all backend
+  and worker processes. Limits are currently hardcoded in
+  `backend/services/rate-limit.ts` under `INVESTIGATION_LIMITS`:
+  - `rateLimitMax` — investigations a tenant (GitHub installation) may start
+    per window
+  - `rateLimitWindowSeconds`
+  - `tenantConcurrencyLimit` — active investigations per tenant
+  - `repoConcurrencyLimit` — active investigations per repository
+  - `concurrencySlotTtlSeconds` — stale-slot TTL so a crashed worker can never
+    permanently hold a concurrency slot. A blocked job is delayed and retried
+    through the queue, never dropped.
 - `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable
   investigation-state persistence (see "Investigation state store" below).
   When `supabase`, also set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`

@@ -9,6 +9,7 @@
 // Cheap-first ordering (cost): deterministic memory replay first, one-shot
 // generation second, agentic exploration only when necessary.
 
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   analyzeIssue,
@@ -29,6 +30,7 @@ import {
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
+  boundFixDiff,
   findStaleFile,
   hashRepoFiles,
   loadMemory,
@@ -713,6 +715,7 @@ export async function runInvestigationPipeline(
     // verification checks, so the diagnostic call is skipped entirely.
     let fixAttempt: FixAttemptResult | null = null;
     let fixerStatus: FixerAgentStatus | null = null;
+    let fixerFailureCode: string | null = null;
     let fixerAttemptCount = 0;
 
     if (result.outcome === "reproduced") {
@@ -776,6 +779,13 @@ export async function runInvestigationPipeline(
           plan,
           reproductionResult: result,
           graphContext: refinedContext,
+          // Memory: how similar bugs in this repo were fixed before,
+          // re-rendered against the CURRENT clone so staleness markers and
+          // verified fix diffs are accurate at fix time.
+          pastInvestigations: await renderPastInvestigations(
+            pastEntries,
+            repoContext.repoPath,
+          ),
           initialSourceFiles: refinedContext.available
             ? refinedContext.relevantFiles
             : contextSourceFiles,
@@ -798,14 +808,19 @@ export async function runInvestigationPipeline(
 
         fixAttempt = agentResult.fixAttempt;
         fixerStatus = agentResult.status;
+        fixerFailureCode = agentResult.failureCode;
         fixerAttemptCount = agentResult.attempts.length;
         await costShape.update({
           fixerTurns: agentResult.turns,
           fixerPatchAttempts: agentResult.attempts.length,
+          fixerFailureCode: agentResult.failureCode,
           compactionEvents:
             costShape.shape.compactionEvents + agentResult.compactionEvents,
         });
         log(`Fixer agent finished: ${agentResult.status} — ${agentResult.reason}`);
+        if (agentResult.failureCode) {
+          log(`Fixer failure code: ${agentResult.failureCode}`);
+        }
         for (const attempt of agentResult.attempts) {
           log(
             `  attempt ${attempt.index} (${attempt.fixAttemptId ?? "?"}): ${attempt.outcome ?? "?"}${attempt.reason ? ` - ${firstLine(attempt.reason)}` : ""}`,
@@ -1044,6 +1059,11 @@ export async function runInvestigationPipeline(
           whatWorked: reflection.whatWorked,
           whatFailed: reflection.whatFailed,
         };
+
+        if (fixerFailureCode === "fixer_no_patch_attempt") {
+          memoryFields.whatFailed =
+            "The failure was reproduced, but the fixer did not attempt a patch before exhausting or ending its budget.";
+        }
       }
 
       // Truthful memory for rejected regression proofs: when the exact
@@ -1064,6 +1084,20 @@ export async function runInvestigationPipeline(
         }), so the patch was rejected despite the passing replay.`;
       }
 
+      // Verified fixes: store the exact winning diff so a future fixer run on
+      // the same bug can reapply HOW it was fixed instead of re-deriving it.
+      let fixDiff: string | null = null;
+
+      if (fixVerified && fixAttempt) {
+        try {
+          fixDiff = boundFixDiff(
+            await readFile(path.join(fixAttempt.attemptDir, "git-diff.patch"), "utf8"),
+          );
+        } catch {
+          fixDiff = null; // Diff artifact missing; record memory without it.
+        }
+      }
+
       await appendMemory(payload.repoUrl, {
         issueTitle: payload.issueTitle,
         issueTerms: memoryFields.issueTerms,
@@ -1075,6 +1109,7 @@ export async function runInvestigationPipeline(
         whatWorked: memoryFields.whatWorked,
         whatFailed: memoryFields.whatFailed,
         createdAt: new Date().toISOString(),
+        ...(fixDiff ? { fixDiff } : {}),
         // Memory-plan replay: store the deterministically proven plan so
         // repeat issues can replay it instead of regenerating. Only plans
         // that actually reproduced are stored; replay (never trust) decides.
