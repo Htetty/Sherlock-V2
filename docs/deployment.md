@@ -124,33 +124,78 @@ that store is selected). The worker refuses to consume jobs until
 > on the backend health port (`BACKEND_PORT`, default 4000), which the compose
 > file deliberately does **not** publish — only the webhook port (3000) is
 > exposed, and that is the one your reverse proxy fronts. Probe readiness from
-> inside the container (see [Verify](#first-deploy) below) or, if an external
+> inside the container (see [Verify](#hosted-deploy-runbook-first-deploy)
+> below) or, if an external
 > load balancer must reach it, publish it bound to loopback only by adding
 > `- "127.0.0.1:4000:4000"` to the api service's `ports:` — never expose the
 > health port to the public internet.
 
-## First deploy
+## Hosted deploy runbook (first deploy)
 
-1. **Place the GitHub App private key** where the compose secret expects it
-   (gitignored):
+Follow the steps in order on the deploy host; each one is checked by the
+doctor/smoke steps before anything goes live.
+
+1. **Provision the host.** A fresh Ubuntu/Debian VM (2+ vCPU, 4+ GB RAM —
+   investigations build and run target containers) needs:
+
+   - **Docker Engine + Compose v2**: install per
+     [docs.docker.com/engine/install](https://docs.docker.com/engine/install/),
+     then confirm with `docker version` and `docker compose version`.
+   - **Git** and **Node.js 22+ with npm** (`node --version`) — Node runs the
+     doctor/smoke scripts on the host; the services themselves run in
+     containers.
+   - **DNS**: an A record for your domain (e.g. `sherlock.example.com`)
+     pointing at the host — GitHub only delivers webhooks over HTTPS to a
+     public name (see [Domain & HTTPS](#domain--https-reverse-proxy)).
+   - **Firewall**: allow inbound **443** (webhooks via the reverse proxy),
+     **80** if your proxy uses ACME HTTP-01 for certificates, and SSH.
+     Nothing else — **3000** (plain-HTTP webhook port), **4000** (health), and
+     **6379** (Redis) must stay unreachable from the internet.
+
+2. **Clone the repo and copy the two secret files** from your secure source
+   (a password manager or an `scp` from the machine that holds them — never
+   chat, email, or the git repo). Both paths are gitignored:
 
    ```sh
+   git clone <your-sherlock-remote> sherlock && cd sherlock
+
+   # Filled-in env file (see Required environment variables above)
+   scp <secure-source>:.env.production .env.production
+   chmod 600 .env.production
+
+   # GitHub App private key, where the compose secret expects it
    mkdir -p secrets
-   cp /path/to/your-app.private-key.pem secrets/github-app-private-key.pem
+   scp <secure-source>:sherlock-app.private-key.pem secrets/github-app-private-key.pem
    chmod 400 secrets/github-app-private-key.pem
    ```
 
-   (Or set `PRIVATE_KEY` inline in the env file and remove the `secrets:`
-   blocks from the compose file.)
-
-2. **Apply the Supabase migration** (creates `public.investigation_states`,
-   RLS enabled with no policies):
+   On a **staging host**, copy the *staging* App's key to the path
+   `.env.staging`'s `SHERLOCK_PRIVATE_KEY_FILE` points at instead:
 
    ```sh
-   # Supabase CLI
+   scp <secure-source>:sherlock-staging-app.private-key.pem secrets/github-app-staging-private-key.pem
+   chmod 400 secrets/github-app-staging-private-key.pem
+   ```
+
+   No filled-in `.env.production` anywhere yet? Create it on the host from
+   the example and fill it in: `cp .env.production.example .env.production`.
+
+   > The stock compose file always mounts the key file as a Docker secret,
+   > so it must exist **even if** you set `PRIVATE_KEY` inline in the env
+   > file. Inline-only setups additionally require removing the `secrets:`
+   > blocks from `docker-compose.prod.yml`; unless you have a reason,
+   > keep the key file.
+
+3. **Apply the Supabase migration** (creates `public.investigation_states`,
+   RLS enabled with no policies). Simplest path: open the Supabase
+   dashboard's **SQL Editor**, paste the contents of
+   `supabase/migrations/20260708000000_create_investigation_states.sql`, and
+   run it. Alternatively use the Supabase CLI — `db push` requires the repo
+   to be linked to your project first:
+
+   ```sh
+   supabase link --project-ref <your-project-ref>   # once per project (asks for the DB password)
    supabase db push
-   # …or paste supabase/migrations/20260708000000_create_investigation_states.sql
-   # into the Supabase SQL editor and run it.
    ```
 
    The table stores only the folded, redacted `InvestigationStateRecord` plus
@@ -158,14 +203,63 @@ that store is selected). The worker refuses to consume jobs until
    webhook payloads. Do not add a public anon read policy; the dashboard will
    read through the backend service role or explicit scoped policies later.
 
-3. **Prepare the worker clone directory** on the host (must be an identical
+4. **Prepare the worker clone directory** on the host (must be an identical
    path inside the container — see production-worker.md):
 
    ```sh
    sudo mkdir -p /var/tmp/sherlock
    ```
 
-4. **Build and start** (note `--env-file` — see
+5. **Run the deployment doctor.** It validates everything above before any
+   container starts: the env file exists with no placeholder values left, the
+   Compose host settings (`SHERLOCK_ENV_FILE`, `SHERLOCK_PRIVATE_KEY_FILE`)
+   point at the right files, the private key file is present and non-empty,
+   the Docker daemon is reachable, and `docker compose config` parses with
+   your `--env-file`. It prints PASS/WARN/FAIL per check, never prints secret
+   values, and exits nonzero on blockers — do not deploy until it passes:
+
+   ```sh
+   npm run deploy:doctor:prod       # production host (.env.production)
+   npm run deploy:doctor:staging    # staging host   (.env.staging)
+   ```
+
+6. **Run the compose smoke test.** Where the doctor checks configuration, the
+   smoke test proves the stack actually *boots* — in an **isolated smoke
+   stack**, not your real deployment. It runs everything under a separate
+   Compose project (`sherlock-smoke`) with its own network and volumes
+   (including a fresh, empty Redis), removes the api's published webhook
+   port, blanks any smee relay, and forces `REDIS_URL` to the smoke-internal
+   Redis — so it can never receive real GitHub deliveries or consume jobs
+   from your real production/staging queue. It then waits for redis and api
+   to report healthy, probes `GET /healthz` and `GET /readyz` from inside the
+   api container, and confirms the worker container is *currently running*
+   and logged `PASS worker preflight` / `Sherlock investigation worker
+   started` during this run. It never prints secret values or log contents
+   and exits nonzero on any failure:
+
+   ```sh
+   npm run deploy:doctor:prod && npm run deploy:smoke:prod    # before a real deploy
+   # staging: npm run deploy:doctor:staging && npm run deploy:smoke:staging
+   ```
+
+   The smoke stack is **boot-health evidence only** — it does not process
+   jobs and does not prove end-to-end investigation behavior (step 9's
+   `/sherlock investigate` pass is what proves that). By default the smoke
+   containers are left running for inspection and the stop command is
+   printed; pass `--down` to tear the smoke stack (and its volumes) down
+   afterwards. A failed teardown exits nonzero:
+
+   ```sh
+   npm run deploy:smoke:prod -- --down
+   # manual cleanup if ever needed:
+   # docker compose -p sherlock-smoke --env-file .env.production -f docker-compose.prod.yml down -v
+   ```
+
+   The generated isolation override uses `ports: !reset`, which needs
+   Docker Compose v2.24 or newer.
+
+7. **Build and start the real stack** (the smoke stack from the previous
+   step is isolated and is *not* your deployment; note `--env-file` — see
    [Required environment variables](#required-environment-variables)):
 
    ```sh
@@ -180,7 +274,12 @@ that store is selected). The worker refuses to consume jobs until
    docker compose --env-file .env.staging -f docker-compose.prod.yml up -d --build
    ```
 
-5. **Verify** (readiness is probed from *inside* the container — the health
+8. **Point the GitHub App at the host**: set the App's webhook URL to
+   `https://<your-domain>/api/github/webhooks` — details in
+   [GitHub App webhook URL](#github-app-webhook-url) below. (Requires the TLS
+   reverse proxy from [Domain & HTTPS](#domain--https-reverse-proxy).)
+
+9. **Verify** (readiness is probed from *inside* the container — the health
    port is not published):
 
    ```sh
@@ -190,7 +289,32 @@ that store is selected). The worker refuses to consume jobs until
      node -e "fetch('http://127.0.0.1:4000/readyz').then(r=>r.text()).then(console.log)"
    # deep worker host check
    docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run worker:check
+   # redis health
+   docker compose --env-file .env.production -f docker-compose.prod.yml exec redis redis-cli ping
+   # recent logs (see Operating below for follow mode)
+   docker compose --env-file .env.production -f docker-compose.prod.yml logs --tail=100 api
+   docker compose --env-file .env.production -f docker-compose.prod.yml logs --tail=100 worker
    ```
+
+   Expected: `ps` shows redis/api `healthy` and the worker running, `/readyz`
+   returns ready, redis answers `PONG`, api logs show webhook deliveries once
+   the App is pointed at the host, and worker logs show
+   `PASS worker preflight`.
+
+   Finally, do one end-to-end pass: comment `/sherlock investigate` on a test
+   issue in a repo where the App is installed, watch the worker log
+   `[inv_…] Stage: …` lines, and confirm a new row appears in Supabase
+   (**Table Editor → `investigation_states`**, or
+   `select investigation_id, status, stage, updated_at from
+   investigation_states order by updated_at desc limit 5;` in the SQL editor). If no row appears, check
+   `SHERLOCK_STATE_STORE=supabase` and the Supabase values in the env file,
+   then the worker logs.
+
+Before announcing the deployment, read
+[Known limitations](#known-limitations-of-this-first-deployment) — notably the
+worker's Docker-socket access (host-root equivalent), the bundled Redis, local
+artifact storage, and the absence of a dashboard — and work through the
+[Production hardening checklist](#production-hardening-checklist).
 
 ## GitHub App webhook URL
 
@@ -239,8 +363,32 @@ drain and its sibling containers are swept before exit; avoid `-t 0`.
 
 ```sh
 git pull
+npm run deploy:doctor:prod             # staging: npm run deploy:doctor:staging
+npm run deploy:smoke:prod -- --down    # isolated boot check; does not touch the real stack
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
 ```
+
+**Roll back to the last good version** — a deploy is just "build and start
+the checked-out commit", so rolling back is checking out the previous good
+commit and redeploying it:
+
+```sh
+git log --oneline -10                        # find the last good commit
+git checkout <last-good-sha>
+npm run deploy:doctor:prod                   # config sanity
+npm run deploy:smoke:prod -- --down          # isolated boot check — NOT the real stack
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+```
+
+The final `up -d --build` is the actual rollback: the smoke test only boots a
+throwaway `sherlock-smoke` project and never touches the real deployment, so
+skipping the last command would leave the broken version running. Volumes
+(Redis queue, artifacts, repo memory) are untouched, so queued jobs
+survive the rollback. `.env.production` and `secrets/` are gitignored and
+unaffected by the checkout — but if the bad deploy also changed the env file,
+restore the previous env file from your secure source first (the doctor will
+catch missing/placeholder values). Once a fixed version ships, return to the
+branch with `git checkout <branch>` and redeploy the same way.
 
 **Stop / tear down** (volumes are preserved unless you add `-v`):
 
@@ -306,6 +454,11 @@ internet without TLS in front.
 - **Single host.** api, worker, and (bundled) Redis co-locate. Multi-host is
   supported by pointing workers at managed Redis, but there is no orchestrator
   manifest (Kubernetes/Nomad) yet.
+- **Bundled Redis is a convenience, not production-grade.** It is single-node,
+  unauthenticated (reachable only on the compose-internal network), and its
+  durability is one append-only volume on the same host — a host loss loses
+  the queue. Use a managed Redis with auth + TLS for real production (see
+  [Using managed Redis](#using-managed-redis-instead-of-the-bundled-service)).
 - **Local artifact storage.** Investigation evidence and repo memory live on
   named volumes on the worker host. Only the compact investigation *state* is
   durable in Supabase; object storage for artifacts is future work.
@@ -360,7 +513,9 @@ docker build -f Dockerfile        -t sherlock-api:"$GIT_SHA"    .
 docker build -f Dockerfile.worker -t sherlock-worker:"$GIT_SHA" .
 
 # Deploy (on the host, after images are pulled/available)
-docker compose --env-file .env.production -f docker-compose.prod.yml up -d
+npm run deploy:doctor:prod
+npm run deploy:smoke:prod -- --down    # isolated boot-health check
+docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
 ```
 
 The patterns are deliberately shaped to avoid false positives without an
