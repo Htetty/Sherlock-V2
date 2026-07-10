@@ -20,6 +20,10 @@
     "test": "vitest",
     "worker": "node ./lib/backend/worker.js",
     "worker:check": "node ./lib/backend/worker-preflight.js",
+    "deploy:doctor:prod": "node scripts/deploy-doctor.mjs production",
+    "deploy:doctor:staging": "node scripts/deploy-doctor.mjs staging",
+    "deploy:smoke:prod": "node scripts/compose-smoke.mjs production",
+    "deploy:smoke:staging": "node scripts/compose-smoke.mjs staging",
     "redis:up": "docker compose up -d redis",
     "redis:down": "docker compose down"
   },
