@@ -110,9 +110,36 @@ Both services load this one file (`env_file`). Names by service:
 | `SHERLOCK_RUN_STARTUP_CHECKS` | | ✓ | set to `true` (compose does this) to fail fast |
 | `WEBHOOK_PROXY_URL` | ✓ | | smee relay for non-public hosts; blank in prod |
 
-`NODE_ENV`, `SHERLOCK_RUN_STARTUP_CHECKS`, and `TMPDIR` are set by the compose
-file itself. Optional tuning (`INVESTIGATION_WORKER_CONCURRENCY`,
-`SHERLOCK_TARGET_IMAGE`, timeouts) is listed in the example files.
+`NODE_ENV`, `SHERLOCK_RUN_STARTUP_CHECKS`, `TMPDIR`, and
+`SHERLOCK_SANDBOX_NETWORK` are set by the compose file itself. Optional tuning
+(`INVESTIGATION_WORKER_CONCURRENCY`, `SHERLOCK_TARGET_IMAGE`, timeouts) is
+listed in the example files.
+
+### Containerized-worker sandbox addressing and ownership
+
+Two things differ when the worker runs inside a container (the compose
+topology) instead of directly on a developer machine; both are wired up by
+`docker-compose.prod.yml` and verified by the worker preflight
+(`sandbox:addressing` check), so they are listed here for understanding, not
+as extra setup steps:
+
+- **`SHERLOCK_SANDBOX_NETWORK`** (compose sets `sherlock-sandbox`): target-app
+  containers do not publish ports on the host loopback — the worker's
+  `localhost` is the worker container, not the Docker host, so it could never
+  reach them. Instead the worker and every target app attach to this shared
+  bridge network and the worker probes `http://<containerName>:<port>`. The
+  network is declared with a fixed name in the compose file; `api` and `redis`
+  deliberately stay off it so target code cannot reach them. Leave the
+  variable unset for a host-run worker (local development) — loopback
+  publishing is correct there, and a containerized worker without it fails
+  preflight and every sandbox start with an explicit error.
+- **`SHERLOCK_TARGET_UID` / `SHERLOCK_TARGET_GID`** (default `1000:1000`, the
+  `node` user in the official Node images): the worker container runs as root,
+  and on a Linux daemon bind mounts preserve ownership, so runtime workspace
+  copies are chowned to the target-container user before mounting — otherwise
+  `npm install` in the sandbox fails with `EACCES` (macOS Docker Desktop masks
+  this). Only override these when `SHERLOCK_TARGET_IMAGE` uses a different
+  unprivileged uid/gid. A non-root worker skips the chown.
 
 The api will not report ready (`GET /readyz` → 503) until `APP_ID`,
 `PRIVATE_KEY`/`PRIVATE_KEY_PATH`, `WEBHOOK_SECRET`, and `ANTHROPIC_API_KEY` are

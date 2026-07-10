@@ -8,7 +8,9 @@ import {
   CONTAINER_DEFAULTS,
   buildContainerRunArgs,
   buildTargetEnv,
+  getSandboxAddressing,
   getSandboxNetworkPolicy,
+  isContainerizedWorker,
   isProtectedEnvName,
   runContainerCommand,
   sanitizeDockerCommand,
@@ -282,11 +284,57 @@ describe("sandbox network policy", () => {
     expect(joined).toContain("--network=container:sherlock-app-abc");
     expect(joined.join(" ")).not.toContain("--add-host");
 
+    // Attaching to a named network (the containerized worker's shared
+    // sandbox network): single argv token, host gateway suppressed here too.
+    const attached = buildContainerRunArgs({
+      ...base,
+      network: { attachNetwork: "sherlock-sandbox" },
+      addHostGateway: true,
+    });
+    expect(attached).toContain("--network=sherlock-sandbox");
+    expect(attached.join(" ")).not.toContain("--add-host");
+
     // The restriction set is independent of the network mode.
-    for (const args of [none, joined]) {
+    for (const args of [none, joined, attached]) {
       expect(args).toContain("--cap-drop=ALL");
       expect(args).toContain("--read-only");
       expect(args).toContain(`--user=${CONTAINER_DEFAULTS.user}`);
     }
+  });
+});
+
+describe("sandbox addressing", () => {
+  test("SHERLOCK_SANDBOX_NETWORK selects network addressing; empty or unset means host addressing", () => {
+    expect(getSandboxAddressing({} as NodeJS.ProcessEnv)).toEqual({ mode: "host" });
+    expect(
+      getSandboxAddressing({ SHERLOCK_SANDBOX_NETWORK: "  " } as NodeJS.ProcessEnv),
+    ).toEqual({ mode: "host" });
+    expect(
+      getSandboxAddressing({
+        SHERLOCK_SANDBOX_NETWORK: "sherlock-sandbox",
+      } as NodeJS.ProcessEnv),
+    ).toEqual({ mode: "network", network: "sherlock-sandbox" });
+  });
+
+  test("containerized-worker detection: explicit flag wins, /.dockerenv decides otherwise", () => {
+    const noEnv = {} as NodeJS.ProcessEnv;
+
+    expect(isContainerizedWorker(noEnv, (path) => path === "/.dockerenv")).toBe(true);
+    expect(isContainerizedWorker(noEnv, () => false)).toBe(false);
+
+    // The flag overrides in both directions (e.g. Dockerfile.worker sets
+    // true; unusual host setups can force false).
+    expect(
+      isContainerizedWorker(
+        { SHERLOCK_WORKER_CONTAINERIZED: "true" } as NodeJS.ProcessEnv,
+        () => false,
+      ),
+    ).toBe(true);
+    expect(
+      isContainerizedWorker(
+        { SHERLOCK_WORKER_CONTAINERIZED: "false" } as NodeJS.ProcessEnv,
+        () => true,
+      ),
+    ).toBe(false);
   });
 });

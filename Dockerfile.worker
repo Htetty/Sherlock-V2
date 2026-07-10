@@ -60,5 +60,9 @@ ENV SHERLOCK_DATA_DIR=/data/sherlock
 ENV NODE_ENV=production
 # Fail fast in production: preflight must pass before jobs are consumed.
 ENV SHERLOCK_RUN_STARTUP_CHECKS=true
+# This image only ever runs the worker inside a container; the flag makes
+# sandbox addressing fail fast (instead of probe timeouts) when the shared
+# sandbox network (SHERLOCK_SANDBOX_NETWORK) is not configured.
+ENV SHERLOCK_WORKER_CONTAINERIZED=true
 
 CMD ["node", "./lib/backend/worker.js"]
