@@ -1,0 +1,133 @@
+# Sherlock production / staging deployment (single host).
+#
+# Topology:
+#   api     - GitHub App webhook receiver (probot) + health/readiness server.
+#             Stateless. This is the public ingress; put a TLS-terminating
+#             reverse proxy in front of it (see docs/deployment.md).
+#   worker  - BullMQ consumer that runs the investigation pipeline. Controls
+#             the HOST Docker daemon through the mounted socket; target apps
+#             run in SIBLING containers, so its clone/temp dir is bind-mounted
+#             at an identical path on the host (SHERLOCK_HOST_TMP).
+#   redis   - queue + webhook-command dedup, with an append-only volume. Swap
+#             for a managed Redis by pointing REDIS_URL at it (see the docs).
+#
+# Secrets are never committed: every service reads them at runtime from an
+# env file on the host. Copy .env.production.example (or .env.staging.example)
+# and fill it in first.
+#
+# IMPORTANT — always pass the env file to Compose itself with --env-file:
+#
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#   docker compose --env-file .env.staging    -f docker-compose.prod.yml up -d --build
+#
+# The env file plays two distinct roles, and --env-file is what covers the
+# second one:
+#   1. `env_file:` below injects its variables into the CONTAINERS.
+#   2. Compose INTERPOLATION (${...} in this file: SHERLOCK_ENV_FILE,
+#      API_WEBHOOK_PORT, SHERLOCK_HOST_TMP, SHERLOCK_PRIVATE_KEY_FILE) is
+#      resolved by the docker compose CLI at parse time and does NOT read
+#      `env_file:` — without --env-file (or shell exports) those variables
+#      silently fall back to their production defaults. Staging in particular
+#      would mount the PRODUCTION private key path.
+#
+name: sherlock
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Append-only persistence so queued/claimed jobs survive a restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # Not published to the host: only api/worker reach it over the internal
+    # network. Managed-Redis deployments drop this service entirely.
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ${SHERLOCK_ENV_FILE:-.env.production}
+    environment:
+      NODE_ENV: production
+    secrets:
+      # Mounted read-only at /run/secrets/github_app_private_key. Point
+      # PRIVATE_KEY_PATH at it in the env file (inline PRIVATE_KEY is the
+      # documented alternative — see docs/deployment.md).
+      - github_app_private_key
+    ports:
+      # Public GitHub webhook ingress. Terminate TLS in a reverse proxy and
+      # forward here; do not expose plain HTTP to the internet directly.
+      - "${API_WEBHOOK_PORT:-3000}:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Liveness only: is the process serving? Configuration readiness is a
+    # separate signal at GET /readyz (used by a load balancer, not here).
+    healthcheck:
+      test:
+        - "CMD"
+        - "node"
+        - "-e"
+        - "fetch('http://127.0.0.1:'+(process.env.BACKEND_PORT||4000)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file:
+      - ${SHERLOCK_ENV_FILE:-.env.production}
+    environment:
+      NODE_ENV: production
+      # Fail fast on a broken host: the preflight must pass before any job is
+      # consumed. (The worker image also defaults this to true.)
+      SHERLOCK_RUN_STARTUP_CHECKS: "true"
+      # Docker-outside-of-Docker path alignment: target containers are
+      # siblings and bind-mount the clone workspace, which the daemon resolves
+      # on the HOST filesystem. TMPDIR must therefore be a path that is
+      # identical inside the container and on the host (see the volume below).
+      TMPDIR: ${SHERLOCK_HOST_TMP:-/var/tmp/sherlock}
+    secrets:
+      # The worker also mints installation tokens from the GitHub App key.
+      - github_app_private_key
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      # Control the host Docker daemon (target apps + validation/regression
+      # containers). This grants host-level privileges: keep the worker host
+      # dedicated and firewalled (see the hardening checklist in the docs).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Same path on both sides so sibling containers resolve the clone mount.
+      - ${SHERLOCK_HOST_TMP:-/var/tmp/sherlock}:${SHERLOCK_HOST_TMP:-/var/tmp/sherlock}
+      # Durable investigation evidence and repo memory (worker-only; not
+      # bind-mounted into target containers, so named volumes are fine).
+      - sherlock-artifacts:/app/artifacts
+      - sherlock-data:/data/sherlock
+    # Graceful shutdown drains the active job and sweeps leftover target
+    # containers; give the pipeline room to finish rather than SIGKILL at 10s.
+    stop_grace_period: 120s
+
+volumes:
+  redis-data:
+  sherlock-artifacts:
+  sherlock-data:
+
+secrets:
+  # GitHub App private key (.pem). Place the file on the host (gitignored
+  # ./secrets/ by default) and keep it 0400/root-owned. Compose fails clearly
+  # if the source file is missing, which is the desired behavior.
+  github_app_private_key:
+    file: ${SHERLOCK_PRIVATE_KEY_FILE:-./secrets/github-app-private-key.pem}

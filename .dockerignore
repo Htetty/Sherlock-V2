@@ -6,7 +6,12 @@
 **/npm-debug.log
 **/coverage
 **/.env
+**/.env.*
 **/.editorconfig
 **/dist
+**/lib
 **/*.pem
+**/secrets
 Dockerfile
+Dockerfile.worker
+docker-compose*.yml
