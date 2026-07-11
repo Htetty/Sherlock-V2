@@ -8,6 +8,7 @@
 // error fails permanently via UnrecoverableError.
 
 import { DelayedError, UnrecoverableError } from "bullmq";
+import { randomUUID } from "node:crypto";
 import type {
   InvestigationPipelineInput,
   InvestigationPipelineResult,
@@ -37,7 +38,10 @@ export type InvestigationJobLike = {
 export type WorkerDeps = {
   runPipeline: (
     payload: InvestigationPipelineInput,
-    options: { onStage?: (stage: InvestigationStage) => void | Promise<void> },
+    options: {
+      onStage?: (stage: InvestigationStage) => void | Promise<void>;
+      signal?: AbortSignal;
+    },
   ) => Promise<InvestigationPipelineResult>;
   // Mints a short-lived installation token from the GitHub App credentials;
   // tokens are never stored in the queue payload. The permissions object is
@@ -149,6 +153,7 @@ export function formatWorkerFailureComment(
 // How long a concurrency-blocked job waits before the queue retries it.
 // Intentional delay through the queue — never a drop and never a failure.
 export const CONCURRENCY_BLOCKED_RETRY_DELAY_MS = 30_000;
+export const CONCURRENCY_HEARTBEAT_INTERVAL_MS = 10 * 60_000;
 
 export type ConcurrencyHooks = {
   gate: InvestigationConcurrencyGate;
@@ -157,6 +162,7 @@ export type ConcurrencyHooks = {
   // DelayedError so BullMQ treats the job as rescheduled, not failed.
   delayJob: (delayMs: number) => Promise<void>;
   retryDelayMs?: number;
+  heartbeatIntervalMs?: number;
 };
 
 // Wraps job processing with the Redis-backed concurrency gate: acquire a
@@ -180,6 +186,7 @@ export async function processInvestigationJobWithConcurrency(
       job.data.repositoryName,
     ),
     investigationId: job.data.investigationId,
+    leaseId: randomUUID(),
   };
 
   const decision = await hooks.gate.acquireInvestigationConcurrency(slot);
@@ -196,9 +203,42 @@ export async function processInvestigationJobWithConcurrency(
     );
   }
 
+  const heartbeatIntervalMs =
+    hooks.heartbeatIntervalMs ?? CONCURRENCY_HEARTBEAT_INTERVAL_MS;
+  let heartbeatStopped = false;
+  const leaseAbort = new AbortController();
+  let pendingRenewal = Promise.resolve();
+  const heartbeat = setInterval(() => {
+    pendingRenewal = pendingRenewal
+      .then(async () => {
+        if (heartbeatStopped) {
+          return;
+        }
+
+        const renewed = await hooks.gate.renewInvestigationConcurrency(slot);
+
+        if (!renewed) {
+          const reason = new Error(
+            `Concurrency lease ownership was lost for investigation ${slot.investigationId}.`,
+          );
+          log(`[${slot.investigationId}] ${reason.message}`);
+          leaseAbort.abort(reason);
+        }
+      })
+      .catch((error: unknown) => {
+        log(
+          `[${slot.investigationId}] Could not renew concurrency lease; the next heartbeat will retry: ${safeErrorMessage(error)}`,
+        );
+      });
+  }, heartbeatIntervalMs);
+  heartbeat.unref();
+
   try {
-    return await processInvestigationJob(job, deps);
+    return await processInvestigationJob(job, deps, leaseAbort.signal);
   } finally {
+    heartbeatStopped = true;
+    clearInterval(heartbeat);
+    await pendingRenewal;
     // Slot release must survive every exit path; a failed release only
     // falls back to the TTL-based stale eviction, never a permanent block.
     await hooks.gate.releaseInvestigationConcurrency(slot).catch((error: unknown) => {
@@ -212,6 +252,7 @@ export async function processInvestigationJobWithConcurrency(
 export async function processInvestigationJob(
   job: InvestigationJobLike,
   deps: WorkerDeps,
+  signal?: AbortSignal,
 ): Promise<{ investigationId: string; outcome: string }> {
   const payload = job.data;
   const log = deps.log ?? (() => {});
@@ -233,10 +274,16 @@ export async function processInvestigationJob(
   };
 
   const reportStage = async (stage: InvestigationStage) => {
+    if (stage !== "failed") {
+      signal?.throwIfAborted();
+    }
     try {
       await deps.reportStage?.(stage);
     } catch {
       // Stage reporting is telemetry; never fail the job over it.
+    }
+    if (stage !== "failed") {
+      signal?.throwIfAborted();
     }
   };
 
@@ -282,8 +329,9 @@ export async function processInvestigationJob(
         installationToken: installationAuth?.token ?? null,
         installationPermissions: installationAuth?.permissions ?? null,
       },
-      { onStage: reportStage },
+      { onStage: reportStage, signal },
     );
+    signal?.throwIfAborted();
     pipelineResult = result;
 
     await deps.postIssueComment({

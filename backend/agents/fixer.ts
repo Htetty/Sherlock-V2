@@ -136,6 +136,7 @@ export type FixerAgentInput = {
   sandboxResult: { baseUrl: string; stdout: string; stderr: string };
   plan: ReproductionPlan;
   reproductionResult: ReproductionResult;
+  abortSignal?: AbortSignal;
   graphContext: GraphContext;
   initialSourceFiles: SourceFile[];
   // Rendered PAST INVESTIGATIONS memory (renderPastInvestigations), including
@@ -490,6 +491,7 @@ export async function runFixerAgent(
 
   try {
     while (true) {
+      input.abortSignal?.throwIfAborted();
       if (Date.now() - startedAt > budgets.maxWallTimeMs) {
         return await finish("exhausted", "Wall-time budget exhausted.", lastAttempt);
       }
@@ -718,6 +720,7 @@ export async function runFixerAgent(
         await recordToolCall("propose_patch", shape.proposal, feedback);
 
         if (attempt.outcome === "verified") {
+          input.abortSignal?.throwIfAborted();
           // Keep the patched workspace: the PR flow commits from it.
           return await finish("verified", attempt.reason, attempt);
         }

@@ -92,6 +92,22 @@ export type FailedMemoryAttempt = {
   failureSignature: string | null;
 };
 
+export function selectBlockingFailedAttempts(
+  entries: MemoryEntry[],
+  issueTitle: string,
+  commitSha: string,
+): FailedMemoryAttempt[] {
+  const normalizedTitle = normalizeIssueTitle(issueTitle);
+
+  return entries
+    .filter(
+      (entry) =>
+        entry.commitSha === commitSha &&
+        normalizeIssueTitle(entry.issueTitle) === normalizedTitle,
+    )
+    .flatMap((entry) => entry.failedAttempts ?? []);
+}
+
 export function boundFixDiff(diff: string): string {
   if (diff.length <= MAX_FIX_DIFF_CHARS) {
     return diff;
@@ -523,6 +539,10 @@ function indentBlock(text: string, prefix: string): string {
     .split("\n")
     .map((line) => `${prefix}${line}`)
     .join("\n");
+}
+
+function normalizeIssueTitle(title: string): string {
+  return title.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 // Staleness by patched-file hashes. Useful but insufficient for replay (a

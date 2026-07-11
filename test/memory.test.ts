@@ -14,6 +14,7 @@ import {
   matchMemory,
   mergeEntriesByTitle,
   renderPastInvestigations,
+  selectBlockingFailedAttempts,
   repoKey,
   writeMemorySelectionArtifacts,
   MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
@@ -270,6 +271,35 @@ describe("memory selection artifacts", () => {
 });
 
 describe("failed-attempt memory", () => {
+  test("only the same normalized issue title and source commit can block a patch", () => {
+    const matching: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "  Archive   crashes ",
+      commitSha: "source-a",
+      failedAttempts: [failedAttempt(1)],
+    };
+    const differentIssue: MemoryEntry = {
+      ...entry(2),
+      issueTitle: "Archive cache is stale",
+      commitSha: "source-a",
+      failedAttempts: [failedAttempt(2)],
+    };
+    const differentCommit: MemoryEntry = {
+      ...entry(3),
+      issueTitle: "Archive crashes",
+      commitSha: "source-b",
+      failedAttempts: [failedAttempt(3)],
+    };
+
+    expect(
+      selectBlockingFailedAttempts(
+        [matching, differentIssue, differentCommit],
+        "archive crashes",
+        "source-a",
+      ).map((attempt) => attempt.proposalHash),
+    ).toEqual(["hash-1"]);
+  });
+
   const failedAttempt = (n: number, diff: string | null = "diff --git a/x b/x"): FailedMemoryAttempt => ({
     approach: `Approach ${n}`,
     proposalHash: `hash-${n}`,

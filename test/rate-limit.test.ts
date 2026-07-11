@@ -9,6 +9,7 @@ import { DelayedError, UnrecoverableError } from "bullmq";
 import { describe, expect, test } from "vitest";
 import {
   CONCURRENCY_ACQUIRE_SCRIPT,
+  CONCURRENCY_RENEW_SCRIPT,
   CONCURRENCY_RELEASE_SCRIPT,
   INVESTIGATION_LIMITS,
   RATE_LIMIT_SCRIPT,
@@ -98,6 +99,35 @@ function createFakeRedis(clock: { now: number }) {
 
         zsets.get(tenantKey)?.delete(member);
         zsets.get(repoKey)?.delete(member);
+        return 1;
+      }
+
+      if (script === CONCURRENCY_RENEW_SCRIPT) {
+        const [tenantKey, repoKey, now, member, _keyTtlSeconds, staleCutoff] = args as [
+          string,
+          string,
+          number,
+          string,
+          number,
+          number,
+        ];
+        const tenant = zsets.get(tenantKey);
+        const repo = zsets.get(repoKey);
+
+        const tenantScore = tenant?.get(member);
+        const repoScore = repo?.get(member);
+
+        if (
+          tenantScore === undefined ||
+          repoScore === undefined ||
+          tenantScore <= Number(staleCutoff) ||
+          repoScore <= Number(staleCutoff)
+        ) {
+          return 0;
+        }
+
+        tenant.set(member, Number(now));
+        repo.set(member, Number(now));
         return 1;
       }
 
@@ -292,6 +322,74 @@ describe("investigation concurrency gate", () => {
     expect((await gate.acquireInvestigationConcurrency(slot)).acquired).toBe(true);
   });
 
+  test("renewal keeps a live investigation from being evicted as stale", async () => {
+    const clock = { now: 1_000 };
+    const { gate } = buildGate(clock, {
+      tenantLimit: 1,
+      repoLimit: 1,
+      slotTtlSeconds: 10,
+    });
+    const slot = (id: string) => ({
+      tenantKey: "tenant-gh-1",
+      repoKey: "o/r",
+      investigationId: id,
+    });
+
+    expect((await gate.acquireInvestigationConcurrency(slot("inv_A"))).acquired).toBe(
+      true,
+    );
+    clock.now = 9_000;
+    expect(await gate.renewInvestigationConcurrency(slot("inv_A"))).toBe(true);
+    clock.now = 15_000;
+    expect((await gate.acquireInvestigationConcurrency(slot("inv_B"))).acquired).toBe(
+      false,
+    );
+  });
+
+  test("renewal never recreates a lease after ownership is lost", async () => {
+    const clock = { now: 1_000 };
+    const { gate } = buildGate(clock);
+    const slot = {
+      tenantKey: "tenant-gh-1",
+      repoKey: "o/r",
+      investigationId: "inv_A",
+    };
+
+    expect(await gate.renewInvestigationConcurrency(slot)).toBe(false);
+  });
+
+  test("an expired old worker cannot renew or release a newer retry lease", async () => {
+    const clock = { now: 1_000 };
+    const { gate } = buildGate(clock, {
+      tenantLimit: 1,
+      repoLimit: 1,
+      slotTtlSeconds: 10,
+    });
+    const oldSlot = {
+      tenantKey: "tenant-gh-1",
+      repoKey: "o/r",
+      investigationId: "inv_A",
+      leaseId: "lease-old",
+    };
+    const retrySlot = { ...oldSlot, leaseId: "lease-retry" };
+
+    expect((await gate.acquireInvestigationConcurrency(oldSlot)).acquired).toBe(true);
+    clock.now = 12_000;
+    expect((await gate.acquireInvestigationConcurrency(retrySlot)).acquired).toBe(true);
+    expect(await gate.renewInvestigationConcurrency(oldSlot)).toBe(false);
+    await gate.releaseInvestigationConcurrency(oldSlot);
+
+    expect(
+      (
+        await gate.acquireInvestigationConcurrency({
+          ...oldSlot,
+          investigationId: "inv_B",
+          leaseId: "lease-other",
+        })
+      ).acquired,
+    ).toBe(false);
+  });
+
   test("limits of 0 disable the corresponding dimension", async () => {
     const clock = { now: 1_000 };
     const { gate } = buildGate(clock, { tenantLimit: 0, repoLimit: 0, slotTtlSeconds: 10 });
@@ -324,6 +422,28 @@ describe("limit configuration", () => {
       repoLimit: INVESTIGATION_LIMITS.repoConcurrencyLimit,
       slotTtlSeconds: INVESTIGATION_LIMITS.concurrencySlotTtlSeconds,
     });
+  });
+
+  test("preserves production defaults and compatible environment overrides", () => {
+    expect(getRateLimitConfig({})).toEqual({ max: 5, windowSeconds: 600 });
+    expect(
+      getRateLimitConfig({
+        SHERLOCK_MAX_COMMANDS_PER_WINDOW: "12",
+        SHERLOCK_COMMAND_WINDOW_MINUTES: "3",
+      }),
+    ).toEqual({ max: 12, windowSeconds: 180 });
+    expect(
+      getRateLimitConfig({
+        SHERLOCK_MAX_COMMANDS_PER_WINDOW: "0",
+        SHERLOCK_COMMAND_WINDOW_MINUTES: "invalid",
+      }),
+    ).toEqual({ max: 5, windowSeconds: 600 });
+    expect(
+      getRateLimitConfig({
+        SHERLOCK_MAX_COMMANDS_PER_WINDOW: "2.9",
+        SHERLOCK_COMMAND_WINDOW_MINUTES: "0.333",
+      }),
+    ).toEqual({ max: 2, windowSeconds: 20 });
   });
 });
 
@@ -370,9 +490,15 @@ function buildWorkerDeps(
   };
 }
 
-type GateCall = { action: "acquire" | "release"; investigationId: string };
+type GateCall = {
+  action: "acquire" | "renew" | "release";
+  investigationId: string;
+};
 
-function buildFakeGate(acquireResult: { acquired: boolean }) {
+function buildFakeGate(
+  acquireResult: { acquired: boolean },
+  renewResult = true,
+) {
   const calls: GateCall[] = [];
 
   return {
@@ -396,6 +522,10 @@ function buildFakeGate(acquireResult: { acquired: boolean }) {
           tenantActive: 2,
           repoActive: 1,
         };
+      },
+      renewInvestigationConcurrency: async (slot: { investigationId: string }) => {
+        calls.push({ action: "renew", investigationId: slot.investigationId });
+        return renewResult;
       },
       releaseInvestigationConcurrency: async (slot: { investigationId: string }) => {
         calls.push({ action: "release", investigationId: slot.investigationId });
@@ -437,6 +567,68 @@ describe("processInvestigationJobWithConcurrency", () => {
     ).rejects.toBeInstanceOf(UnrecoverableError);
 
     expect(calls.filter((call) => call.action === "release")).toHaveLength(1);
+  });
+
+  test("renews the lease while a long-running investigation is active", async () => {
+    const { gate, calls } = buildFakeGate({ acquired: true });
+    const deps = buildWorkerDeps(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(
+            () =>
+              resolve({
+                investigationId: "inv_WRAP123456",
+                outcome: "not_reproduced",
+                summary: {
+                  investigationId: "inv_WRAP123456",
+                  outcome: "not_reproduced",
+                },
+                githubComment: "done",
+              } as InvestigationPipelineResult),
+            25,
+          );
+        }),
+    );
+
+    await processInvestigationJobWithConcurrency(job, deps, {
+      gate,
+      delayJob: async () => {},
+      heartbeatIntervalMs: 5,
+    });
+
+    expect(calls.some((call) => call.action === "renew")).toBe(true);
+    expect(calls.at(-1)?.action).toBe("release");
+  });
+
+  test("lost lease ownership aborts the pipeline before it can complete", async () => {
+    const { gate, calls } = buildFakeGate({ acquired: true }, false);
+    let completed = false;
+    const deps = buildWorkerDeps(async (_payload, options) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      options.signal?.throwIfAborted();
+      completed = true;
+      return {
+        investigationId: "inv_WRAP123456",
+        outcome: "not_reproduced",
+        summary: {
+          investigationId: "inv_WRAP123456",
+          outcome: "not_reproduced",
+        },
+        githubComment: "done",
+      } as InvestigationPipelineResult;
+    });
+
+    await expect(
+      processInvestigationJobWithConcurrency(job, deps, {
+        gate,
+        delayJob: async () => {},
+        heartbeatIntervalMs: 5,
+      }),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(completed).toBe(false);
+    expect(calls.some((call) => call.action === "renew")).toBe(true);
+    expect(calls.at(-1)?.action).toBe("release");
   });
 
   test("a denied slot delays the job through the queue instead of dropping it", async () => {

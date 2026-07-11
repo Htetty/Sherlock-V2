@@ -45,6 +45,7 @@ import {
   loadMemory,
   matchMemory,
   renderPastInvestigations,
+  selectBlockingFailedAttempts,
   writeMemorySelectionArtifacts,
   MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
   MAX_FAILED_DIFF_BYTES,
@@ -150,6 +151,8 @@ export type InvestigationPipelineResult = {
 
 export type PipelineOptions = {
   onStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Cooperative cancellation used by the worker's concurrency lease fence.
+  signal?: AbortSignal;
   // Injectable for tests; production always uses the real authenticated
   // clone flow.
   cloneRepo?: typeof cloneRepoForInvestigation;
@@ -209,6 +212,7 @@ export async function runInvestigationPipeline(
   // Stage reporting is best-effort telemetry; a broken reporter (e.g. a
   // Redis blip during updateProgress) must never fail the investigation.
   const reportStage = async (stage: InvestigationStage) => {
+    options.signal?.throwIfAborted();
     await recordState({ type: "stage_changed", stage });
 
     try {
@@ -216,6 +220,7 @@ export async function runInvestigationPipeline(
     } catch (error) {
       log(`Could not report stage "${stage}": ${formatError(error)}`);
     }
+    options.signal?.throwIfAborted();
   };
 
   let repoContext: RepoContext | null = null;
@@ -529,6 +534,7 @@ export async function runInvestigationPipeline(
           graphContext,
           initialSourceFiles: contextSourceFiles,
           pastInvestigations,
+          abortSignal: options.signal,
           // Cross-run duplicate-plan guard seed (Change 3): plan hashes that
           // failed to reproduce in previous investigations. The guard itself
           // is commit-scoped inside the agent. Omitted when empty.
@@ -874,8 +880,11 @@ export async function runInvestigationPipeline(
 
         await reportStage("verifying");
 
-        const knownFailedProposals = pastEntries
-          .flatMap((entry) => entry.failedAttempts ?? [])
+        const knownFailedProposals = selectBlockingFailedAttempts(
+          pastEntries,
+          payload.issueTitle,
+          repoContext.commit,
+        )
           .filter(
             (attempt) =>
               typeof attempt?.proposalHash === "string" && attempt.proposalHash,
@@ -912,6 +921,7 @@ export async function runInvestigationPipeline(
           sandboxResult: sandboxSession.result,
           plan,
           reproductionResult: result,
+          abortSignal: options.signal,
           graphContext: refinedContext,
           // Memory: how similar bugs in this repo were fixed before,
           // re-rendered against the CURRENT clone so staleness markers and
@@ -1144,7 +1154,9 @@ export async function runInvestigationPipeline(
           pushUrl: token
             ? `https://x-access-token:${token}@github.com/${payload.repoOwner}/${payload.repoName}.git`
             : null,
+          abortSignal: options.signal,
         });
+        options.signal?.throwIfAborted();
 
         log(
           `Pull request flow finished: ${pullRequest.status}${pullRequest.pullRequestUrl ? ` (${pullRequest.pullRequestUrl})` : ""}`,
@@ -1158,6 +1170,7 @@ export async function runInvestigationPipeline(
           branch: pullRequest.branch,
         });
       } catch (error) {
+        options.signal?.throwIfAborted();
         log(`Pull request flow failed unexpectedly: ${formatError(error)}`);
         await recordState({
           type: "error",

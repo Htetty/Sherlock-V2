@@ -38,13 +38,12 @@ export function asScriptRunner(redis: Redis): RedisScriptRunner {
 
 // --- Configuration -----------------------------------------------------------
 
-// Central hardcoded limits for now. Keep all production values here so they
-// are easy to change without threading new env vars through local/dev setup.
-// Later, getRateLimitConfig/getConcurrencyConfig can read env vars and fall
-// back to these values.
+// Production defaults. Rate-limit environment variables retain the names
+// used by the previous in-process limiter so deployments can tune the Redis
+// limiter without a configuration migration.
 export const INVESTIGATION_LIMITS = {
-  rateLimitMax: 3, // change later
-  rateLimitWindowSeconds: 5, // change later
+  rateLimitMax: 5,
+  rateLimitWindowSeconds: 10 * 60,
   tenantConcurrencyLimit: 2,
   repoConcurrencyLimit: 1,
   concurrencySlotTtlSeconds: 1800,
@@ -62,10 +61,20 @@ export type ConcurrencyConfig = {
   slotTtlSeconds: number;
 };
 
-export function getRateLimitConfig(): RateLimitConfig {
+export function getRateLimitConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): RateLimitConfig {
+  const configuredMax = positiveInteger(env.SHERLOCK_MAX_COMMANDS_PER_WINDOW);
+  const configuredWindowMinutes = positiveNumber(
+    env.SHERLOCK_COMMAND_WINDOW_MINUTES,
+  );
+
   return {
-    max: INVESTIGATION_LIMITS.rateLimitMax,
-    windowSeconds: INVESTIGATION_LIMITS.rateLimitWindowSeconds,
+    max: configuredMax ?? INVESTIGATION_LIMITS.rateLimitMax,
+    windowSeconds:
+      configuredWindowMinutes !== null
+        ? Math.max(1, Math.ceil(configuredWindowMinutes * 60))
+        : INVESTIGATION_LIMITS.rateLimitWindowSeconds,
   };
 }
 
@@ -145,6 +154,24 @@ redis.call('ZREM', KEYS[2], ARGV[1])
 return 1
 `;
 
+// Renews an existing lease only when the investigation still owns BOTH its
+// tenant and repository slots. Never recreates a partial/missing lease.
+// KEYS: [tenant zset, repo zset]
+// ARGV: [nowMs, member, keyTtlSeconds, staleCutoffMs]
+export const CONCURRENCY_RENEW_SCRIPT = `
+local heldTenant = redis.call('ZSCORE', KEYS[1], ARGV[2])
+local heldRepo = redis.call('ZSCORE', KEYS[2], ARGV[2])
+local staleCutoff = tonumber(ARGV[4])
+if not heldTenant or not heldRepo or tonumber(heldTenant) <= staleCutoff or tonumber(heldRepo) <= staleCutoff then
+  return 0
+end
+redis.call('ZADD', KEYS[1], tonumber(ARGV[1]), ARGV[2])
+redis.call('ZADD', KEYS[2], tonumber(ARGV[1]), ARGV[2])
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
+return 1
+`;
+
 // --- Rate limiter --------------------------------------------------------------------
 
 export type RateLimitDecision = {
@@ -205,6 +232,9 @@ export type ConcurrencySlot = {
   tenantKey: string;
   repoKey: string;
   investigationId: string;
+  // Unique per worker processor execution. A stalled old worker must never
+  // renew or release a newer retry's lease for the same investigation.
+  leaseId?: string;
 };
 
 export type ConcurrencyDecision =
@@ -221,6 +251,9 @@ export type InvestigationConcurrencyGate = {
   acquireInvestigationConcurrency: (
     slot: ConcurrencySlot,
   ) => Promise<ConcurrencyDecision>;
+  // Refreshes a live slot's score so long investigations are not evicted as
+  // stale while they are still running. False means ownership was lost.
+  renewInvestigationConcurrency: (slot: ConcurrencySlot) => Promise<boolean>;
   // Must run when the investigation finishes, fails, or throws. Idempotent.
   releaseInvestigationConcurrency: (slot: ConcurrencySlot) => Promise<void>;
 };
@@ -243,6 +276,8 @@ export function createInvestigationConcurrencyGate(
     `${TENANT_CONCURRENCY_KEY_PREFIX}${slot.tenantKey}`,
     `${REPO_CONCURRENCY_KEY_PREFIX}${slot.repoKey}`,
   ];
+  const memberFor = (slot: ConcurrencySlot) =>
+    slot.leaseId ?? slot.investigationId;
 
   return {
     acquireInvestigationConcurrency: async (slot) => {
@@ -261,7 +296,7 @@ export function createInvestigationConcurrencyGate(
         config.repoLimit,
         currentMs - config.slotTtlSeconds * 1000,
         currentMs,
-        slot.investigationId,
+        memberFor(slot),
         keyTtlSeconds,
       )) as [number, string, number, number];
 
@@ -294,6 +329,29 @@ export function createInvestigationConcurrencyGate(
         repoActive: Number(repoActive),
       };
     },
+    renewInvestigationConcurrency: async (slot) => {
+      const [tenantConcurrencyKey, repoConcurrencyKey] = keysFor(slot);
+      const renewed = Number(
+        await getRedis().eval(
+          CONCURRENCY_RENEW_SCRIPT,
+          2,
+          tenantConcurrencyKey,
+          repoConcurrencyKey,
+          now(),
+          memberFor(slot),
+          config.slotTtlSeconds * 2,
+          now() - config.slotTtlSeconds * 1000,
+        ),
+      );
+
+      if (renewed !== 1) {
+        log(
+          `[${slot.investigationId}] Concurrency lease renewal failed because slot ownership was lost.`,
+        );
+      }
+
+      return renewed === 1;
+    },
     releaseInvestigationConcurrency: async (slot) => {
       const [tenantConcurrencyKey, repoConcurrencyKey] = keysFor(slot);
 
@@ -302,7 +360,7 @@ export function createInvestigationConcurrencyGate(
         2,
         tenantConcurrencyKey,
         repoConcurrencyKey,
-        slot.investigationId,
+        memberFor(slot),
       );
 
       log(
@@ -314,4 +372,16 @@ export function createInvestigationConcurrencyGate(
 
 function describeLimit(limit: number): string {
   return limit > 0 ? String(limit) : "unlimited";
+}
+
+function positiveNumber(value: string | undefined): number | null {
+  const parsed = Number(value);
+
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function positiveInteger(value: string | undefined): number | null {
+  const parsed = positiveNumber(value);
+
+  return parsed === null ? null : Math.max(1, Math.floor(parsed));
 }

@@ -134,6 +134,7 @@ export type ReproducerAgentInput = {
   graphContext: GraphContext;
   initialSourceFiles: SourceFile[];
   pastInvestigations: string;
+  abortSignal?: AbortSignal;
   // Plan-behavior hashes that failed to reproduce in PREVIOUS investigations
   // of this issue (from memory failedPlans). COMMIT-SCOPED: the guard only
   // blocks a hash whose recorded commitSha equals the current sourceCommit —
@@ -884,6 +885,7 @@ export async function runReproducerAgent(
     });
 
     while (true) {
+      input.abortSignal?.throwIfAborted();
       if (Date.now() - startedAt > budgets.maxWallTimeMs) {
         return await finishExhausted("Wall-time budget exhausted.");
       }

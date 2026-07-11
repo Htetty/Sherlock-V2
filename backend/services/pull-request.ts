@@ -91,6 +91,7 @@ export type PullRequestInput = {
   // Remote used for collision checks and push. Production may pass an
   // x-access-token URL; it is normalized before any git argv is built.
   pushUrl: string | null;
+  abortSignal?: AbortSignal;
 };
 
 const PR_RESULT_FILE = "pull-request-result.json";
@@ -137,6 +138,7 @@ export async function createFixPullRequest(
 
   // --- Idempotency: reuse persisted state -----------------------------------
   const previous = await readPreviousResult(input.store);
+  input.abortSignal?.throwIfAborted();
 
   if (previous && previous.key === key) {
     if (previous.status === "created" || previous.status === "already_exists") {
@@ -181,15 +183,18 @@ export async function createFixPullRequest(
   let branch: string;
 
   try {
+    input.abortSignal?.throwIfAborted();
     branch = await chooseBranchName(input);
     await runGit(input.repoPath, ["checkout", "-b", branch]);
     result.branch = branch;
   } catch (error) {
+    input.abortSignal?.throwIfAborted();
     return finish("branch_creation_failed", formatError(error));
   }
 
   // --- Commit -----------------------------------------------------------------
   try {
+    input.abortSignal?.throwIfAborted();
     await runGit(input.repoPath, ["add", "--", ...input.fixAttempt.changedFiles]);
 
     const staged = (await runGit(input.repoPath, ["diff", "--cached", "--name-only"]))
@@ -238,6 +243,7 @@ export async function createFixPullRequest(
       status: (await runGit(input.repoPath, ["status", "--short"])).trim(),
     });
   } catch (error) {
+    input.abortSignal?.throwIfAborted();
     return finish("commit_failed", formatError(error));
   }
 
@@ -245,6 +251,7 @@ export async function createFixPullRequest(
   const remote = input.pushUrl ? await createPushRemote(input.pushUrl) : null;
 
   try {
+    input.abortSignal?.throwIfAborted();
     if (!remote) {
       return finish("push_failed", "No push remote was provided.");
     }
@@ -254,7 +261,9 @@ export async function createFixPullRequest(
       remote.url,
       `refs/heads/${branch}:refs/heads/${branch}`,
     ], remote.auth);
+    input.abortSignal?.throwIfAborted();
   } catch (error) {
+    input.abortSignal?.throwIfAborted();
     return finish("push_failed", formatError(error));
   } finally {
     await remote?.auth?.cleanup().catch(() => {});
@@ -276,6 +285,7 @@ async function openPullRequest(
   }
 
   try {
+    input.abortSignal?.throwIfAborted();
     const head = `${input.owner}:${result.branch}`;
     const existing = await input.github.findOpenPullRequest(head);
 
@@ -286,6 +296,7 @@ async function openPullRequest(
     }
 
     const body = await buildPullRequestBody(input);
+    input.abortSignal?.throwIfAborted();
     const created = await input.github.createPullRequest({
       title: buildPullRequestTitle(input),
       head: result.branch!,
@@ -297,6 +308,7 @@ async function openPullRequest(
     result.pullRequestUrl = created.url;
     return finish("created");
   } catch (error) {
+    input.abortSignal?.throwIfAborted();
     return finish(
       "pull_request_failed",
       `The branch ${result.branch} was pushed, but pull request creation failed: ${formatError(error)}`,
