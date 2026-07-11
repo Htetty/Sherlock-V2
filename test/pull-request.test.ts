@@ -87,6 +87,7 @@ async function createVerifiedAttempt(root: string, commit: string, overrides: Pa
     summary: "Return 401 for unknown users instead of a server error.",
     rootCause: "The login handler always responds with HTTP 500.",
     postPatchOutcome: "not_reproduced",
+    postPatchEvidence: null,
     testRuns: [
       {
         command: "node check-login.mjs",

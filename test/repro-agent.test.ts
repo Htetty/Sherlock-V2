@@ -12,10 +12,13 @@ import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
+  MAX_REPRODUCER_FINDINGS,
   REPRODUCER_BUDGETS,
   detectApiIssueSignal,
   runReproducerAgent,
+  selectReproducerFindings,
   type ReproducerAgentInput,
+  type ReproducerFinding,
 } from "../backend/agents/reproducer.js";
 import { getPlanMode, type ReproductionPlan } from "../backend/services/plan.js";
 import type { CreateModelMessage } from "../backend/agents/fixer.js";
@@ -706,5 +709,97 @@ describe("reproducer agent loop", () => {
     expect(lastToolResultText(model.calls[1])).toContain('start with "/"');
     // The invalid action never reached a live session.
     expect(sessions.openedCount()).toBe(0);
+  });
+});
+
+describe("structured reproducer findings", () => {
+  test("exploration produces structured, deduplicated findings and an artifact", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([
+      stepRecord("goto", "passed"),
+      stepRecord("goto", "passed"), // identical repeat -> deduplicated
+      stepRecord("click", "failed", "strict mode violation: matched 3 elements"),
+      stepRecord("click", "passed"),
+    ]);
+    const model = scriptedModel([
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("click", { target: { text: "Completed" } }),
+      toolUseMessage("click", { target: { testId: "archive-btn" } }),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("reproduced", "Expected failure condition observed: 500."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(result.findings.length).toBeGreaterThan(0);
+
+    // Real observations, never byte-count metadata.
+    for (const finding of result.findings) {
+      expect(finding.evidenceClass).toBe("live_exploration");
+      expect(finding.observation).not.toMatch(/ok \(\d+ bytes\)/);
+    }
+
+    // Route finding from goto, deduplicated across the identical repeat.
+    const gotoFindings = result.findings.filter(
+      (finding) => finding.kind === "route" && finding.sourceTool === "goto",
+    );
+    expect(gotoFindings).toHaveLength(1);
+    expect(gotoFindings[0].observation).toContain("goto / -> page loaded");
+
+    // Page observation from read_page.
+    expect(
+      result.findings.some(
+        (finding) => finding.sourceTool === "read_page" && finding.observation.includes("Title: Tasks"),
+      ),
+    ).toBe(true);
+
+    // Failed click becomes a bounded tool_failure with the real error.
+    const failure = result.findings.find((finding) => finding.kind === "tool_failure");
+    expect(failure?.observation).toContain("strict mode violation");
+    expect(failure?.observation).toContain("(ambiguous target)");
+
+    // Successful click becomes an element finding with step identity.
+    const element = result.findings.find((finding) => finding.kind === "element");
+    expect(element?.observation).toContain("archive-btn");
+    expect(element?.sourceStepId).toMatch(/^live-/);
+
+    // Artifact persisted for audit.
+    const artifact = JSON.parse(
+      await readFile(
+        path.join(input.investigationDir, "repro-agent", "reproducer-findings.json"),
+        "utf8",
+      ),
+    ) as ReproducerFinding[];
+    expect(artifact).toEqual(result.findings);
+  });
+
+  test("selectReproducerFindings caps with priority for runtime errors and routes", () => {
+    const make = (kind: ReproducerFinding["kind"], n: number): ReproducerFinding => ({
+      kind,
+      observation: `${kind} ${n}`,
+      sourceTool: "test",
+      sourceStepId: null,
+      evidenceClass: "live_exploration",
+    });
+
+    const all = [
+      ...Array.from({ length: 25 }, (_, n) => make("element", n)),
+      ...Array.from({ length: 20 }, (_, n) => make("runtime_error", n)),
+    ];
+
+    const selected = selectReproducerFindings(all);
+    expect(selected).toHaveLength(MAX_REPRODUCER_FINDINGS);
+    // All 20 runtime errors survive; elements fill the remainder.
+    expect(selected.filter((finding) => finding.kind === "runtime_error")).toHaveLength(20);
+    expect(selected.filter((finding) => finding.kind === "element")).toHaveLength(10);
+    // Chronological order is preserved.
+    expect(selected[selected.length - 1].observation).toBe("runtime_error 19");
   });
 });

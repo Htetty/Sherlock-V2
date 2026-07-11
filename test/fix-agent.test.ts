@@ -19,9 +19,11 @@ import {
   type FixerAgentInput,
 } from "../backend/agents/fixer.js";
 import type { FixAttemptResult } from "../backend/services/fix.js";
+import { hashFixProposalEdits, type FixProposal } from "../backend/services/fix-proposal.js";
 import type { GraphContext } from "../backend/services/graphContext.js";
 import type { ReproductionPlan } from "../backend/services/plan.js";
 import type { ReproductionResult } from "../backend/services/playwright.js";
+import type { ReproductionEvidenceSummary } from "../backend/services/reproduction-evidence.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -185,10 +187,34 @@ function lastToolResultText(params: RecordedCall): string {
 
 // --- Stubbed verifier ----------------------------------------------------------
 
+function evidenceSummary(
+  signature: string,
+  observed: string | null = null,
+): ReproductionEvidenceSummary {
+  return {
+    outcome: "reproduced",
+    outcomeReason: "Assertion matched the failure value.",
+    assertion: observed
+      ? { observed, detail: `Observed ${observed}.`, matchedFailure: true, matchedExpected: false }
+      : null,
+    failedStep: null,
+    consoleErrors: [],
+    consoleErrorCount: 0,
+    pageErrors: [],
+    pageErrorCount: 0,
+    networkFailures: [],
+    networkFailureCount: 0,
+    apiResponses: [],
+    apiResponseCount: 0,
+    signature,
+  };
+}
+
 function attemptResult(
   outcome: FixAttemptResult["outcome"],
   reason: string,
   changedFiles: string[] = ["server.js"],
+  postPatchEvidence: ReproductionEvidenceSummary | null = null,
 ): FixAttemptResult {
   return {
     investigationId: "inv_TESTAGENT0000",
@@ -208,6 +234,7 @@ function attemptResult(
     summary: "stub",
     rootCause: "stub root cause",
     postPatchOutcome: outcome === "verified" ? "not_reproduced" : "reproduced",
+    postPatchEvidence,
     testRuns: [],
     repositoryValidation: null,
     regressionTest: null,
@@ -230,6 +257,17 @@ const PROPOSAL_INPUT = {
   relevantTests: [],
   risk: "low",
   assumptions: [],
+};
+
+const SECOND_PROPOSAL_INPUT = {
+  ...PROPOSAL_INPUT,
+  summary: "Return 403 for unknown users",
+  files: [
+    {
+      path: "server.js",
+      edits: [{ oldText: "return { status: 500 };", newText: "return { status: 403 };" }],
+    },
+  ],
 };
 
 // --- Tests ------------------------------------------------------------------------
@@ -277,7 +315,7 @@ describe("fixer agent loop", () => {
     const serverPath = path.join(input.repoPath, "server.js");
     const model = scriptedModel([
       toolUseMessage("propose_patch", PROPOSAL_INPUT),
-      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", SECOND_PROPOSAL_INPUT),
     ]);
 
     const contentsSeenByVerifier: string[] = [];
@@ -321,8 +359,7 @@ describe("fixer agent loop", () => {
     const input = await makeInput();
     const model = scriptedModel([
       toolUseMessage("propose_patch", PROPOSAL_INPUT),
-      toolUseMessage("propose_patch", PROPOSAL_INPUT),
-      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", SECOND_PROPOSAL_INPUT),
       // Never reached: the loop must stop at maxPatchAttempts.
       toolUseMessage("propose_patch", PROPOSAL_INPUT),
     ]);
@@ -673,5 +710,358 @@ describe("fixer agent loop", () => {
     const initial = model.calls[0].messages[0].content as string;
     expect(initial).not.toContain("PAST INVESTIGATIONS");
     expect(String(model.calls[0].system)).not.toContain("MEMORY FIRST");
+  });
+});
+
+describe("rich retry feedback (evidence delta)", () => {
+  test("failed attempt feedback contains before/after signatures and the change verdict", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "giving up for the test" }),
+    ]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () =>
+        attemptResult(
+          "rejected_reproduction_still_fails",
+          "The original failure still occurs after the patch.",
+          ["server.js"],
+          evidenceSummary('reproduced | assertion observed "500"', "500"),
+        ),
+    });
+
+    const feedback = lastToolResultText(model.calls[1]);
+    expect(feedback).toContain("EVIDENCE DELTA");
+    expect(feedback).toContain("Before signature:");
+    expect(feedback).toContain("After signature:");
+    expect(feedback).toMatch(/Signature changed: (yes|no)/);
+    // Existing fields are preserved.
+    expect(feedback).toContain("Verification outcome: rejected_reproduction_still_fails");
+    expect(feedback).toContain("Changed files: server.js");
+  });
+
+  test("missing post-patch evidence is reported truthfully", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () =>
+        attemptResult("rejected_patch_invalid", "Patch rejected before application.", []),
+    });
+
+    const feedback = lastToolResultText(model.calls[1]);
+    expect(feedback).toContain("Post-patch replay not reached");
+  });
+
+  test("signature lines survive the feedback byte cap", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    const hugeReason = "x".repeat(10_000);
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () =>
+        attemptResult(
+          "rejected_reproduction_still_fails",
+          hugeReason,
+          ["server.js"],
+          evidenceSummary("reproduced | assertion observed \"500\"", "500"),
+        ),
+    });
+
+    const feedback = lastToolResultText(model.calls[1]);
+    expect(Buffer.byteLength(feedback, "utf8")).toBeLessThanOrEqual(
+      FIXER_BUDGETS.maxAttemptFeedbackBytes,
+    );
+    expect(feedback).toContain("Before signature:");
+    expect(feedback).toContain("After signature:");
+  });
+});
+
+describe("compaction preserves attempt signatures", () => {
+  test("state summary keeps a before/after signature line per attempt", async () => {
+    const previous = process.env.SHERLOCK_COMPACTION;
+    process.env.SHERLOCK_COMPACTION = "true";
+
+    try {
+      const input = await makeInput();
+      const model = scriptedModel([
+        toolUseMessage("propose_patch", PROPOSAL_INPUT),
+        toolUseMessage("read_file", { path: "server.js" }),
+        toolUseMessage("read_file", { path: "server.js", startLine: 1, endLine: 2 }),
+        toolUseMessage("read_file", { path: "server.js", startLine: 2, endLine: 3 }),
+        toolUseMessage("read_file", { path: "server.js", startLine: 3, endLine: 4 }),
+        toolUseMessage("grep", { query: "login" }),
+        toolUseMessage("grep", { query: "status" }),
+        toolUseMessage("submit_blocked", { reason: "done" }),
+      ]);
+
+      const result = await runFixerAgent(input, {
+        createMessage: model.createMessage,
+        runFixAttempt: async () =>
+          attemptResult(
+            "rejected_reproduction_still_fails",
+            "Still fails.",
+            ["server.js"],
+            evidenceSummary('reproduced | assertion observed "500"', "500"),
+          ),
+      });
+
+      expect(result.compactionEvents).toBeGreaterThanOrEqual(1);
+
+      // After compaction, some model call saw the rebuilt state summary with
+      // per-attempt signature lines.
+      const allMessages = model.calls
+        .flatMap((call) => call.messages)
+        .map((message) =>
+          typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content),
+        )
+        .join("\n");
+      expect(allMessages).toContain("Patch attempts so far");
+      expect(allMessages).toContain("before: reproduced");
+      expect(allMessages).toContain('after: reproduced | assertion observed');
+    } finally {
+      process.env.SHERLOCK_COMPACTION = previous;
+    }
+  });
+});
+
+describe("duplicate-patch guard", () => {
+  test("identical proposal twice reaches the verifier once and keeps the attempt budget", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    let verifierCalls = 0;
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        verifierCalls += 1;
+        return attemptResult("rejected_reproduction_still_fails", "Still fails.");
+      },
+    });
+
+    expect(verifierCalls).toBe(1);
+    expect(result.attempts).toHaveLength(1);
+
+    const rejection = lastToolResultText(model.calls[2]);
+    expect(rejection).toContain("REJECTED without verification");
+    expect(rejection).toContain("attempt 1");
+
+    const summary = JSON.parse(
+      await readFile(path.join(input.investigationDir, "fix-agent", "summary.json"), "utf8"),
+    ) as { patchAttempts: number; counters: { duplicatePatchRejections: number } };
+    expect(summary.patchAttempts).toBe(1);
+    expect(summary.counters.duplicatePatchRejections).toBe(1);
+  });
+
+  test("reordered files/edits and changed prose still count as duplicates", async () => {
+    const twoFileProposal = {
+      ...PROPOSAL_INPUT,
+      files: [
+        { path: "server.js", edits: [{ oldText: "return { status: 500 };", newText: "return { status: 401 };" }] },
+        { path: "./other.js", edits: [
+          { oldText: "a", newText: "b" },
+          { oldText: "c", newText: "d" },
+        ] },
+      ],
+    };
+    const reordered = {
+      ...twoFileProposal,
+      summary: "Completely different explanation",
+      rootCause: "Some other prose",
+      confidence: 0.4,
+      files: [
+        { path: "other.js", edits: [
+          { oldText: "c", newText: "d" },
+          { oldText: "a", newText: "b" },
+        ] },
+        { path: "server.js", edits: [{ oldText: "return { status: 500 };", newText: "return { status: 401 };" }] },
+      ],
+    };
+
+    expect(hashFixProposalEdits(twoFileProposal as unknown as FixProposal)).toBe(
+      hashFixProposalEdits(reordered as unknown as FixProposal),
+    );
+
+    const different = {
+      ...twoFileProposal,
+      files: [
+        { path: "server.js", edits: [{ oldText: "return { status: 500 };", newText: "return { status: 403 };" }] },
+      ],
+    };
+    expect(hashFixProposalEdits(different as unknown as FixProposal)).not.toBe(
+      hashFixProposalEdits(twoFileProposal as unknown as FixProposal),
+    );
+  });
+
+  test("a materially different patch reaches verification", async () => {
+    const secondProposal = {
+      ...PROPOSAL_INPUT,
+      files: [
+        {
+          path: "server.js",
+          edits: [{ oldText: "return { status: 500 };", newText: "return { status: 403 };" }],
+        },
+      ],
+    };
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", secondProposal),
+    ]);
+
+    let verifierCalls = 0;
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        verifierCalls += 1;
+        return verifierCalls === 1
+          ? attemptResult("rejected_reproduction_still_fails", "Still fails.")
+          : attemptResult("verified", "Replay clean.");
+      },
+    });
+
+    expect(verifierCalls).toBe(2);
+    expect(result.status).toBe("verified");
+  });
+
+  test("third duplicate rejection ends with fixer_repeated_patch", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+    ]);
+
+    let verifierCalls = 0;
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        verifierCalls += 1;
+        return attemptResult("rejected_reproduction_still_fails", "Still fails.");
+      },
+    });
+
+    expect(verifierCalls).toBe(1);
+    expect(result.status).toBe("failed");
+    expect(result.failureCode).toBe("fixer_repeated_patch");
+  });
+
+  test("memory-seeded knownFailedProposals reject on the FIRST submission", async () => {
+    const seededHash = hashFixProposalEdits(PROPOSAL_INPUT as unknown as FixProposal);
+    const input = await makeInput({
+      knownFailedProposals: [
+        { proposalHash: seededHash, failureReason: "The exact replay still reproduced the issue." },
+      ],
+    });
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "cannot find a different fix" }),
+    ]);
+
+    let verifierCalls = 0;
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        verifierCalls += 1;
+        return attemptResult("verified", "unexpected");
+      },
+    });
+
+    expect(verifierCalls).toBe(0);
+    expect(result.status).toBe("blocked");
+
+    const rejection = lastToolResultText(model.calls[1]);
+    expect(rejection).toContain("REJECTED without verification");
+    expect(rejection).toContain("previous investigation");
+    expect(rejection).toContain("The exact replay still reproduced the issue.");
+  });
+});
+
+describe("reproducer findings in the fixer prompt", () => {
+  test("findings render as labeled exploration hints", async () => {
+    const input = await makeInput({
+      reproducerFindings: [
+        {
+          kind: "response",
+          observation: "POST /api/archive -> 500",
+          sourceTool: "request",
+          sourceStepId: "live-3",
+          evidenceClass: "live_exploration",
+        },
+        {
+          kind: "runtime_error",
+          observation: "TypeError: Converting circular structure to JSON",
+          sourceTool: "read_page",
+          sourceStepId: null,
+          evidenceClass: "live_exploration",
+        },
+      ],
+    });
+    const model = scriptedModel([toolUseMessage("propose_patch", PROPOSAL_INPUT)]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    const initial = model.calls[0].messages[0].content as string;
+    expect(initial).toContain("REPRODUCER EXPLORATION HINTS");
+    expect(initial).toContain("They are not proof");
+    expect(initial).toContain("- [response/request] POST /api/archive -> 500");
+    expect(initial).toContain("- [runtime_error/read_page] TypeError");
+  });
+
+  test("the complete findings section obeys its byte cap", async () => {
+    const input = await makeInput({
+      reproducerFindings: Array.from({ length: 30 }, (_, index) => ({
+        kind: "runtime_error" as const,
+        observation: `finding-${index}-${"x".repeat(280)}`,
+        sourceTool: "read_page",
+        sourceStepId: null,
+        evidenceClass: "live_exploration" as const,
+      })),
+    });
+    const model = scriptedModel([toolUseMessage("propose_patch", PROPOSAL_INPUT)]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    const initial = model.calls[0].messages[0].content as string;
+    const start = initial.indexOf("REPRODUCER EXPLORATION HINTS");
+    const end = initial.indexOf("\nSaved reproduction plan", start);
+    const section = initial.slice(start, end);
+    expect(Buffer.byteLength(section, "utf8")).toBeLessThanOrEqual(2 * 1024);
+  });
+
+  test("no findings means no hints section", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([toolUseMessage("propose_patch", PROPOSAL_INPUT)]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => attemptResult("verified", "Replay clean."),
+    });
+
+    const initial = model.calls[0].messages[0].content as string;
+    expect(initial).not.toContain("REPRODUCER EXPLORATION HINTS");
   });
 });

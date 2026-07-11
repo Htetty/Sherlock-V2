@@ -49,6 +49,7 @@ import {
 } from "../services/playwright.js";
 import type { SourceFile } from "../services/repo.js";
 import { redactSecrets } from "../services/report.js";
+import { truncateUtf8Bytes } from "../services/reproduction-evidence.js";
 import type { CreateModelMessage } from "./fixer.js";
 
 const execFileAsync = promisify(execFile);
@@ -160,10 +161,56 @@ export type ReproducerAgentResult = {
   // How the agent explored (may be broader than the accepted plan's mode).
   explorationMode: ReproductionMode;
   submissions: PlanSubmissionRecord[];
+  // Bounded, deterministic live-exploration observations (Change 4). Hints
+  // for the fixer, never proof — the official replay stays authoritative.
+  findings: ReproducerFinding[];
   // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
   turns: number;
   compactionEvents: number;
 };
+
+// --- Structured findings (AGENT_LOOP_UPGRADE_PROMPT.md, Change 4) -------------
+//
+// Deterministic summaries of actual tool observations, built at tool-execution
+// time. Never model-generated prose, never byte-count metadata.
+
+export type ReproducerFinding = {
+  kind: "route" | "element" | "response" | "runtime_error" | "tool_failure";
+  observation: string;
+  sourceTool: string;
+  sourceStepId: string | null;
+  evidenceClass: "live_exploration";
+};
+
+export const MAX_REPRODUCER_FINDINGS = 30;
+export const MAX_REPRODUCER_FINDING_BYTES = 300;
+export const MAX_RENDERED_REPRODUCER_FINDINGS_BYTES = 2 * 1024;
+
+// Final cap selection: prefer recent runtime errors and route/response
+// findings, then fill with the rest (newest first). Chronological order is
+// preserved in the returned array.
+export function selectReproducerFindings(
+  all: ReproducerFinding[],
+): ReproducerFinding[] {
+  if (all.length <= MAX_REPRODUCER_FINDINGS) {
+    return [...all];
+  }
+
+  const priority = new Set(["runtime_error", "route", "response"]);
+  const selected = new Set<ReproducerFinding>();
+
+  for (let index = all.length - 1; index >= 0; index -= 1) {
+    if (selected.size >= MAX_REPRODUCER_FINDINGS) break;
+    if (priority.has(all[index].kind)) selected.add(all[index]);
+  }
+
+  for (let index = all.length - 1; index >= 0; index -= 1) {
+    if (selected.size >= MAX_REPRODUCER_FINDINGS) break;
+    selected.add(all[index]);
+  }
+
+  return all.filter((finding) => selected.has(finding));
+}
 
 export type ReproducerAgentDeps = {
   createMessage: CreateModelMessage;
@@ -485,6 +532,73 @@ export async function runReproducerAgent(
   // Last failed official replay (for the not_reproduced terminal state).
   let lastReplay: { plan: ReproductionPlan; result: ReproductionResult } | null = null;
 
+  // Structured findings (Change 4): deterministic, deduplicated, bounded.
+  const findings: ReproducerFinding[] = [];
+  const findingKeys = new Set<string>();
+  let findingsCursor = { console: 0, page: 0, network: 0 };
+
+  const recordFinding = (
+    kind: ReproducerFinding["kind"],
+    observation: string,
+    sourceTool: string,
+    sourceStepId: string | null,
+  ) => {
+    const bounded = truncateUtf8Bytes(
+      redactSecrets(observation).replace(/\s+/g, " ").trim(),
+      MAX_REPRODUCER_FINDING_BYTES,
+    );
+
+    if (!bounded) {
+      return;
+    }
+
+    const key = `${kind}|${bounded}`;
+
+    if (findingKeys.has(key)) {
+      return;
+    }
+
+    findingKeys.add(key);
+    findings.push({
+      kind,
+      observation: bounded,
+      sourceTool,
+      sourceStepId,
+      evidenceClass: "live_exploration",
+    });
+  };
+
+  // New console/page errors and failed requests observed since the last
+  // findings sweep. Peeks without touching the model-facing evidenceCursor.
+  const recordNewEvidenceFindings = (
+    live: LiveSession,
+    sourceTool: string,
+    sourceStepId: string | null,
+  ) => {
+    const { evidence } = live;
+
+    for (const error of evidence.consoleErrors.slice(findingsCursor.console)) {
+      recordFinding("runtime_error", error, sourceTool, sourceStepId);
+    }
+
+    for (const error of evidence.pageErrors.slice(findingsCursor.page)) {
+      recordFinding("runtime_error", error, sourceTool, sourceStepId);
+    }
+
+    for (const failure of evidence.networkFailures.slice(findingsCursor.network)) {
+      recordFinding(
+        "response",
+        `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`,
+        sourceTool,
+        sourceStepId,
+      );
+    }
+
+    findingsCursor.console = evidence.consoleErrors.length;
+    findingsCursor.page = evidence.pageErrors.length;
+    findingsCursor.network = evidence.networkFailures.length;
+  };
+
   const messages: Anthropic.Messages.MessageParam[] = [
     { role: "user", content: buildInitialMessage(input) },
   ];
@@ -506,6 +620,10 @@ export async function runReproducerAgent(
     // plan - never the exploratory browser trace or screenshots.
     const fixerEvidenceMode = status === "reproduced" ? acceptedPlanMode : null;
 
+    // Bounded structured findings (Change 4): typed result is the runtime
+    // transport; the artifact is the audit trail.
+    const selectedFindings = selectReproducerFindings(findings);
+
     const agentResult: ReproducerAgentResult = {
       plan,
       result,
@@ -513,11 +631,13 @@ export async function runReproducerAgent(
       reason,
       explorationMode: mode,
       submissions,
+      findings: selectedFindings,
       turns: counters.turns,
       compactionEvents: compactor.events,
     };
     transcript.push({ type: "final_result", status, reason, submissions, mode });
     await store.writeJson("transcript.json", transcript);
+    await store.writeJson("reproducer-findings.json", selectedFindings);
     await store.writeJson("mode.json", {
       mode,
       browserActions: counters.pageActionsExecuted,
@@ -569,6 +689,7 @@ export async function runReproducerAgent(
     if (!session) {
       session = await openSession(sessionBaseUrl, { store: explorationStore });
       evidenceCursor = { console: 0, page: 0, network: 0, api: 0 };
+      findingsCursor = { console: 0, page: 0, network: 0 };
     }
 
     return session;
@@ -854,6 +975,13 @@ export async function runReproducerAgent(
             resultText = truncateText(`${digest}\n\n${delta}`, budgets.maxDigestBytes);
             counters.evidenceBytes += resultText.length;
             counters.readPageOk += 1;
+            recordFinding(
+              "route",
+              `page observed: ${digest.split("\n").slice(0, 2).join(" | ")}`,
+              "read_page",
+              null,
+            );
+            recordNewEvidenceFindings(live, "read_page", null);
             await live
               .captureScreenshot(`${String(toolCallIndex + 1).padStart(3, "0")}-after-read_page`)
               .catch(() => null);
@@ -891,6 +1019,12 @@ export async function runReproducerAgent(
           if (stepErrors.length > 0) {
             resultText = `Invalid action: ${stepErrors.join(" | ")}`;
             isError = true;
+            recordFinding(
+              "tool_failure",
+              `${toolUse.name} rejected as invalid: ${stepErrors.join(" | ")}`,
+              toolUse.name,
+              null,
+            );
           } else {
             try {
               const live = await ensureSession();
@@ -898,6 +1032,53 @@ export async function runReproducerAgent(
               resultText = formatStepResult(record, live, evidenceCursor, isRequest);
               isError = record.outcome === "failed";
               counters.evidenceBytes += resultText.length;
+
+              // Structured finding from the ACTUAL observation (Change 4).
+              const stepInput = toolUse.input as Record<string, unknown>;
+              const targetLabel =
+                typeof stepInput.path === "string"
+                  ? stepInput.path
+                  : stepInput.target
+                    ? JSON.stringify(stepInput.target)
+                    : typeof stepInput.selector === "string"
+                      ? stepInput.selector
+                      : "";
+
+              if (record.outcome === "failed") {
+                recordFinding(
+                  "tool_failure",
+                  `${toolUse.name} ${targetLabel} failed${record.ambiguous ? " (ambiguous target)" : ""}: ${record.error ?? "unknown error"}`,
+                  toolUse.name,
+                  record.id,
+                );
+              } else if (isRequest) {
+                const lastResponse =
+                  live.evidence.apiResponses[live.evidence.apiResponses.length - 1];
+                recordFinding(
+                  "response",
+                  lastResponse
+                    ? `${lastResponse.method} ${lastResponse.url} -> ${lastResponse.status}`
+                    : `request ${targetLabel} executed`,
+                  "request",
+                  record.id,
+                );
+              } else if (toolUse.name === "goto") {
+                recordFinding(
+                  "route",
+                  `goto ${targetLabel} -> page loaded`,
+                  "goto",
+                  record.id,
+                );
+              } else if (toolUse.name === "click" || toolUse.name === "fill") {
+                recordFinding(
+                  "element",
+                  `${toolUse.name} ${targetLabel} existed and the action succeeded`,
+                  toolUse.name,
+                  record.id,
+                );
+              }
+
+              recordNewEvidenceFindings(live, toolUse.name, record.id);
 
               if (isRequest) {
                 counters.requestsExecuted += 1;

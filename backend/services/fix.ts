@@ -29,6 +29,10 @@ import { parseGitStatusPorcelainZ } from "./git-status.js";
 import type { ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
 import {
+  summarizeReproductionEvidence,
+  type ReproductionEvidenceSummary,
+} from "./reproduction-evidence.js";
+import {
   formatValidationLine,
   runRepositoryValidation,
   type RepositoryValidation,
@@ -135,6 +139,10 @@ export type FixAttemptResult = {
   summary: string | null;
   rootCause: string | null;
   postPatchOutcome: string | null;
+  // Bounded shared evidence summary of the post-patch replay (Change 1).
+  // Null until the replay runs; the raw post-patch-reproduction-result.json
+  // artifact remains the complete record.
+  postPatchEvidence: ReproductionEvidenceSummary | null;
   testRuns: TestRunRecord[];
   // Truthful repository validation summary (null until validation runs).
   repositoryValidation: RepositoryValidationSummary | null;
@@ -163,6 +171,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     summary: null,
     rootCause: null,
     postPatchOutcome: null,
+    postPatchEvidence: null,
     testRuns: [],
     repositoryValidation: null,
     regressionTest: null,
@@ -507,6 +516,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     probeTimeoutMs: input.probeTimeoutMs,
   });
   result.postPatchOutcome = postResult.outcome;
+  result.postPatchEvidence = summarizeReproductionEvidence(postResult);
   await store.writeJson("post-patch-reproduction-result.json", {
     investigationId: input.investigationId,
     fixAttemptId,

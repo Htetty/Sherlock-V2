@@ -17,8 +17,16 @@ import {
   generateRegressionTestProposal,
   generateReproductionPlan,
 } from "./claude.js";
-import { runFixerAgent, type FixerAgentStatus } from "../agents/fixer.js";
-import { getBudgetProfileName, runReproducerAgent } from "../agents/reproducer.js";
+import {
+  runFixerAgent,
+  type FixerAgentAttempt,
+  type FixerAgentStatus,
+} from "../agents/fixer.js";
+import {
+  getBudgetProfileName,
+  runReproducerAgent,
+  type ReproducerFinding,
+} from "../agents/reproducer.js";
 import { createCostShapeTracker } from "./cost-shape.js";
 import type { FixAttemptResult, FixOutcome } from "./fix.js";
 import { getSandboxNetworkPolicy } from "./container.js";
@@ -36,8 +44,13 @@ import {
   loadMemory,
   matchMemory,
   renderPastInvestigations,
+  MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
+  MAX_FAILED_DIFF_BYTES,
+  MAX_FAILED_REASON_BYTES,
+  type FailedMemoryAttempt,
   type MemoryOutcome,
 } from "./memory.js";
+import { truncateUtf8Bytes } from "./reproduction-evidence.js";
 import {
   createFixPullRequest,
   createGitHubRestClient,
@@ -76,6 +89,7 @@ import {
   formatAnalysisComment,
   formatPullRequestComment,
   formatResultComment,
+  redactSecrets,
   type InvestigationSummary,
 } from "./report.js";
 import {
@@ -402,6 +416,10 @@ export async function runInvestigationPipeline(
       | "one_shot"
       | "reproducer_agent"
       | null = null;
+    // Structured live-exploration findings, retained ONLY when reproduction
+    // succeeded through the reproducer agent (Change 4). Memory-replay and
+    // one-shot paths never fabricate findings.
+    let reproducerFindings: ReproducerFinding[] = [];
 
     // Runs the reproducer agent fallback. Returns a finished pipeline result
     // on a terminal failure, or null when a plan/result was accepted (stored
@@ -471,6 +489,7 @@ export async function runInvestigationPipeline(
         result = reproResult.result;
         reproductionMode = getPlanMode(plan);
         reproductionPath = "reproducer_agent";
+        reproducerFindings = reproResult.findings;
         investigationRecord.reproduction = {
           explorationMode: reproResult.explorationMode,
           planMode: reproductionMode,
@@ -717,6 +736,9 @@ export async function runInvestigationPipeline(
     let fixerStatus: FixerAgentStatus | null = null;
     let fixerFailureCode: string | null = null;
     let fixerAttemptCount = 0;
+    // Retained outside the fixer try block so the memory-recording stage can
+    // persist ALL non-verified attempts, not only the last one (Change 2).
+    let fixerAttempts: FixerAgentAttempt[] = [];
 
     if (result.outcome === "reproduced") {
       try {
@@ -750,6 +772,17 @@ export async function runInvestigationPipeline(
         });
 
         await reportStage("verifying");
+
+        const knownFailedProposals = pastEntries
+          .flatMap((entry) => entry.failedAttempts ?? [])
+          .filter(
+            (attempt) =>
+              typeof attempt?.proposalHash === "string" && attempt.proposalHash,
+          )
+          .map((attempt) => ({
+            proposalHash: attempt.proposalHash,
+            failureReason: attempt.failureReason ?? "(no reason recorded)",
+          }));
 
         // One regression test per fix attempt (dev): Claude-backed generator
         // with bounded refinement handled inside runFixAttempt(). The fixer
@@ -786,6 +819,13 @@ export async function runInvestigationPipeline(
             pastEntries,
             repoContext.repoPath,
           ),
+          // Cross-run duplicate guard seed (Change 3): canonical hashes of
+          // patches that already failed for this issue. Omitted when empty.
+          ...(knownFailedProposals.length > 0 ? { knownFailedProposals } : {}),
+          // Live-exploration hints (Change 4): reproducerFindings is only
+          // ever assigned on the reproducer-agent path, so a non-empty array
+          // implies that path; memory-replay/one-shot stay empty.
+          ...(reproducerFindings.length > 0 ? { reproducerFindings } : {}),
           initialSourceFiles: refinedContext.available
             ? refinedContext.relevantFiles
             : contextSourceFiles,
@@ -810,6 +850,7 @@ export async function runInvestigationPipeline(
         fixerStatus = agentResult.status;
         fixerFailureCode = agentResult.failureCode;
         fixerAttemptCount = agentResult.attempts.length;
+        fixerAttempts = agentResult.attempts;
         await costShape.update({
           fixerTurns: agentResult.turns,
           fixerPatchAttempts: agentResult.attempts.length,
@@ -1084,6 +1125,45 @@ export async function runInvestigationPipeline(
         }), so the patch was rejected despite the passing replay.`;
       }
 
+      // Failed-attempt memory (Change 2): the last two non-verified attempts,
+      // bounded, with diffs read only through the fixer-returned attemptDir.
+      const failedAttempts: FailedMemoryAttempt[] = [];
+
+      for (const attempt of fixerAttempts
+        .filter((item) => item.outcome !== "verified" && item.proposalHash)
+        .slice(-MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY)) {
+        let failedDiff: string | null = null;
+
+        if (attempt.attemptDir) {
+          try {
+            const raw = await readFile(
+              path.join(attempt.attemptDir, "git-diff.patch"),
+              "utf8",
+            );
+            failedDiff = raw.trim()
+              ? truncateUtf8Bytes(raw, MAX_FAILED_DIFF_BYTES)
+              : null;
+          } catch {
+            failedDiff = null; // Patch never reached application.
+          }
+        }
+
+        failedAttempts.push({
+          approach: attempt.proposalSummary ?? "(no summary recorded)",
+          proposalHash: attempt.proposalHash as string,
+          diff: failedDiff,
+          failureReason: truncateUtf8Bytes(
+            redactSecrets(
+              [attempt.reason ?? "", attempt.failureSignature ?? ""]
+                .filter(Boolean)
+                .join(" | ") || "(no reason recorded)",
+            ),
+            MAX_FAILED_REASON_BYTES,
+          ),
+          failureSignature: attempt.failureSignature ?? null,
+        });
+      }
+
       // Verified fixes: store the exact winning diff so a future fixer run on
       // the same bug can reapply HOW it was fixed instead of re-deriving it.
       let fixDiff: string | null = null;
@@ -1110,6 +1190,7 @@ export async function runInvestigationPipeline(
         whatFailed: memoryFields.whatFailed,
         createdAt: new Date().toISOString(),
         ...(fixDiff ? { fixDiff } : {}),
+        ...(failedAttempts.length > 0 ? { failedAttempts } : {}),
         // Memory-plan replay: store the deterministically proven plan so
         // repeat issues can replay it instead of regenerating. Only plans
         // that actually reproduced are stored; replay (never trust) decides.

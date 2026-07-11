@@ -2,6 +2,7 @@
 // This module must stay free of Claude/Anthropic imports so fix attempts can
 // be validated and applied without any Claude dependency.
 
+import { createHash } from "node:crypto";
 import { readFile, lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -31,6 +32,27 @@ export type FixProposal = {
 export type ProposalValidationResult =
   | { ok: true; proposal: FixProposal }
   | { ok: false; errors: string[] };
+
+// Canonical patch identity (AGENT_LOOP_UPGRADE_PROMPT.md, Change 3): two
+// proposals that make identical file edits hash identically even when their
+// prose (summary, rootCause, confidence, relevantTests) or file/edit ordering
+// differs. Whitespace inside oldText/newText is preserved byte-for-byte.
+export function hashFixProposalEdits(proposal: FixProposal): string {
+  const canonical = proposal.files
+    .map((file) => ({
+      path: path.posix.normalize(file.path.split(path.sep).join("/")),
+      edits: [...file.edits]
+        .map((edit) => [edit.oldText, edit.newText] as const)
+        .sort((a, b) => compareStrings(a[0], b[0]) || compareStrings(a[1], b[1])),
+    }))
+    .sort((a, b) => compareStrings(a.path, b.path));
+
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
 
 export const PATCH_LIMITS = {
   maxChangedFiles: 5,

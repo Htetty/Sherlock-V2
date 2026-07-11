@@ -34,10 +34,21 @@ import type { AppNetworkTarget } from "../services/regression-test.js";
 import {
   FIX_PROPOSAL_VERSION,
   PATCH_LIMITS,
+  hashFixProposalEdits,
   validateFixProposalShape,
 } from "../services/fix-proposal.js";
+import {
+  formatReproductionEvidenceDelta,
+  summarizeReproductionEvidence,
+  truncateUtf8Bytes,
+  type ReproductionEvidenceSummary,
+} from "../services/reproduction-evidence.js";
 import { queryGraphNeighbors, type GraphContext } from "../services/graphContext.js";
 import type { ReproductionPlan } from "../services/plan.js";
+import {
+  MAX_RENDERED_REPRODUCER_FINDINGS_BYTES,
+  type ReproducerFinding,
+} from "./reproducer.js";
 import type { ReproductionResult } from "../services/playwright.js";
 import type { SourceFile } from "../services/repo.js";
 import { redactSecrets } from "../services/report.js";
@@ -130,6 +141,15 @@ export type FixerAgentInput = {
   // Rendered PAST INVESTIGATIONS memory (renderPastInvestigations), including
   // verified fix diffs and staleness markers. Empty string when no matches.
   pastInvestigations?: string;
+  // Canonical edit hashes of patches that failed in PREVIOUS investigations
+  // of this issue (from memory failedAttempts). Seeds the duplicate-patch
+  // guard so a known-failed patch is rejected deterministically, before
+  // verification, on its first submission.
+  knownFailedProposals?: Array<{ proposalHash: string; failureReason: string }>;
+  // Structured live-exploration observations from the reproducer agent
+  // (Change 4). Present ONLY when reproduction came through the reproducer
+  // path — memory replay and one-shot plans must not fabricate findings.
+  reproducerFindings?: ReproducerFinding[];
   restart: () => Promise<RestartResult>;
   // --- Verification extras (dev: repo validation + regression tests) ------
   // "owner/name" used in validation artifacts; never a URL or secret.
@@ -151,14 +171,21 @@ export type FixerFailureCode =
   | "proposal_format_invalid"
   | "fixer_patch_failed_verification"
   | "fixer_patch_rejected_safety"
-  | "fixer_patch_failed_tests";
+  | "fixer_patch_failed_tests"
+  | "fixer_repeated_patch";
 
 export type FixerAgentAttempt = {
   index: number;
   fixAttemptId?: string;
+  // Attempt artifact directory returned by the verifier; the orchestrator
+  // reads git-diff.patch only through this, never by reconstructing paths.
+  attemptDir?: string;
   outcome?: string;
   reason?: string;
   changedFiles?: string[];
+  proposalSummary?: string;
+  proposalHash?: string;
+  failureSignature?: string | null;
 };
 
 export type FixerAgentResult = {
@@ -331,8 +358,27 @@ export async function runFixerAgent(
     graph: 0,
     patchAttempts: 0,
     malformedPatchProposals: 0,
+    duplicatePatchRejections: 0,
     evidenceBytes: 0,
   };
+
+  // Change 1: the accepted reproduction's evidence summary, computed once and
+  // compared against every attempt's post-patch evidence.
+  const beforeEvidence = summarizeReproductionEvidence(input.reproductionResult);
+
+  // Change 3: duplicate-patch guard. Maps canonical edit hashes to a bounded
+  // description of the prior failure. Seeded from memory (cross-run), then
+  // extended with this run's real attempts.
+  const failedPatchHashes = new Map<string, string>();
+
+  for (const known of input.knownFailedProposals ?? []) {
+    if (typeof known?.proposalHash === "string" && known.proposalHash) {
+      failedPatchHashes.set(
+        known.proposalHash,
+        `a patch that failed in a previous investigation of this issue: ${truncateUtf8Bytes(redactSecrets(known.failureReason ?? "(no reason recorded)"), 500)}`,
+      );
+    }
+  }
   const attempts: FixerAgentAttempt[] = [];
   const transcript: unknown[] = [];
 
@@ -362,9 +408,14 @@ export async function runFixerAgent(
         : "No inspection tool calls yet.",
       attempts.length > 0
         ? `Patch attempts so far (all rolled back unless verified):\n${attempts
-            .map(
-              (attempt) =>
-                `- attempt ${attempt.index}: ${attempt.outcome ?? "?"} — ${(attempt.reason ?? "").slice(0, 300)} (changed: ${(attempt.changedFiles ?? []).join(", ") || "none"})`,
+            .map((attempt) =>
+              [
+                `- attempt ${attempt.index}: ${attempt.outcome ?? "?"} — ${(attempt.reason ?? "").slice(0, 200)}`,
+                `  before: ${truncateUtf8Bytes(beforeEvidence.signature, 200)}`,
+                `  after: ${attempt.failureSignature ? truncateUtf8Bytes(attempt.failureSignature, 200) : "(replay not reached or verified)"}`,
+                `  changed: ${attempt.failureSignature ? (attempt.failureSignature === beforeEvidence.signature ? "no" : "yes") : "n/a"}`,
+                `  files: ${(attempt.changedFiles ?? []).join(", ") || "none"}`,
+              ].join("\n"),
             )
             .join("\n")}`
         : "No patch attempts yet.",
@@ -389,6 +440,7 @@ export async function runFixerAgent(
       status,
       counters.patchAttempts,
       counters.malformedPatchProposals,
+      counters.duplicatePatchRejections,
       fixAttempt,
     );
     const result: FixerAgentResult = {
@@ -560,6 +612,53 @@ export async function runFixerAgent(
           continue;
         }
 
+        // Change 3: deterministic duplicate-patch guard. Identical file edits
+        // (canonically hashed) never reach verification twice — no restart,
+        // no replay, no consumed patch attempt. Memory-seeded hashes reject
+        // known cross-run failures on their first submission.
+        const proposalHash = hashFixProposalEdits(shape.proposal);
+        const priorFailure = failedPatchHashes.get(proposalHash);
+
+        if (priorFailure) {
+          counters.duplicatePatchRejections += 1;
+
+          const rejection = `REJECTED without verification: these file edits are identical to ${priorFailure}. Propose materially different edits or call submit_blocked.`;
+          await recordToolCall("propose_patch", shape.proposal, rejection);
+          transcript.push({
+            type: "duplicate_patch_rejected",
+            turn: counters.turns,
+            proposalHash,
+            rejections: counters.duplicatePatchRejections,
+          });
+          log(
+            `duplicate patch rejected (${counters.duplicatePatchRejections}): hash ${proposalHash.slice(0, 12)}`,
+          );
+
+          if (counters.duplicatePatchRejections >= 3) {
+            return await finish(
+              "failed",
+              "The model resubmitted identical file edits three times despite rejection feedback.",
+              lastAttempt,
+            );
+          }
+
+          messages.push(
+            { role: "assistant", content: message.content },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: rejection,
+                  is_error: true,
+                },
+              ],
+            },
+          );
+          continue;
+        }
+
         counters.patchAttempts += 1;
 
         const attempt = await verify({
@@ -582,9 +681,16 @@ export async function runFixerAgent(
         attempts.push({
           index: counters.patchAttempts,
           fixAttemptId: attempt.fixAttemptId,
+          attemptDir: attempt.attemptDir,
           outcome: attempt.outcome,
           reason: attempt.reason,
           changedFiles: attempt.changedFiles,
+          proposalSummary: shape.proposal.summary,
+          proposalHash,
+          failureSignature:
+            attempt.outcome === "verified"
+              ? null
+              : (attempt.postPatchEvidence?.signature ?? null),
         });
         transcript.push({
           type: "fix_attempt",
@@ -593,10 +699,22 @@ export async function runFixerAgent(
           outcome: attempt.outcome,
           reason: attempt.reason,
           changedFiles: attempt.changedFiles,
+          proposalHash,
         });
         log(`patch attempt ${counters.patchAttempts}: ${attempt.outcome}`);
 
-        const feedback = formatAttemptFeedback(attempt);
+        if (attempt.outcome !== "verified") {
+          failedPatchHashes.set(
+            proposalHash,
+            `attempt ${counters.patchAttempts}, which failed with ${truncateUtf8Bytes(attempt.reason, 500)}`,
+          );
+        }
+
+        const feedback = formatAttemptFeedback(
+          attempt,
+          beforeEvidence,
+          budgets.maxAttemptFeedbackBytes,
+        );
         await recordToolCall("propose_patch", shape.proposal, feedback);
 
         if (attempt.outcome === "verified") {
@@ -1176,10 +1294,15 @@ function classifyFixerFailure(
   status: FixerAgentStatus,
   patchAttempts: number,
   malformedPatchProposals: number,
+  duplicatePatchRejections: number,
   fixAttempt: FixAttemptResult | null,
 ): FixerFailureCode | null {
   if (status === "verified" || fixAttempt?.outcome === "verified") {
     return null;
+  }
+
+  if (status === "failed" && duplicatePatchRejections >= 3) {
+    return "fixer_repeated_patch";
   }
 
   if (malformedPatchProposals > 0 && patchAttempts === 0 && status === "failed") {
@@ -1271,9 +1394,56 @@ How you MUST use these:
   get_graph_neighbors first.
 - If the diff is marked STALE, use it as a strong starting hypothesis: read
   only the changed region of the patched file(s), then patch.
+- A verified, non-stale fix diff is strong evidence and may be reapplied.
+- An ALREADY TRIED AND FAILED diff is a falsified historical approach — not
+  proof that every related approach is wrong.
+- A patch whose file edits exactly match a listed proposal hash will be
+  REJECTED automatically without verification. Do not resubmit it.
+- A materially different patch may revisit the same area only when current
+  evidence explains why it differs from the recorded failure.
 - Treat "blocked"/"failed" entries as approaches that already failed — do not
   repeat them unchanged.
 `;
+}
+
+// Change 4: bounded live-exploration hints. Only rendered when the reproducer
+// agent actually ran; never elevated above the deterministic replay.
+function formatReproducerFindingsSection(
+  findings: ReproducerFinding[] | undefined,
+): string {
+  if (!findings || findings.length === 0) {
+    return "";
+  }
+
+  const header = [
+    "",
+    "REPRODUCER EXPLORATION HINTS",
+    "These observations came from live exploration before the accepted clean replay.",
+    "Use them as bounded hints. They are not proof and must not override the accepted plan or official replay result.",
+    "",
+  ].join("\n");
+  const bodyBudget = Math.max(
+    0,
+    MAX_RENDERED_REPRODUCER_FINDINGS_BYTES - Buffer.byteLength(`${header}\n`, "utf8"),
+  );
+
+  let body = "";
+
+  for (const finding of findings) {
+    const line = `- [${finding.kind}/${finding.sourceTool}] ${finding.observation}\n`;
+
+    if (
+      Buffer.byteLength(body + line, "utf8") > bodyBudget
+    ) {
+      break;
+    }
+
+    body += line;
+  }
+
+  return body
+    ? truncateUtf8Bytes(`${header}\n${body}`, MAX_RENDERED_REPRODUCER_FINDINGS_BYTES)
+    : "";
 }
 
 function buildInitialMessage(input: FixerAgentInput): string {
@@ -1282,7 +1452,7 @@ function buildInitialMessage(input: FixerAgentInput): string {
   return `A bug was reproduced. Investigate and fix it.
 
 Repository commit: ${input.sourceCommit}
-${formatFixerMemorySection(input.pastInvestigations)}
+${formatFixerMemorySection(input.pastInvestigations)}${formatReproducerFindingsSection(input.reproducerFindings)}
 
 Saved reproduction plan (replayed exactly after each patch):
 ${JSON.stringify(input.plan, null, 2)}
@@ -1313,24 +1483,56 @@ ${formatRepoEvidence({
 
 // --- Verifier feedback --------------------------------------------------------------
 
-function formatAttemptFeedback(attempt: FixAttemptResult): string {
+// Change 1b: retry feedback with an explicit PRE/POST evidence delta. Uses
+// the active run's byte budget (never the global FIXER_BUDGETS alias).
+// Truncation priority: outcome/reason and signature lines always survive;
+// delta detail lines, then checks/files/tests, are dropped first.
+function formatAttemptFeedback(
+  attempt: FixAttemptResult,
+  beforeEvidence: ReproductionEvidenceSummary,
+  maxBytes: number,
+): string {
+  const byteLength = (text: string) => Buffer.byteLength(text, "utf8");
+
+  const head = [
+    `Verification outcome: ${attempt.outcome}`,
+    `Reason: ${truncateUtf8Bytes(attempt.reason, 600)}`,
+  ].join("\n");
+
+  // Delta core (signature lines) is never trimmed by the tail sections; the
+  // delta formatter itself only trims its detail lines to fit its sub-budget.
+  const deltaBudget = Math.min(2_048, Math.max(0, maxBytes - byteLength(head) - 2));
+  const delta = attempt.postPatchEvidence
+    ? formatReproductionEvidenceDelta(
+        beforeEvidence,
+        attempt.postPatchEvidence,
+        deltaBudget,
+      )
+    : "EVIDENCE DELTA\nPost-patch replay not reached (the patch was rejected before replay).";
+
   const failedChecks = attempt.checks
     .filter((item) => !item.passed)
     .map((item) => `  ${item.name}: ${item.detail}`);
 
-  const text = [
-    `Verification outcome: ${attempt.outcome}`,
-    `Reason: ${attempt.reason}`,
+  const tail = [
     failedChecks.length > 0 ? `Failed checks:\n${failedChecks.join("\n")}` : "Failed checks: (none)",
     `Changed files: ${attempt.changedFiles.join(", ") || "(none)"}`,
     `Post-patch replay outcome: ${attempt.postPatchOutcome ?? "(replay not reached)"}`,
     attempt.testRuns.length > 0
       ? `Tests:\n${attempt.testRuns.map((run) => `  ${run.command} -> exit ${run.exitCode}${run.timedOut ? " (timed out)" : ""}`).join("\n")}`
       : "Tests: (none run)",
-  ].join("\n");
+  ];
 
-  if (text.length > FIXER_BUDGETS.maxAttemptFeedbackBytes) {
-    return `${text.slice(0, FIXER_BUDGETS.maxAttemptFeedbackBytes)}\n[TRUNCATED]`;
+  let text = `${head}\n\n${delta}`;
+
+  for (const section of tail) {
+    const candidate = `${text}\n${section}`;
+
+    if (byteLength(candidate) > maxBytes) {
+      break;
+    }
+
+    text = candidate;
   }
 
   return text;

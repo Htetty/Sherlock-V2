@@ -381,6 +381,10 @@ describe("verified fix loop", () => {
 
       expect(attempt.outcome).toBe("verified");
       expect(attempt.postPatchOutcome).toBe("not_reproduced");
+      // Change 1: the bounded evidence summary is populated from the actual
+      // post-patch replay and carries a signature.
+      expect(attempt.postPatchEvidence?.outcome).toBe("not_reproduced");
+      expect(attempt.postPatchEvidence?.signature).toContain("not_reproduced");
       expect(attempt.changedFiles).toEqual(["server.mjs"]);
       expect(attempt.fixAttemptId).toMatch(/^fix_[0-9A-Z]{10,}$/);
       expect(attempt.testRuns).toHaveLength(1);
@@ -479,6 +483,7 @@ describe("verified fix loop", () => {
 
       expect(attempt.outcome).toBe("rejected_reproduction_still_fails");
       expect(attempt.postPatchOutcome).toBe("reproduced");
+      expect(attempt.postPatchEvidence?.outcome).toBe("reproduced");
     },
   );
 

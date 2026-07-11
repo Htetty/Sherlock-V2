@@ -7,11 +7,20 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { ReproductionPlan } from "./plan.js";
+import { truncateUtf8Bytes } from "./reproduction-evidence.js";
+import { redactSecrets } from "./report.js";
 
 const MAX_MATCHES = 3;
 const DEFAULT_MAX_MEMORY_ENTRIES = 100;
 // Bound stored/rendered fix diffs so memory.json and prompts stay small.
 export const MAX_FIX_DIFF_CHARS = 20_000;
+// Failed-attempt memory limits (AGENT_LOOP_UPGRADE_PROMPT.md, Change 2).
+// Failed approaches are warnings, not reapplication instructions — they get
+// a much smaller diff budget than verified fixes.
+export const MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY = 2;
+export const MAX_FAILED_DIFF_BYTES = 4 * 1024;
+export const MAX_FAILED_REASON_BYTES = 500;
+export const MAX_RENDERED_PAST_INVESTIGATIONS_BYTES = 32 * 1024;
 const memoryWriteLocks = new Map<string, Promise<void>>();
 
 export type MemoryOutcome =
@@ -41,6 +50,22 @@ export type MemoryEntry = {
   // The exact verified git diff (bounded). Optional and backward compatible.
   // Lets the fixer reuse HOW the same bug was fixed, not just where.
   fixDiff?: string;
+  // Bounded record of patches that were tried and failed verification, so a
+  // future run does not repeat them. Optional and backward compatible.
+  failedAttempts?: FailedMemoryAttempt[];
+};
+
+export type FailedMemoryAttempt = {
+  approach: string;
+  // Canonical edit hash (hashFixProposalEdits) — seeds the fixer's
+  // duplicate-patch guard across investigations.
+  proposalHash: string;
+  // Bounded git diff, or null when the patch never reached application.
+  diff: string | null;
+  failureReason: string;
+  // Origin-free post-patch failure signature (reproduction-evidence), or
+  // null when the replay was not reached.
+  failureSignature: string | null;
 };
 
 export function boundFixDiff(diff: string): string {
@@ -119,16 +144,7 @@ export function matchMemory(
 ): MemoryEntry[] {
   const terms = new Set(issueTerms);
 
-  // Reruns of the same issue append near-identical entries; keep only the
-  // newest per issue title so the top matches stay diverse and reflect the
-  // latest outcome. Entries are appended chronologically.
-  const newestByTitle = new Map<string, MemoryEntry>();
-
-  for (const entry of entries) {
-    newestByTitle.set(entry.issueTitle, entry);
-  }
-
-  return [...newestByTitle.values()]
+  return [...mergeEntriesByTitle(entries).values()]
     .map((entry) => ({
       entry,
       score: overlapScore(entry, terms),
@@ -137,6 +153,54 @@ export function matchMemory(
     .sort((a, b) => b.score - a.score)
     .slice(0, MAX_MATCHES)
     .map(({ entry }) => entry);
+}
+
+// Repeated-title merge (Change 2): reruns of the same issue append
+// near-identical entries. A later FAILED run must not hide an older VERIFIED
+// fix, so per title we keep the newest verified entry as the base (with its
+// own fixDiff/patchedFiles/fileHashes, which staleness checks depend on) and
+// attach the newest failed attempts from later entries. When no verified
+// entry exists, the newest entry wins. The merge result is ephemeral —
+// persisted history is never rewritten.
+export function mergeEntriesByTitle(entries: MemoryEntry[]): Map<string, MemoryEntry> {
+  const groups = new Map<string, MemoryEntry[]>();
+
+  for (const entry of entries) {
+    const group = groups.get(entry.issueTitle) ?? [];
+    group.push(entry);
+    groups.set(entry.issueTitle, group);
+  }
+
+  const merged = new Map<string, MemoryEntry>();
+
+  for (const [title, group] of groups) {
+    const newest = group[group.length - 1];
+    const newestVerified = [...group]
+      .reverse()
+      .find((entry) => entry.outcome === "verified");
+
+    if (!newestVerified || newestVerified === newest) {
+      merged.set(title, newest);
+      continue;
+    }
+
+    // Newest failed attempts from entries AFTER the verified one, newest
+    // first, bounded.
+    const laterFailedAttempts = group
+      .slice(group.indexOf(newestVerified) + 1)
+      .reverse()
+      .flatMap((entry) => entry.failedAttempts ?? [])
+      .slice(0, MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY);
+
+    merged.set(
+      title,
+      laterFailedAttempts.length > 0
+        ? { ...newestVerified, failedAttempts: laterFailedAttempts }
+        : newestVerified,
+    );
+  }
+
+  return merged;
 }
 
 function overlapScore(entry: MemoryEntry, terms: Set<string>): number {
@@ -163,43 +227,102 @@ function splitTokens(text: string): string[] {
     .filter((token) => token.length >= 3);
 }
 
+type DiffRenderMode = "full" | "no_failed_diffs" | "no_diffs";
+
 export async function renderPastInvestigations(
   entries: MemoryEntry[],
   repoPath: string,
 ): Promise<string> {
-  const blocks: string[] = [];
+  const prepared: Array<{ entry: MemoryEntry; staleFile: string | null }> = [];
 
   for (const entry of entries) {
-    const lines = [
-      `PAST: "${entry.issueTitle}" -> ${entry.outcome}`,
-      `  root cause: ${entry.rootCause || "(not recorded)"}`,
-      `  patched: ${entry.patchedFiles.join(", ") || "(none)"}`,
-      `  lesson: ${entry.whatWorked || entry.whatFailed || "(none recorded)"}`,
-    ];
-
-    const staleFile = await findStaleFile(entry, repoPath);
-
-    if (staleFile) {
-      lines.push(
-        `  [STALE: ${staleFile} changed since this fix - re-verify before trusting]`,
-      );
-    }
-
-    // Verified fixes carry the exact diff that worked. A fresh (non-stale)
-    // diff is the strongest possible hint: the same bug was already fixed.
-    if (entry.outcome === "verified" && entry.fixDiff) {
-      lines.push(
-        staleFile
-          ? `  verified fix diff (STALE — patched files changed since; adapt, do not apply blindly):`
-          : `  verified fix diff (patched files are UNCHANGED since this fix — reapply this exact change unless current evidence contradicts it):`,
-        indentBlock(boundFixDiff(entry.fixDiff), "    "),
-      );
-    }
-
-    blocks.push(lines.join("\n"));
+    prepared.push({ entry, staleFile: await findStaleFile(entry, repoPath) });
   }
 
-  return blocks.join("\n\n");
+  const render = (mode: DiffRenderMode) =>
+    prepared
+      .map(({ entry, staleFile }) => renderEntry(entry, staleFile, mode))
+      .join("\n\n");
+
+  // Aggregate cap (Change 2): entry headers, verified-fix warnings, and
+  // failure signatures survive; diff bodies are dropped first (failed diffs,
+  // then verified diffs), and only then is the text hard-truncated.
+  const modes: DiffRenderMode[] = ["full", "no_failed_diffs", "no_diffs"];
+
+  for (const mode of modes) {
+    const text = render(mode);
+
+    if (Buffer.byteLength(text, "utf8") <= MAX_RENDERED_PAST_INVESTIGATIONS_BYTES) {
+      if (mode === "full") {
+        return text;
+      }
+
+      const marker = `\n[MEMORY RENDER TRUNCATED: diff bodies omitted to fit the ${MAX_RENDERED_PAST_INVESTIGATIONS_BYTES}-byte cap]`;
+      return `${truncateUtf8Bytes(
+        text,
+        MAX_RENDERED_PAST_INVESTIGATIONS_BYTES - Buffer.byteLength(marker, "utf8"),
+      )}${marker}`;
+    }
+  }
+
+  const marker = "\n[MEMORY RENDER TRUNCATED at the aggregate byte cap]";
+  return `${truncateUtf8Bytes(
+    render("no_diffs"),
+    MAX_RENDERED_PAST_INVESTIGATIONS_BYTES - Buffer.byteLength(marker, "utf8"),
+  )}${marker}`;
+}
+
+function renderEntry(
+  entry: MemoryEntry,
+  staleFile: string | null,
+  mode: DiffRenderMode,
+): string {
+  const lines = [
+    `PAST: "${entry.issueTitle}" -> ${entry.outcome}`,
+    `  root cause: ${entry.rootCause || "(not recorded)"}`,
+    `  patched: ${entry.patchedFiles.join(", ") || "(none)"}`,
+    `  lesson: ${entry.whatWorked || entry.whatFailed || "(none recorded)"}`,
+  ];
+
+  if (staleFile) {
+    lines.push(
+      `  [STALE: ${staleFile} changed since this fix - re-verify before trusting]`,
+    );
+  }
+
+  // Verified fixes carry the exact diff that worked. A fresh (non-stale)
+  // diff is the strongest possible hint: the same bug was already fixed.
+  if (entry.outcome === "verified" && entry.fixDiff) {
+    lines.push(
+      staleFile
+        ? `  verified fix diff (STALE — patched files changed since; adapt, do not apply blindly):`
+        : `  verified fix diff (patched files are UNCHANGED since this fix — reapply this exact change unless current evidence contradicts it):`,
+      mode === "no_diffs"
+        ? "    (diff omitted: aggregate memory cap reached)"
+        : indentBlock(boundFixDiff(entry.fixDiff), "    "),
+    );
+  }
+
+  const failedAttempts = (entry.failedAttempts ?? []).slice(
+    0,
+    MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
+  );
+
+  for (const attempt of failedAttempts) {
+    lines.push(
+      "  ALREADY TRIED AND FAILED (historical evidence; do not repeat unchanged):",
+      `    approach: ${redactSecrets(attempt.approach || "(not recorded)")}`,
+      `    proposal hash: ${attempt.proposalHash}`,
+      `    failure signature: ${redactSecrets(attempt.failureSignature ?? "(replay not reached)")}`,
+      `    why it failed: ${truncateUtf8Bytes(redactSecrets(attempt.failureReason), MAX_FAILED_REASON_BYTES)}`,
+      "    diff:",
+      mode !== "full" || !attempt.diff
+        ? `      ${attempt.diff ? "(diff omitted: aggregate memory cap reached)" : "(diff unavailable; patch did not reach application)"}`
+        : indentBlock(truncateUtf8Bytes(attempt.diff, MAX_FAILED_DIFF_BYTES), "      "),
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function indentBlock(text: string, prefix: string): string {
