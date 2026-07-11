@@ -34,12 +34,19 @@ import type { GraphContext } from "../services/graphContext.js";
 import {
   REPRODUCTION_PLAN_VERSION,
   getPlanMode,
+  hashPlanBehavior,
   validateReproductionPlan,
   validateStep,
   type PlanMode,
   type ReproductionPlan,
   type ReproductionStep,
 } from "../services/plan.js";
+import {
+  computeReproducerDivergence,
+  formatReproducerDivergence,
+  hasDivergence,
+  type ReproducerDivergence,
+} from "../services/reproduction-divergence.js";
 import {
   executeReproductionPlan,
   openLiveSession,
@@ -49,7 +56,11 @@ import {
 } from "../services/playwright.js";
 import type { SourceFile } from "../services/repo.js";
 import { redactSecrets } from "../services/report.js";
-import { truncateUtf8Bytes } from "../services/reproduction-evidence.js";
+import {
+  summarizeReproductionEvidence,
+  truncateUtf8Bytes,
+  type ReproductionEvidenceSummary,
+} from "../services/reproduction-evidence.js";
 import type { CreateModelMessage } from "./fixer.js";
 
 const execFileAsync = promisify(execFile);
@@ -123,6 +134,16 @@ export type ReproducerAgentInput = {
   graphContext: GraphContext;
   initialSourceFiles: SourceFile[];
   pastInvestigations: string;
+  // Plan-behavior hashes that failed to reproduce in PREVIOUS investigations
+  // of this issue (from memory failedPlans). COMMIT-SCOPED: the guard only
+  // blocks a hash whose recorded commitSha equals the current sourceCommit —
+  // an old failure on a different commit informs (via rendered memory) but
+  // never blocks.
+  knownFailedPlans?: Array<{
+    planHash: string;
+    commitSha: string;
+    failureReason: string;
+  }>;
   // Restart the sandbox (fresh container) and return the new base URL.
   restart: () => Promise<RestartResult>;
 };
@@ -143,7 +164,14 @@ export type ReproductionMode = "api-only" | "browser" | "mixed" | "unknown";
 export type PlanSubmissionRecord = {
   index: number;
   valid: boolean;
+  // Canonical behavior hash (hashPlanBehavior over the submitted steps +
+  // assertion), present for every submission — invalid ones included, hashed
+  // over the raw submitted values.
+  planHash: string;
   validationErrors?: string[];
+  // Origin-free evidence signature of this submission's replay; null when the
+  // submission never reached replay (invalid).
+  replaySignature?: string | null;
   // What the agent had explored with UP TO this submission. Exploration can
   // be broader than the frozen proof (e.g. mixed exploration, api-only plan).
   explorationModeAtSubmission?: ReproductionMode;
@@ -164,10 +192,54 @@ export type ReproducerAgentResult = {
   // Bounded, deterministic live-exploration observations (Change 4). Hints
   // for the fixer, never proof — the official replay stays authoritative.
   findings: ReproducerFinding[];
+  // Deterministic failure classification (REPRODUCER_LOOP_UPGRADE_PROMPT.md).
+  // Null on "reproduced" and "not_reproduced" — the latter is a truthful
+  // negative result, not a failure.
+  failureCode: ReproducerFailureCode | null;
+  failureEvidence: ReproducerFailureEvidence | null;
   // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
   turns: number;
   compactionEvents: number;
 };
+
+// --- Failure taxonomy (REPRODUCER_LOOP_UPGRADE_PROMPT.md, Change 1) -----------
+
+export type ReproducerFailureCode =
+  | "reproducer_no_submission"           // budgets exhausted before any submit_plan
+  | "reproducer_all_submissions_invalid" // every submission failed validation
+  | "reproducer_replay_diverged"         // failure observed live, but no replay reproduced it
+  | "reproducer_no_failure_signal"       // failure never observed, live or replayed
+  | "reproducer_repeated_plan"           // duplicate-plan cap hit (Change 3)
+  | "reproducer_ambiguity_loop"          // >= 3 ambiguous-target step failures, no valid submission accepted
+  | "reproducer_environment";            // environment_failed terminal state
+
+export type ReproducerFailureEvidence = {
+  code: ReproducerFailureCode;
+  failureObservedLive: boolean;
+  // One entry per submission, in order (bounded by maxPlanSubmissions).
+  submissions: Array<{
+    planHash: string;
+    valid: boolean;
+    invalidReasons?: string[];
+    replaySignature: string | null;
+    replayOutcome: string | null;
+  }>;
+  // Shared bounded summary of the LAST failed replay (null if none ran).
+  lastReplayEvidence: ReproductionEvidenceSummary | null;
+  // Structured divergence from Change 4 (null when not computable).
+  divergence: ReproducerDivergence | null;
+};
+
+// True when live exploration observed the failure itself: a runtime error, or
+// a response finding carrying a 4xx/5xx status. Shared by the failure
+// classifier and future consumers (e.g. plan_mismatch routing).
+export function failureObservedLive(findings: ReproducerFinding[]): boolean {
+  return findings.some(
+    (finding) =>
+      finding.kind === "runtime_error" ||
+      (finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation)),
+  );
+}
 
 // --- Structured findings (AGENT_LOOP_UPGRADE_PROMPT.md, Change 4) -------------
 //
@@ -438,8 +510,36 @@ export async function runReproducerAgent(
     readPage: 0,
     readPageOk: 0, // read_page calls that returned a digest (UI-first policy)
     submissions: 0,
+    // Duplicate-plan guard (Change 3): rejections that never reached replay.
+    duplicatePlanRejections: 0,
+    // Failed steps whose target was ambiguous (strict-mode violations) — the
+    // reproducer_ambiguity_loop classification input.
+    ambiguousStepFailures: 0,
     evidenceBytes: 0,
   };
+
+  // Duplicate-plan guard state (Change 3): behavior hash -> bounded prior
+  // failure description. Seeded from memory (commit-scoped), extended with
+  // this run's replayed-but-not-reproduced submissions.
+  const failedPlanHashes = new Map<string, string>();
+
+  for (const known of input.knownFailedPlans ?? []) {
+    if (
+      typeof known?.planHash === "string" &&
+      known.planHash &&
+      known.commitSha === input.sourceCommit
+    ) {
+      failedPlanHashes.set(
+        known.planHash,
+        `a plan that failed to reproduce in a previous investigation of this issue on this same commit: ${truncateUtf8Bytes(known.failureReason ?? "(no reason recorded)", 500)}`,
+      );
+    }
+  }
+
+  // Evidence-delta state (Change 4a) and failure-evidence state (Change 1).
+  let previousFailedReplaySummary: ReproductionEvidenceSummary | null = null;
+  let lastFailedReplaySummary: ReproductionEvidenceSummary | null = null;
+  let lastDivergence: ReproducerDivergence | null = null;
 
   // UI-first policy: required unless the issue/memory clearly identifies an
   // API endpoint failure. Satisfied by >=1 successful goto and >=1 read_page.
@@ -624,6 +724,44 @@ export async function runReproducerAgent(
     // transport; the artifact is the audit trail.
     const selectedFindings = selectReproducerFindings(findings);
 
+    // Failure classification (Change 1): deterministic, terminal-failure
+    // statuses only. "not_reproduced" is a truthful negative, not a failure.
+    const isTerminalFailure =
+      status === "plan_failed" ||
+      status === "exhausted" ||
+      status === "environment_failed" ||
+      status === "failed";
+    const failureCode = isTerminalFailure
+      ? classifyReproducerFailure({
+          status,
+          submissions,
+          findings: selectedFindings,
+          duplicatePlanRejections: counters.duplicatePlanRejections,
+          ambiguousStepFailures: counters.ambiguousStepFailures,
+        })
+      : null;
+    const failureEvidence: ReproducerFailureEvidence | null = failureCode
+      ? {
+          code: failureCode,
+          failureObservedLive: failureObservedLive(selectedFindings),
+          submissions: submissions.map((submission) => ({
+            planHash: submission.planHash,
+            valid: submission.valid,
+            ...(submission.validationErrors
+              ? {
+                  invalidReasons: submission.validationErrors
+                    .slice(0, 5)
+                    .map((error) => truncateUtf8Bytes(error, 300)),
+                }
+              : {}),
+            replaySignature: submission.replaySignature ?? null,
+            replayOutcome: submission.replayOutcome ?? null,
+          })),
+          lastReplayEvidence: lastFailedReplaySummary,
+          divergence: lastDivergence,
+        }
+      : null;
+
     const agentResult: ReproducerAgentResult = {
       plan,
       result,
@@ -632,12 +770,18 @@ export async function runReproducerAgent(
       explorationMode: mode,
       submissions,
       findings: selectedFindings,
+      failureCode,
+      failureEvidence,
       turns: counters.turns,
       compactionEvents: compactor.events,
     };
-    transcript.push({ type: "final_result", status, reason, submissions, mode });
+    transcript.push({ type: "final_result", status, reason, submissions, mode, failureCode });
     await store.writeJson("transcript.json", transcript);
     await store.writeJson("reproducer-findings.json", selectedFindings);
+
+    if (failureEvidence) {
+      await store.writeJson("failure-evidence.json", failureEvidence);
+    }
     await store.writeJson("mode.json", {
       mode,
       browserActions: counters.pageActionsExecuted,
@@ -660,6 +804,7 @@ export async function runReproducerAgent(
     await store.writeJson("summary.json", {
       status,
       reason,
+      failureCode,
       mode,
       acceptedPlanMode,
       submissions,
@@ -671,6 +816,9 @@ export async function runReproducerAgent(
     log(
       `finished: ${status} (exploration: ${mode}${acceptedPlanMode ? `, accepted plan: ${acceptedPlanMode}` : ""}) — ${reason}`,
     );
+    if (failureCode) {
+      log(`failure code: ${failureCode}`);
+    }
     return agentResult;
   };
 
@@ -810,12 +958,17 @@ export async function runReproducerAgent(
           assertion: submitted.assertion,
         };
 
+        // Canonical behavior hash (Change 1/3): computed for every submission,
+        // including invalid ones (hashed over the raw submitted values).
+        const planHash = hashPlanBehavior(candidate as unknown as ReproductionPlan);
+
         const validation = validateReproductionPlan(candidate);
 
         if (!validation.ok) {
           submissions.push({
             index: counters.submissions,
             valid: false,
+            planHash,
             explorationModeAtSubmission,
             validationErrors: validation.errors,
           });
@@ -837,6 +990,42 @@ export async function runReproducerAgent(
           }
 
           pushResult(message.content, toolUse.id, `${feedback}\n\n${remainingSubmissions()}`, true);
+          continue;
+        }
+
+        // --- Duplicate-plan guard (Change 3) -----------------------------------
+        // A behaviorally identical plan never reaches the expensive path
+        // (workspace reset + app restart + replay) and never consumes a
+        // submission. Seeded from memory (same-commit only), extended with
+        // this run's replayed-but-not-reproduced submissions.
+        const priorPlanFailure = failedPlanHashes.get(planHash);
+
+        if (priorPlanFailure) {
+          counters.submissions -= 1; // Duplicates never consume the budget.
+          counters.duplicatePlanRejections += 1;
+
+          const rejection = `REJECTED without replay: this plan's steps and assertion are behaviorally identical to ${priorPlanFailure}. Submit a materially different plan (different steps or assertion) or call submit_not_reproducible.`;
+          await recordToolCall("submit_plan", submitted, rejection);
+          transcript.push({
+            type: "duplicate_plan_rejected",
+            turn: counters.turns,
+            planHash,
+            rejections: counters.duplicatePlanRejections,
+          });
+          log(
+            `duplicate plan rejected (${counters.duplicatePlanRejections}): hash ${planHash}`,
+          );
+
+          if (counters.duplicatePlanRejections >= 3) {
+            return await finish(
+              "failed",
+              "The model resubmitted a behaviorally identical plan three times despite rejection feedback.",
+              null,
+              null,
+            );
+          }
+
+          pushResult(message.content, toolUse.id, rejection, true);
           continue;
         }
 
@@ -897,9 +1086,21 @@ export async function runReproducerAgent(
           path.relative(input.investigationDir, replayStore.dir),
         );
 
+        // Shared bounded evidence summary of this replay (Change 1/4).
+        const replaySummary = summarizeReproductionEvidence(replayResult);
+        const failedReplay = replayResult.outcome !== "reproduced";
+        // Live-vs-replay divergence (Change 4b): only meaningful for a replay
+        // that actually ran and did not reproduce.
+        const divergence =
+          failedReplay && replayResult.outcome !== "environment_failed"
+            ? computeReproducerDivergence(findings, frozen, replayResult)
+            : null;
+
         submissions.push({
           index: counters.submissions,
           valid: true,
+          planHash,
+          replaySignature: replaySummary.signature,
           explorationModeAtSubmission,
           planMode,
           replayOutcome: replayResult.outcome,
@@ -909,6 +1110,7 @@ export async function runReproducerAgent(
           type: "plan_submission",
           turn: counters.turns,
           valid: true,
+          planHash,
           explorationModeAtSubmission,
           planMode,
           replayOutcome: replayResult.outcome,
@@ -916,7 +1118,12 @@ export async function runReproducerAgent(
         });
         log(`submission ${counters.submissions}: replay ${replayResult.outcome} — ${firstLine(replayResult.outcomeReason)}`);
 
-        const feedback = formatReplayFeedback(replayResult);
+        const feedback = formatReplayFeedback(
+          replayResult,
+          failedReplay ? previousFailedReplaySummary : null,
+          failedReplay ? replaySummary : null,
+          divergence,
+        );
         await recordToolCall("submit_plan", submitted, feedback);
 
         if (replayResult.outcome === "reproduced") {
@@ -928,6 +1135,8 @@ export async function runReproducerAgent(
           );
         }
 
+        lastFailedReplaySummary = replaySummary;
+
         if (replayResult.outcome === "environment_failed") {
           return await finish(
             "environment_failed",
@@ -936,6 +1145,15 @@ export async function runReproducerAgent(
             promotedReplayResult,
           );
         }
+
+        lastDivergence = divergence;
+        previousFailedReplaySummary = replaySummary;
+        // Register the failed plan so an identical resubmission is rejected
+        // without another reset/restart/replay (Change 3).
+        failedPlanHashes.set(
+          planHash,
+          `submission ${counters.submissions}, which replayed with outcome ${replayResult.outcome} (${truncateUtf8Bytes(replayResult.outcomeReason, 300)})`,
+        );
 
         lastReplay = { plan: frozen, result: promotedReplayResult };
 
@@ -1045,6 +1263,10 @@ export async function runReproducerAgent(
                       : "";
 
               if (record.outcome === "failed") {
+                if (record.ambiguous) {
+                  counters.ambiguousStepFailures += 1;
+                }
+
                 recordFinding(
                   "tool_failure",
                   `${toolUse.name} ${targetLabel} failed${record.ambiguous ? " (ambiguous target)" : ""}: ${record.error ?? "unknown error"}`,
@@ -1158,6 +1380,43 @@ export async function runReproducerAgent(
   }
 }
 
+// Deterministic failure classification (Change 1). Precedence: first match
+// wins. Derived only from counters, submissions, findings, and replays —
+// never from model output.
+function classifyReproducerFailure(args: {
+  status: ReproducerAgentStatus;
+  submissions: PlanSubmissionRecord[];
+  findings: ReproducerFinding[];
+  duplicatePlanRejections: number;
+  ambiguousStepFailures: number;
+}): ReproducerFailureCode {
+  if (args.status === "environment_failed") {
+    return "reproducer_environment";
+  }
+
+  if (args.duplicatePlanRejections >= 3) {
+    return "reproducer_repeated_plan";
+  }
+
+  if (args.submissions.length === 0) {
+    return "reproducer_no_submission";
+  }
+
+  if (args.submissions.every((submission) => !submission.valid)) {
+    return "reproducer_all_submissions_invalid";
+  }
+
+  if (args.ambiguousStepFailures >= 3) {
+    return "reproducer_ambiguity_loop";
+  }
+
+  if (failureObservedLive(args.findings)) {
+    return "reproducer_replay_diverged";
+  }
+
+  return "reproducer_no_failure_signal";
+}
+
 // Factual metadata only: explains the exploration-vs-proof split so a human
 // reading artifacts can immediately tell what evidence drove the fixer.
 function buildEvidenceExplanation(
@@ -1259,24 +1518,53 @@ function formatStepResult(
   return lines.join("\n");
 }
 
-function formatReplayFeedback(result: ReproductionResult): string {
+// Replay feedback (Change 4): outcome + reason first, then the
+// submission-vs-previous-submission signature delta and the live-vs-replay
+// divergence (both BEFORE the per-step listing so they survive the overall
+// truncation), then the detailed listing.
+function formatReplayFeedback(
+  result: ReproductionResult,
+  previousSummary: ReproductionEvidenceSummary | null,
+  currentSummary: ReproductionEvidenceSummary | null,
+  divergence: ReproducerDivergence | null,
+): string {
   const stepLines = result.steps.map(
     (step) =>
       `  ${step.id} [${step.outcome}]${step.error ? ` ${firstLine(step.error)}` : ""}`,
   );
 
-  return truncateText(
-    [
-      `OFFICIAL REPLAY (pristine workspace, fresh app): ${result.outcome}`,
-      `Reason: ${result.outcomeReason}`,
-      `Steps:\n${stepLines.join("\n")}`,
-      `Assertion: ${result.assertion ? `matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected} — ${result.assertion.detail}` : "(not evaluated)"}`,
-      `Console errors: ${result.consoleErrors.join(" | ") || "(none)"}`,
-      `Page errors: ${result.pageErrors.join(" | ") || "(none)"}`,
-      `API responses: ${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status} ${response.body.slice(0, 200)}`).join(" | ") || "(none)"}`,
-    ].join("\n"),
-    8_000,
+  const sections = [
+    `OFFICIAL REPLAY (pristine workspace, fresh app): ${result.outcome}`,
+    `Reason: ${result.outcomeReason}`,
+  ];
+
+  if (previousSummary && currentSummary) {
+    const changed = previousSummary.signature !== currentSummary.signature;
+    sections.push(
+      [
+        "DELTA vs your previous submission:",
+        `Before signature: ${previousSummary.signature}`,
+        `After signature:  ${currentSummary.signature}`,
+        `Signature changed: ${changed ? "yes" : "no"}`,
+        "- Identical signature: your plan changes did not alter what the replay observed. Do not iterate on the same approach.",
+        "- Changed signature: the plan change altered observable behavior; use the new evidence.",
+      ].join("\n"),
+    );
+  }
+
+  if (divergence && hasDivergence(divergence)) {
+    sections.push(formatReproducerDivergence(divergence));
+  }
+
+  sections.push(
+    `Steps:\n${stepLines.join("\n")}`,
+    `Assertion: ${result.assertion ? `matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected} — ${result.assertion.detail}` : "(not evaluated)"}`,
+    `Console errors: ${result.consoleErrors.join(" | ") || "(none)"}`,
+    `Page errors: ${result.pageErrors.join(" | ") || "(none)"}`,
+    `API responses: ${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status} ${response.body.slice(0, 200)}`).join(" | ") || "(none)"}`,
   );
+
+  return truncateText(sections.join("\n"), 8_000);
 }
 
 // --- Prompt --------------------------------------------------------------------------------
@@ -1293,6 +1581,7 @@ Rules:
 - Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.
 - Submissions are limited; explore until you have SEEN the failure before submitting.
+- PAST INVESTIGATIONS may list REPRODUCTION PLANS ALREADY TRIED. A plan whose steps and assertion behaviorally match a listed plan hash will be REJECTED automatically without replay — submit a materially different plan (different steps or assertion), and treat the recorded replay signature as evidence of what that plan actually did.
 - Respond with exactly one tool call per turn.`;
 
 // Deliberately lean initial context (cost): the reproducer explores the LIVE

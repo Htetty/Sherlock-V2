@@ -417,6 +417,77 @@ describe("failed-attempt memory", () => {
     expect(matches.map((item) => item.outcome)).toEqual(["failed", "verified"]);
   });
 
+  test("failedPlans render with hash, commit, and signature; entries without them are unchanged", async () => {
+    const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-repo-"));
+    const withPlans: MemoryEntry = {
+      ...entry(1),
+      outcome: "failed",
+      failedPlans: [
+        {
+          planHash: "abcd1234efgh5678",
+          commitSha: "a1b2c3d4e5f6a7b8",
+          replaySignature: "not_reproduced | assertion Expected behavior observed.",
+          failureReason: "x".repeat(1_000),
+        },
+        {
+          planHash: "second-hash",
+          commitSha: "a1b2c3d4e5f6a7b8",
+          replaySignature: null,
+          failureReason: "invalid submission",
+        },
+        {
+          planHash: "third-hash-dropped",
+          commitSha: "a1b2c3d4e5f6a7b8",
+          replaySignature: null,
+          failureReason: "over the cap",
+        },
+      ],
+    };
+
+    const rendered = await renderPastInvestigations([withPlans], repoPath);
+    const warnings = rendered.match(/REPRODUCTION PLANS ALREADY TRIED/g) ?? [];
+    expect(warnings).toHaveLength(2);
+    expect(rendered).toContain("plan hash: abcd1234efgh5678 (commit a1b2c3d4)");
+    expect(rendered).toContain("replay signature: not_reproduced | assertion Expected behavior observed.");
+    expect(rendered).toContain("replay signature: (never replayed: invalid)");
+    expect(rendered).not.toContain("third-hash-dropped");
+    // Reason byte-bounded.
+    expect(rendered).not.toContain("x".repeat(600));
+
+    const plain = await renderPastInvestigations([entry(2)], repoPath);
+    expect(plain).not.toContain("REPRODUCTION PLANS ALREADY TRIED");
+  });
+
+  test("a newer failed reproduction attaches failedPlans without displacing a verified fix", () => {
+    const verified: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "Archive crashes",
+      outcome: "verified",
+      fixDiff: "+fixed",
+      fileHashes: { "server.js": "vh" },
+    };
+    const laterFailedRepro: MemoryEntry = {
+      ...entry(2),
+      issueTitle: "Archive crashes",
+      outcome: "failed",
+      fileHashes: {},
+      failedPlans: [
+        {
+          planHash: "plan-hash-9",
+          commitSha: "commit-9",
+          replaySignature: "execution_failed | step step-1",
+          failureReason: "replay failed",
+        },
+      ],
+    };
+
+    const merged = mergeEntriesByTitle([verified, laterFailedRepro]).get("Archive crashes");
+    expect(merged?.outcome).toBe("verified");
+    expect(merged?.fixDiff).toBe("+fixed");
+    expect(merged?.fileHashes).toEqual({ "server.js": "vh" });
+    expect(merged?.failedPlans?.[0]?.planHash).toBe("plan-hash-9");
+  });
+
   test("no verified entry means the newest entry wins unchanged", () => {
     const older: MemoryEntry = { ...entry(1), issueTitle: "X", outcome: "failed" };
     const newer: MemoryEntry = {

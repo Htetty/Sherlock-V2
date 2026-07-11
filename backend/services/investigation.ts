@@ -25,6 +25,7 @@ import {
 import {
   getBudgetProfileName,
   runReproducerAgent,
+  type ReproducerAgentResult,
   type ReproducerFinding,
 } from "../agents/reproducer.js";
 import { createCostShapeTracker } from "./cost-shape.js";
@@ -47,8 +48,11 @@ import {
   writeMemorySelectionArtifacts,
   MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
   MAX_FAILED_DIFF_BYTES,
+  MAX_FAILED_PLAN_REASON_BYTES,
+  MAX_FAILED_PLANS_PER_MEMORY_ENTRY,
   MAX_FAILED_REASON_BYTES,
   type FailedMemoryAttempt,
+  type FailedMemoryPlan,
   type MemoryOutcome,
 } from "./memory.js";
 import { truncateUtf8Bytes } from "./reproduction-evidence.js";
@@ -429,6 +433,78 @@ export async function runInvestigationPipeline(
     // one-shot paths never fabricate findings.
     let reproducerFindings: ReproducerFinding[] = [];
 
+    // Cross-run duplicate-plan guard seed (REPRODUCER_LOOP_UPGRADE_PROMPT.md,
+    // Change 3): plan hashes that failed to reproduce in previous
+    // investigations of this issue. Commit scoping is enforced by the agent.
+    const knownFailedPlans = pastEntries
+      .flatMap((entry) => entry.failedPlans ?? [])
+      .filter(
+        (failedPlan) =>
+          typeof failedPlan?.planHash === "string" &&
+          failedPlan.planHash &&
+          typeof failedPlan?.commitSha === "string",
+      )
+      .map((failedPlan) => ({
+        planHash: failedPlan.planHash,
+        commitSha: failedPlan.commitSha,
+        failureReason: failedPlan.failureReason ?? "(no reason recorded)",
+      }));
+
+    // Failed-reproduction memory (Change 2): recorded BEFORE the terminal
+    // early returns so reruns see which plans already failed. Deterministic —
+    // no model reflection call. A memory failure never changes the outcome.
+    const recordFailedReproductionMemory = async (
+      reproResult: ReproducerAgentResult,
+    ): Promise<void> => {
+      try {
+        const evidence = reproResult.failureEvidence;
+        const failedPlans: FailedMemoryPlan[] = reproResult.submissions
+          .filter((submission) => submission.valid)
+          .slice(-MAX_FAILED_PLANS_PER_MEMORY_ENTRY)
+          .map((submission) => ({
+            planHash: submission.planHash,
+            commitSha: repoContext!.commit,
+            replaySignature: submission.replaySignature ?? null,
+            failureReason: truncateUtf8Bytes(
+              submission.replayReason ?? "(no replay reason recorded)",
+              MAX_FAILED_PLAN_REASON_BYTES,
+            ),
+          }));
+
+        const whatFailed = truncateUtf8Bytes(
+          `Reproduction failed (${evidence?.code ?? "unclassified"}): ${failedPlans.length} plan(s) replayed without reproducing.${
+            evidence?.failureObservedLive
+              ? " Live exploration DID observe the failure."
+              : ""
+          }${
+            evidence?.lastReplayEvidence
+              ? ` Last replay: ${evidence.lastReplayEvidence.signature}`
+              : ""
+          }`,
+          MAX_FAILED_PLAN_REASON_BYTES,
+        );
+
+        await appendMemory(payload.repoUrl, {
+          issueTitle: payload.issueTitle,
+          issueTerms: issueTerms.slice(0, 8),
+          commitSha: repoContext!.commit,
+          outcome: "failed",
+          rootCause: "",
+          patchedFiles: [],
+          fileHashes: {},
+          whatWorked: "",
+          whatFailed,
+          createdAt: new Date().toISOString(),
+          ...(failedPlans.length > 0 ? { failedPlans } : {}),
+        });
+        log(
+          `Failed-reproduction memory recorded (${failedPlans.length} failed plan(s), code: ${evidence?.code ?? "unclassified"}).`,
+        );
+      } catch (error) {
+        log(`Could not record failed-reproduction memory: ${formatError(error)}`);
+      }
+    };
+
     // Runs the reproducer agent fallback. Returns a finished pipeline result
     // on a terminal failure, or null when a plan/result was accepted (stored
     // into the outer plan/result variables).
@@ -452,16 +528,24 @@ export async function runInvestigationPipeline(
           graphContext,
           initialSourceFiles: contextSourceFiles,
           pastInvestigations,
+          // Cross-run duplicate-plan guard seed (Change 3): plan hashes that
+          // failed to reproduce in previous investigations. The guard itself
+          // is commit-scoped inside the agent. Omitted when empty.
+          ...(knownFailedPlans.length > 0 ? { knownFailedPlans } : {}),
           restart,
         });
 
         await costShape.update({
           reproducerTurns: reproResult.turns,
+          reproducerFailureCode: reproResult.failureCode,
           compactionEvents:
             costShape.shape.compactionEvents + reproResult.compactionEvents,
         });
 
         log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
+        if (reproResult.failureCode) {
+          log(`Reproducer failure code: ${reproResult.failureCode}`);
+        }
         for (const submission of reproResult.submissions) {
           log(
             `  submission ${submission.index}: ${submission.valid ? (submission.replayOutcome ?? "valid") : `invalid - ${(submission.validationErrors ?? []).join(" | ")}`}`,
@@ -469,6 +553,7 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "plan_failed" || reproResult.status === "exhausted") {
+          await recordFailedReproductionMemory(reproResult);
           return await finish({
             investigationId,
             outcome: "plan_failed",
@@ -477,6 +562,8 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "environment_failed") {
+          // No memory: an environment problem says nothing about the issue
+          // or the plans.
           return await finish({
             investigationId,
             outcome: "environment_failed",
@@ -486,6 +573,7 @@ export async function runInvestigationPipeline(
         }
 
         if (reproResult.status === "failed" || !reproResult.plan || !reproResult.result) {
+          await recordFailedReproductionMemory(reproResult);
           return await finish({
             investigationId,
             outcome: "execution_failed",

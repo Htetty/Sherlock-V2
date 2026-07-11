@@ -21,6 +21,9 @@ export const MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY = 2;
 export const MAX_FAILED_DIFF_BYTES = 4 * 1024;
 export const MAX_FAILED_REASON_BYTES = 500;
 export const MAX_RENDERED_PAST_INVESTIGATIONS_BYTES = 32 * 1024;
+// Failed-plan memory limits (REPRODUCER_LOOP_UPGRADE_PROMPT.md, Change 2).
+export const MAX_FAILED_PLANS_PER_MEMORY_ENTRY = 2;
+export const MAX_FAILED_PLAN_REASON_BYTES = 500;
 const memoryWriteLocks = new Map<string, Promise<void>>();
 
 export type MemoryOutcome =
@@ -53,6 +56,22 @@ export type MemoryEntry = {
   // Bounded record of patches that were tried and failed verification, so a
   // future run does not repeat them. Optional and backward compatible.
   failedAttempts?: FailedMemoryAttempt[];
+  // Bounded record of reproduction plans that were replayed and did NOT
+  // reproduce the issue, so a future reproducer run does not repeat them.
+  // Optional and backward compatible.
+  failedPlans?: FailedMemoryPlan[];
+};
+
+export type FailedMemoryPlan = {
+  // Canonical behavior hash (hashPlanBehavior: steps + assertion).
+  planHash: string;
+  // Commit the plan failed against. The duplicate-plan guard only blocks on
+  // the SAME commit; on other commits this is informational only.
+  commitSha: string;
+  // Origin-free replay evidence signature; null when the plan never reached
+  // replay (invalid submission).
+  replaySignature: string | null;
+  failureReason: string;
 };
 
 export type FailedMemoryAttempt = {
@@ -318,18 +337,27 @@ export function mergeEntriesByTitle(entries: MemoryEntry[]): Map<string, MemoryE
       continue;
     }
 
-    // Newest failed attempts from entries AFTER the verified one, newest
-    // first, bounded.
-    const laterFailedAttempts = group
-      .slice(group.indexOf(newestVerified) + 1)
-      .reverse()
+    // Newest failed attempts/plans from entries AFTER the verified one,
+    // newest first, bounded. Never displaces the verified entry itself or its
+    // fixDiff/patchedFiles/fileHashes.
+    const laterEntries = group.slice(group.indexOf(newestVerified) + 1).reverse();
+    const laterFailedAttempts = laterEntries
       .flatMap((entry) => entry.failedAttempts ?? [])
       .slice(0, MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY);
+    const laterFailedPlans = laterEntries
+      .flatMap((entry) => entry.failedPlans ?? [])
+      .slice(0, MAX_FAILED_PLANS_PER_MEMORY_ENTRY);
 
     merged.set(
       title,
-      laterFailedAttempts.length > 0
-        ? { ...newestVerified, failedAttempts: laterFailedAttempts }
+      laterFailedAttempts.length > 0 || laterFailedPlans.length > 0
+        ? {
+            ...newestVerified,
+            ...(laterFailedAttempts.length > 0
+              ? { failedAttempts: laterFailedAttempts }
+              : {}),
+            ...(laterFailedPlans.length > 0 ? { failedPlans: laterFailedPlans } : {}),
+          }
         : newestVerified,
     );
   }
@@ -458,6 +486,23 @@ function renderEntry(
             redactSecrets(truncateUtf8Bytes(attempt.diff, MAX_FAILED_DIFF_BYTES)),
             "      ",
           ),
+    );
+  }
+
+  // Failed reproduction plans (REPRODUCER_LOOP_UPGRADE_PROMPT.md, Change 2).
+  // No diff bodies — these blocks sit in the always-preserved tier alongside
+  // headers and signatures.
+  const failedPlans = (entry.failedPlans ?? []).slice(
+    0,
+    MAX_FAILED_PLANS_PER_MEMORY_ENTRY,
+  );
+
+  for (const plan of failedPlans) {
+    lines.push(
+      "  REPRODUCTION PLANS ALREADY TRIED (did not reproduce; historical evidence):",
+      `    plan hash: ${plan.planHash} (commit ${plan.commitSha.slice(0, 8)})`,
+      `    replay signature: ${redactSecrets(plan.replaySignature ?? "(never replayed: invalid)")}`,
+      `    why it failed: ${truncateUtf8Bytes(redactSecrets(plan.failureReason), MAX_FAILED_PLAN_REASON_BYTES)}`,
     );
   }
 

@@ -2,6 +2,8 @@
 // This module must stay free of Claude/Anthropic imports so saved plans can be
 // replayed without any Claude dependency.
 
+import { createHash } from "node:crypto";
+
 export const REPRODUCTION_PLAN_VERSION = 1;
 
 export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -90,6 +92,17 @@ export type ReproductionPlan = {
 export type PlanValidationResult =
   | { ok: true; plan: ReproductionPlan }
   | { ok: false; errors: string[] };
+
+// Canonical hash of a plan's BEHAVIOR (steps + assertion, excluding baseUrl,
+// which changes per sandbox). The single plan-identity implementation: used
+// by the replay-proof check in fix.ts, the reproducer's duplicate-plan guard,
+// and failed-plan memory.
+export function hashPlanBehavior(plan: ReproductionPlan): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ steps: plan.steps, assertion: plan.assertion }))
+    .digest("hex")
+    .slice(0, 16);
+}
 
 const MAX_STEPS = 30;
 const MAX_WAIT_MS = 10_000;

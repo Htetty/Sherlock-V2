@@ -7,7 +7,6 @@
 // restart behavior is injected so the loop is independent of the sandbox.
 
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
 import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -26,7 +25,7 @@ import {
   type FixProposal,
 } from "./fix-proposal.js";
 import { parseGitStatusPorcelainZ } from "./git-status.js";
-import type { ReproductionPlan } from "./plan.js";
+import { hashPlanBehavior, type ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
 import {
   summarizeReproductionEvidence,
@@ -860,13 +859,9 @@ async function prepareVerificationRuntime(
 }
 
 // Hash of the plan's behavior (steps + assertion, excluding baseUrl) proving
-// the replay used the saved reproduction unchanged.
-export function hashPlanBehavior(plan: ReproductionPlan) {
-  return createHash("sha256")
-    .update(JSON.stringify({ steps: plan.steps, assertion: plan.assertion }))
-    .digest("hex")
-    .slice(0, 16);
-}
+// the replay used the saved reproduction unchanged. Hoisted to plan.ts as the
+// single implementation; re-exported here for existing callers.
+export { hashPlanBehavior };
 
 async function getHeadCommit(repoPath: string): Promise<string | null> {
   try {

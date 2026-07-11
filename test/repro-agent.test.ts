@@ -15,11 +15,14 @@ import {
   MAX_REPRODUCER_FINDINGS,
   REPRODUCER_BUDGETS,
   detectApiIssueSignal,
+  failureObservedLive,
   runReproducerAgent,
   selectReproducerFindings,
   type ReproducerAgentInput,
+  type ReproducerFailureEvidence,
   type ReproducerFinding,
 } from "../backend/agents/reproducer.js";
+import { hashPlanBehavior, type ReproductionPlan as PlanForHash } from "../backend/services/plan.js";
 import { getPlanMode, type ReproductionPlan } from "../backend/services/plan.js";
 import type { CreateModelMessage } from "../backend/agents/fixer.js";
 import type { GraphContext } from "../backend/services/graphContext.js";
@@ -801,5 +804,417 @@ describe("structured reproducer findings", () => {
     expect(selected.filter((finding) => finding.kind === "element")).toHaveLength(10);
     // Chronological order is preserved.
     expect(selected[selected.length - 1].observation).toBe("runtime_error 19");
+  });
+});
+
+// --- REPRODUCER_LOOP_UPGRADE_PROMPT.md tests -----------------------------------
+
+const VALID_SUBMISSION_HASH = hashPlanBehavior({
+  version: 1,
+  baseUrl: "http://unused",
+  steps: VALID_SUBMISSION.steps,
+  expectedBehavior: VALID_SUBMISSION.expectedBehavior,
+  failureCondition: VALID_SUBMISSION.failureCondition,
+  assertion: VALID_SUBMISSION.assertion,
+} as unknown as PlanForHash);
+
+// Same steps, different wait -> different behavior hash.
+const VALID_SUBMISSION_VARIANT = {
+  ...VALID_SUBMISSION,
+  steps: [
+    VALID_SUBMISSION.steps[0],
+    { id: "step-2", action: "wait", ms: 3000 },
+    VALID_SUBMISSION.steps[2],
+  ],
+};
+
+// Session stub whose request steps record a live 500 API response, so the
+// exploration produces a real failure signal (response finding with 5xx).
+function evidenceSessionFactory() {
+  let opened = 0;
+
+  const openLiveSession = async (baseUrl: string): Promise<LiveSession> => {
+    opened += 1;
+    const evidence = emptyEvidence();
+
+    return {
+      page: {} as LiveSession["page"],
+      baseUrl,
+      evidence,
+      executeStep: async (step) => {
+        if (step.action === "request") {
+          evidence.apiResponses.push({
+            method: (step as { method?: string }).method ?? "GET",
+            url: `${baseUrl}${(step as { path?: string }).path ?? "/"}`,
+            status: 500,
+            statusText: "Internal Server Error",
+            body: "boom",
+          });
+        }
+
+        return {
+          id: step.id,
+          action: step.action,
+          startedAt: null,
+          finishedAt: null,
+          outcome: "passed",
+          error: null,
+          ambiguous: false,
+          screenshot: null,
+        };
+      },
+      readPageDigest: async () => "URL: /\nTitle: Tasks",
+      captureScreenshot: async (name) => `screenshots/${name}.png`,
+      close: async () => {},
+    };
+  };
+
+  return { openLiveSession, openedCount: () => opened };
+}
+
+async function readFailureEvidenceArtifact(
+  investigationDir: string,
+): Promise<ReproducerFailureEvidence> {
+  return JSON.parse(
+    await readFile(path.join(investigationDir, "repro-agent", "failure-evidence.json"), "utf8"),
+  ) as ReproducerFailureEvidence;
+}
+
+describe("reproducer failure taxonomy and evidence", () => {
+  test("reproduced runs carry no failure code or evidence, same model-call count", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([stepRecord("goto", "passed")]);
+    const model = scriptedModel([
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => replayResult("reproduced", "Failure observed."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(result.failureCode).toBeNull();
+    expect(result.failureEvidence).toBeNull();
+    // Happy path: exactly one model call per scripted tool use.
+    expect(model.calls).toHaveLength(3);
+  });
+
+  test("declared not reproducible before any submission -> reproducer_no_submission", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_not_reproducible", { reason: "cannot find the feature" }),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        throw new Error("replay must not run");
+      },
+    });
+
+    expect(result.status).toBe("plan_failed");
+    expect(result.failureCode).toBe("reproducer_no_submission");
+    expect(result.failureEvidence?.submissions).toEqual([]);
+    expect(result.failureEvidence?.failureObservedLive).toBe(false);
+
+    const artifact = await readFailureEvidenceArtifact(input.investigationDir);
+    expect(artifact).toEqual(result.failureEvidence);
+  });
+
+  test("all submissions invalid -> reproducer_all_submissions_invalid with reasons", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", INVALID_SUBMISSION),
+      toolUseMessage("submit_plan", INVALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        throw new Error("replay must not run");
+      },
+    });
+
+    expect(result.status).toBe("exhausted");
+    expect(result.failureCode).toBe("reproducer_all_submissions_invalid");
+    expect(result.failureEvidence?.submissions).toHaveLength(2);
+    expect(result.failureEvidence?.submissions[0].valid).toBe(false);
+    expect(result.failureEvidence?.submissions[0].invalidReasons?.length).toBeGreaterThan(0);
+    expect(result.failureEvidence?.submissions[0].replaySignature).toBeNull();
+    expect(result.failureEvidence?.submissions[0].planHash).toBeTruthy();
+  });
+
+  test("clean-replay exhaustion downgrades to not_reproduced with NO failure code", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("not_reproduced", "Expected behavior observed."),
+    });
+
+    expect(result.status).toBe("not_reproduced");
+    expect(result.failureCode).toBeNull();
+    expect(result.failureEvidence).toBeNull();
+  });
+
+  test("live 500 + failing replays -> reproducer_replay_diverged with failureObservedLive", async () => {
+    const { input } = await makeInput();
+    const sessions = evidenceSessionFactory();
+    const model = scriptedModel([
+      toolUseMessage("request", { method: "POST", path: "/api/tasks/archive" }),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("execution_failed", "Step step-1 failed."),
+    });
+
+    expect(result.status).toBe("exhausted");
+    expect(result.failureCode).toBe("reproducer_replay_diverged");
+    expect(result.failureEvidence?.failureObservedLive).toBe(true);
+    expect(failureObservedLive(result.findings)).toBe(true);
+    expect(result.failureEvidence?.lastReplayEvidence?.outcome).toBe("execution_failed");
+  });
+
+  test("no failure signal anywhere -> reproducer_no_failure_signal", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("execution_failed", "Step step-1 failed."),
+    });
+
+    expect(result.status).toBe("exhausted");
+    expect(result.failureCode).toBe("reproducer_no_failure_signal");
+  });
+});
+
+describe("duplicate-plan guard", () => {
+  test("identical resubmission never replays, keeps budget, third ends reproducer_repeated_plan", async () => {
+    const { input, restartCalls } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+    ]);
+
+    let replays = 0;
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        replays += 1;
+        return replayResult("not_reproduced", "Expected behavior observed.");
+      },
+    });
+
+    expect(replays).toBe(1);
+    expect(restartCalls()).toBe(1); // No restart for duplicates.
+    expect(result.status).toBe("failed");
+    expect(result.failureCode).toBe("reproducer_repeated_plan");
+
+    // Rejection text reached the model with the prior outcome.
+    const rejection = lastToolResultText(model.calls[2]);
+    expect(rejection).toContain("REJECTED without replay");
+    expect(rejection).toContain("submission 1");
+
+    const summary = JSON.parse(
+      await readFile(path.join(input.investigationDir, "repro-agent", "summary.json"), "utf8"),
+    ) as { counters: { duplicatePlanRejections: number; submissions: number } };
+    expect(summary.counters.duplicatePlanRejections).toBe(3);
+    // Duplicates never consumed the submission budget.
+    expect(summary.counters.submissions).toBe(1);
+  });
+
+  test("baseUrl differences still count as duplicates; changed steps reach replay", async () => {
+    // Behavior hash ignores baseUrl by construction (see divergence test
+    // file); here: a materially different plan reaches a second replay.
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
+    ]);
+
+    let replays = 0;
+    await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        replays += 1;
+        return replayResult("not_reproduced", "Expected behavior observed.");
+      },
+    });
+
+    expect(replays).toBe(2);
+  });
+
+  test("invalid submissions are never deduplicated", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", INVALID_SUBMISSION),
+      toolUseMessage("submit_plan", INVALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        throw new Error("replay must not run");
+      },
+    });
+
+    // Both consumed the budget as validation failures, no duplicate rejection.
+    expect(result.failureCode).toBe("reproducer_all_submissions_invalid");
+    const summary = JSON.parse(
+      await readFile(path.join(input.investigationDir, "repro-agent", "summary.json"), "utf8"),
+    ) as { counters: { duplicatePlanRejections: number } };
+    expect(summary.counters.duplicatePlanRejections).toBe(0);
+  });
+
+  test("memory-seeded hash with matching commit rejects the FIRST submission", async () => {
+    const { input } = await makeInput();
+    input.knownFailedPlans = [
+      {
+        planHash: VALID_SUBMISSION_HASH,
+        commitSha: input.sourceCommit,
+        failureReason: "replayed clean in a previous run",
+      },
+    ];
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_not_reproducible", { reason: "no different plan available" }),
+    ]);
+
+    let replays = 0;
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        replays += 1;
+        return replayResult("reproduced", "unexpected");
+      },
+    });
+
+    expect(replays).toBe(0);
+    expect(result.status).toBe("plan_failed");
+
+    const rejection = lastToolResultText(model.calls[1]);
+    expect(rejection).toContain("REJECTED without replay");
+    expect(rejection).toContain("previous investigation");
+    expect(rejection).toContain("replayed clean in a previous run");
+  });
+
+  test("memory-seeded hash with a DIFFERENT commit does not block", async () => {
+    const { input } = await makeInput();
+    input.knownFailedPlans = [
+      {
+        planHash: VALID_SUBMISSION_HASH,
+        commitSha: "a-different-commit",
+        failureReason: "older failure",
+      },
+    ];
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([toolUseMessage("submit_plan", VALID_SUBMISSION)]);
+
+    let replays = 0;
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        replays += 1;
+        return replayResult("reproduced", "Failure observed.");
+      },
+    });
+
+    expect(replays).toBe(1);
+    expect(result.status).toBe("reproduced");
+  });
+});
+
+describe("replay feedback deltas and divergence", () => {
+  test("second failed submission includes the signature delta; first does not", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([]);
+    const model = scriptedModel([
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
+    ]);
+
+    await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("execution_failed", "Step step-1 failed."),
+    });
+
+    // Feedback for submission 1 (delivered to model call 2) has no delta.
+    const firstFeedback = lastToolResultText(model.calls[1]);
+    expect(firstFeedback).toContain("OFFICIAL REPLAY");
+    expect(firstFeedback).not.toContain("DELTA vs your previous submission");
+
+    // Submission 2 exhausted the budget, so its feedback exists in artifacts.
+    const toolCall = JSON.parse(
+      await readFile(
+        path.join(input.investigationDir, "repro-agent", "tool-calls", "002-submit_plan.json"),
+        "utf8",
+      ),
+    ) as { result: string };
+    expect(toolCall.result).toContain("DELTA vs your previous submission");
+    expect(toolCall.result).toContain("Before signature:");
+    expect(toolCall.result).toContain("After signature:");
+    expect(toolCall.result).toMatch(/Signature changed: (yes|no)/);
+  });
+
+  test("divergence renders when a live 500 is absent from a clean replay", async () => {
+    const { input } = await makeInput();
+    const sessions = evidenceSessionFactory();
+    const model = scriptedModel([
+      toolUseMessage("request", { method: "POST", path: "/api/uncovered" }),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_not_reproducible", { reason: "cannot freeze" }),
+    ]);
+
+    await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("not_reproduced", "Expected behavior observed."),
+    });
+
+    const feedback = lastToolResultText(model.calls[2]);
+    expect(feedback).toContain("DIVERGENCE (live exploration vs this replay):");
+    expect(feedback).toContain("POST /api/uncovered -> 500");
+    expect(feedback).toContain("Likely cause:");
   });
 });

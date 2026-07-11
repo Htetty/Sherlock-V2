@@ -20,6 +20,7 @@ export type CostShape = {
   analyzeIssueCalled: boolean;
   memoryReflectionCalled: boolean;
   reproducerTurns: number;
+  reproducerFailureCode: string | null;
   fixerTurns: number;
   fixerPatchAttempts: number;
   fixerFailureCode: string | null;
@@ -48,6 +49,7 @@ export function createCostShapeTracker(
     analyzeIssueCalled: false,
     memoryReflectionCalled: false,
     reproducerTurns: 0,
+    reproducerFailureCode: null,
     fixerTurns: 0,
     fixerPatchAttempts: 0,
     fixerFailureCode: null,
