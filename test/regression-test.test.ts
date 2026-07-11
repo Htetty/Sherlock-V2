@@ -14,6 +14,7 @@ import {
   classifyPrePatchRun,
   extractRegressionFailureMarker,
   formatRegressionCommentLines,
+  getRegressionTimeoutMs,
   hashTestContents,
   materializeTest,
   runRegressionTest,
@@ -151,6 +152,31 @@ describe("regression generation prompt", () => {
     expect(prompt).toContain("exactly ONE assertion");
     expect(prompt).toContain("Capture IDs from the resources the test itself creates");
     expect(prompt).toContain("Test ONLY the reproduced behavioral assertion");
+    expect(prompt).toContain("ACTUAL behavioral completion condition");
+    expect(prompt).toContain("must not stop merely because a response exists");
+    expect(prompt).toContain("5_000 ms total polling");
+    expect(prompt).toContain("intervals no longer than 250 ms");
+    expect(prompt).toContain("exact bytes can run unchanged before and after the patch");
+    expect(prompt).toContain("process.env.SHERLOCK_TARGET_URL");
+  });
+});
+
+describe("regression execution timeout", () => {
+  test("defaults to 30 seconds", () => {
+    expect(getRegressionTimeoutMs({})).toBe(30_000);
+  });
+
+  test("preserves a valid positive environment override without clamping it", () => {
+    expect(getRegressionTimeoutMs({ SHERLOCK_REGRESSION_TIMEOUT_MS: "180000" })).toBe(
+      180_000,
+    );
+  });
+
+  test("ignores invalid and non-positive overrides", () => {
+    expect(getRegressionTimeoutMs({ SHERLOCK_REGRESSION_TIMEOUT_MS: "invalid" })).toBe(
+      30_000,
+    );
+    expect(getRegressionTimeoutMs({ SHERLOCK_REGRESSION_TIMEOUT_MS: "0" })).toBe(30_000);
   });
 });
 

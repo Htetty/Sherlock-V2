@@ -225,7 +225,7 @@ function attemptResult(
     checks: [
       {
         name: "failure_no_longer_observed",
-        passed: outcome === "verified",
+        status: outcome === "verified" ? "passed" : "failed",
         detail: reason,
       },
     ],
@@ -757,6 +757,34 @@ describe("rich retry feedback (evidence delta)", () => {
 
     const feedback = lastToolResultText(model.calls[1]);
     expect(feedback).toContain("Post-patch replay not reached");
+  });
+
+  test("advisory checks are not presented to the fixer as failed checks", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        const attempt = attemptResult(
+          "rejected_reproduction_still_fails",
+          "The exact replay still fails.",
+        );
+        attempt.checks.push({
+          name: "regression_test",
+          status: "advisory",
+          detail: "Generated regression evidence was blocked but is not a failed check.",
+        });
+        return attempt;
+      },
+    });
+
+    const feedback = lastToolResultText(model.calls[1]);
+    expect(feedback).toContain("failure_no_longer_observed");
+    expect(feedback).not.toContain("Generated regression evidence was blocked");
   });
 
   test("signature lines survive the feedback byte cap", async () => {

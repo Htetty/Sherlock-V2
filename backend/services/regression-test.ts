@@ -81,7 +81,7 @@ const MAX_NAME_CHARS = 80;
 const TEST_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.mjs$/;
 const TEST_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{2,79}$/;
 
-const DEFAULT_REGRESSION_TIMEOUT_MS = 120_000;
+const DEFAULT_REGRESSION_TIMEOUT_MS = 30_000;
 
 export function getRegressionTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const configured = Number(env.SHERLOCK_REGRESSION_TIMEOUT_MS);
@@ -451,11 +451,36 @@ Test rules:
 - Setup steps (creating fixtures, calling endpoints) must use plain assertions WITHOUT that marker, so a setup failure is never mistaken for the behavioral failure.
 - Capture IDs from the resources the test itself creates (parse the response bodies) instead of assuming fixed IDs, unless the verified reproduction plan itself proves fixed IDs.
 - Test ONLY the reproduced behavioral assertion; no broad suites, no unrelated checks.
+- Write one deterministic test whose exact bytes can run unchanged before and after the patch; do not branch on source version, patch state, or run phase.
 - The relativePath must be a single new file at the repository root ending in ".mjs".
 - If the check requires calling the running application, use fetch against \`process.env.SHERLOCK_TARGET_URL\` (the sandbox app). No other network access.
 - Reading repository source files relatively is allowed when asserting on behavior is impossible.
 - NEVER use child_process, eval, new Function, worker threads, vm, or dump process.env.
-- Keep it under 100 lines, fully deterministic (no timing races: poll with a bounded retry loop if the app does asynchronous work).
+- Keep it under 100 lines and fully deterministic.
+- If an action starts asynchronous work, poll for the ACTUAL behavioral completion condition or a verified terminal job state. A poll must not stop merely because a response exists, returns JSON, has a property, has a numeric count, or has a successful HTTP status; those are readiness checks, not proof that the behavior under test completed.
+- Stop polling as soon as the expected post-patch behavior is observed. Use a monotonic deadline or bounded attempts with at most 5_000 ms total polling and intervals no longer than 250 ms, unless the verified reproduction proves a longer interval is necessary.
+- Never use an unbounded loop or a fixed multi-second sleep when the behavioral condition can be polled. If the condition remains wrong through the deadline or a verified terminal failure state is reached, make exactly ONE final behavioral assertion carrying the required failure marker.
+- The pre-patch run must fail only after the bounded wait confirms the behavior remains wrong. The post-patch run must pass as soon as the correct behavior appears.
+
+Illustrative polling shape (adapt the behavioral predicate using only trusted routes and identifiers; do not copy or invent endpoints):
+  async function pollUntil(predicate, timeoutMs = 5_000, intervalMs = 200) {
+    const deadline = Date.now() + timeoutMs;
+    let lastValue;
+    while (Date.now() < deadline) {
+      lastValue = await readCurrentState();
+      if (predicate(lastValue)) return { matched: true, lastValue };
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    lastValue = await readCurrentState();
+    return { matched: predicate(lastValue), lastValue };
+  }
+  const result = await pollUntil(
+    (body) => !JSON.stringify(body).includes(taskTitle),
+  );
+  assert.ok(
+    result.matched,
+    "${REGRESSION_FAILURE_MARKER_PREFIX} archived task remained visible",
+  );
 
 Bug context:
 Issue: ${input.issueTitle}

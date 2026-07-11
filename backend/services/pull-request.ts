@@ -20,7 +20,10 @@ const SHERLOCK_AUTHOR_EMAIL = "sherlock[bot]@users.noreply.github.com";
 const MAX_SLUG_CHARS = 24;
 const MAX_BODY_CHARS = 20_000;
 
-// Verification checks that must all have passed before a PR may be opened.
+// Blocking verification checks that must all have passed before a PR may be
+// opened. Generated regression evidence is evaluated separately because it is
+// advisory when the authoritative exact replay passes but generation is
+// unavailable or the generated test remains blocked.
 const REQUIRED_CHECKS = [
   "original_reproduced",
   "patch_valid",
@@ -29,10 +32,6 @@ const REQUIRED_CHECKS = [
   "exact_plan_replayed",
   "failure_no_longer_observed",
   "repository_validation",
-  // Passed when the generated test proved fail-before/pass-after OR when
-  // generation was truthfully unavailable; failed regression contracts
-  // never reach the PR stage (the fix outcome is already rejected).
-  "regression_test",
 ];
 
 const SECRET_FILE_PATTERN = /(^\.env|\.pem$|\.key$)/i;
@@ -311,12 +310,44 @@ async function checkPreconditions(input: PullRequestInput): Promise<string | nul
   }
 
   const passed = new Set(
-    input.fixAttempt.checks.filter((check) => check.passed).map((check) => check.name),
+    input.fixAttempt.checks
+      .filter((check) => check.status === "passed")
+      .map((check) => check.name),
   );
   const missing = REQUIRED_CHECKS.filter((name) => !passed.has(name));
 
   if (missing.length > 0) {
     return `Verification checks missing or failed: ${missing.join(", ")}.`;
+  }
+
+  const regression = input.fixAttempt.regressionTest;
+  const regressionCheck = input.fixAttempt.checks.find(
+    (check) => check.name === "regression_test",
+  );
+
+  if (!regression || !regressionCheck) {
+    return "Regression verification metadata is missing.";
+  }
+
+  if (regression.prePatch === "unexpectedly_passed") {
+    return "The generated regression test unexpectedly passed before the patch and cannot support a verified fix.";
+  }
+
+  if (regression.status === "proven") {
+    if (regressionCheck.status !== "passed") {
+      return "Proven regression evidence is not recorded as a passed verification check.";
+    }
+  } else {
+    if (regressionCheck.status !== "advisory") {
+      return `${regression.status} regression evidence is not recorded as advisory.`;
+    }
+
+    if (
+      regression.status === "blocked" &&
+      input.fixAttempt.postPatchOutcome !== "not_reproduced"
+    ) {
+      return "Blocked regression evidence may only be advisory after a healthy exact post-patch replay.";
+    }
   }
 
   if (input.fixAttempt.changedFiles.length === 0) {
@@ -429,7 +460,10 @@ export async function buildPullRequestBody(input: PullRequestInput): Promise<str
     .join("\n");
 
   const verificationChecks = attempt.checks
-    .map((check) => `- ${check.passed ? "PASS" : "FAIL"} ${check.name}: ${check.detail}`)
+    .map(
+      (check) =>
+        `- ${check.status === "passed" ? "PASS" : check.status === "failed" ? "FAIL" : "ADVISORY"} ${check.name}: ${check.detail}`,
+    )
     .join("\n");
 
   const testLines =

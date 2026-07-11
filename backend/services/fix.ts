@@ -89,9 +89,11 @@ export type TestRunRecord = {
   stderrFile: string;
 };
 
+export type VerificationCheckStatus = "passed" | "failed" | "advisory";
+
 export type VerificationCheck = {
   name: string;
-  passed: boolean;
+  status: VerificationCheckStatus;
   detail: string;
 };
 
@@ -180,8 +182,12 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
   };
 
   const check = (name: string, passed: boolean, detail: string) => {
-    result.checks.push({ name, passed, detail });
+    result.checks.push({ name, status: passed ? "passed" : "failed", detail });
     return passed;
+  };
+
+  const advisory = (name: string, detail: string) => {
+    result.checks.push({ name, status: "advisory", detail });
   };
 
   const finish = async (outcome: FixOutcome, reason: string) => {
@@ -746,9 +752,8 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
           : `The regression test did not pass on the patched source (${postClassification}).`;
 
       await persistRegressionArtifact();
-      check(
+      advisory(
         "regression_test",
-        true,
         `Generated regression test "${provenRegressionTest.testName}" was blocked after the exact replay passed: ${regressionSummary.reason}. Verification relies on the exact reproduction replay${validation.aggregate === "passed" ? " and repository validation" : ""}.`,
       );
     } else {
@@ -763,18 +768,30 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     // Neutral, truthful: no generated test exists, so nothing may claim one
     // passed. Exact replay (and repository validation when available)
     // carries verification.
-    check(
+    advisory(
       "regression_test",
-      true,
       `No generated regression test was available: ${regressionSummary.reason ?? "generation is unsupported for this repository"}. Verification relies on the exact reproduction replay${validation.aggregate === "passed" ? " and repository validation" : ""}.`,
     );
   }
 
+  const regressionAdvisory = regressionSummary.status !== "proven";
+  const validationUnavailable = validation.aggregate === "not_available";
+
   return finish(
     "verified",
-    validation.aggregate === "not_available"
-      ? "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay."
-      : "The patch was applied, the application restarted, the exact saved reproduction no longer fails, and all available repository validation commands passed.",
+    regressionAdvisory
+      ? `The exact saved reproduction passed after the patch. ${
+          regressionSummary.status === "blocked"
+            ? "The generated regression test remained blocked and was retained as advisory evidence"
+            : "No usable generated regression test was available, so regression evidence is advisory"
+        }. ${
+          validationUnavailable
+            ? "Repository validation was unavailable."
+            : "All available repository validation commands passed."
+        }`
+      : validationUnavailable
+        ? "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay and the proven generated regression test."
+        : "The patch was applied, the application restarted, the exact saved reproduction no longer fails, all available repository validation commands passed, and the generated regression test passed.",
   );
 }
 

@@ -73,7 +73,7 @@ async function createVerifiedAttempt(root: string, commit: string, overrides: Pa
     "failure_no_longer_observed",
     "repository_validation",
     "regression_test",
-  ].map((name) => ({ name, passed: true, detail: `${name} ok` }));
+  ].map((name) => ({ name, status: "passed" as const, detail: `${name} ok` }));
 
   const fixAttempt: FixAttemptResult = {
     investigationId,
@@ -98,6 +98,22 @@ async function createVerifiedAttempt(root: string, commit: string, overrides: Pa
         stderrFile: "test-1-stderr.log",
       },
     ],
+    repositoryValidation: {
+      aggregate: "passed",
+      categories: [{ category: "test", status: "passed" }],
+    },
+    regressionTest: {
+      status: "proven",
+      testName: "login-does-not-return-500",
+      relativePath: "sherlock-regression.test.mjs",
+      runner: "node",
+      sha256: "a".repeat(64),
+      prePatch: "failed_as_expected",
+      postPatch: "passed",
+      hashMatched: true,
+      generationAttempts: 1,
+      reason: null,
+    },
     startedAt: new Date().toISOString(),
     finishedAt: new Date().toISOString(),
     ...overrides,
@@ -222,6 +238,103 @@ describe("verified fix -> pull request", () => {
     // Nothing was committed or pushed anywhere.
     expect((await git(workspace.repoPath, ["rev-parse", "HEAD"])).trim()).toBe(workspace.commit);
     expect(await git(workspace.repoPath, ["ls-remote", "--heads", workspace.originPath])).toBe("");
+  });
+
+  test("a blocked generated regression remains advisory after a healthy replay and permits the PR", async () => {
+    const { github, input } = await buildInput();
+    input.fixAttempt = {
+      ...input.fixAttempt,
+      reason:
+        "The exact saved reproduction passed after the patch. The generated regression test remained blocked and was retained as advisory evidence.",
+      checks: input.fixAttempt.checks.map((check) =>
+        check.name === "regression_test"
+          ? {
+              ...check,
+              status: "advisory" as const,
+              detail:
+                "Generated regression test was blocked after the exact replay passed.",
+            }
+          : check,
+      ),
+      regressionTest: {
+        ...input.fixAttempt.regressionTest!,
+        status: "blocked",
+        postPatch: "failed",
+        reason: "The regression test did not pass on the patched source (failed).",
+      },
+    };
+
+    const body = await buildPullRequestBody(input);
+    expect(body).toContain("ADVISORY regression_test");
+    expect(body).not.toContain("PASS regression_test");
+
+    const result = await createFixPullRequest(input);
+    expect(result.status).toBe("created");
+    expect(github.calls.create).toHaveLength(1);
+  });
+
+  test("unavailable generated regression evidence remains advisory and permits a replay-verified PR", async () => {
+    const { github, input } = await buildInput();
+    input.fixAttempt = {
+      ...input.fixAttempt,
+      checks: input.fixAttempt.checks.map((check) =>
+        check.name === "regression_test"
+          ? {
+              ...check,
+              status: "advisory" as const,
+              detail: "No usable generated regression test was available.",
+            }
+          : check,
+      ),
+      regressionTest: {
+        status: "unavailable",
+        testName: null,
+        relativePath: null,
+        runner: null,
+        sha256: null,
+        prePatch: null,
+        postPatch: null,
+        hashMatched: null,
+        generationAttempts: 0,
+        reason: "No regression-test generator was available.",
+      },
+    };
+
+    const result = await createFixPullRequest(input);
+    expect(result.status).toBe("created");
+    expect(github.calls.create).toHaveLength(1);
+  });
+
+  test("missing regression metadata prevents PR creation", async () => {
+    const { workspace, github, input } = await buildInput();
+    input.fixAttempt = { ...input.fixAttempt, regressionTest: null };
+
+    const result = await createFixPullRequest(input);
+
+    expect(result.status).toBe("precondition_failed");
+    expect(result.reason).toContain("Regression verification metadata is missing");
+    expect(github.calls.create).toHaveLength(0);
+    expect((await git(workspace.repoPath, ["rev-parse", "HEAD"])).trim()).toBe(
+      workspace.commit,
+    );
+  });
+
+  test("a failed blocking check prevents PR creation regardless of regression proof", async () => {
+    const { github, input } = await buildInput();
+    input.fixAttempt = {
+      ...input.fixAttempt,
+      checks: input.fixAttempt.checks.map((check) =>
+        check.name === "repository_validation"
+          ? { ...check, status: "failed" as const, detail: "Tests failed." }
+          : check,
+      ),
+    };
+
+    const result = await createFixPullRequest(input);
+
+    expect(result.status).toBe("precondition_failed");
+    expect(result.reason).toContain("repository_validation");
+    expect(github.calls.create).toHaveLength(0);
   });
 
   test("duplicate execution reuses the existing pull request", async () => {

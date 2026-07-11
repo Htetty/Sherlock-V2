@@ -867,6 +867,9 @@ assert.ok(!source.includes("res.writeHead(500"), "REGRESSION_EXPECTED_FAILURE: l
         generationAttempts: 1,
       });
       expect(attempt.regressionTest?.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(
+        attempt.checks.find((check) => check.name === "regression_test")?.status,
+      ).toBe("passed");
 
       // Both runs happened in their own regression containers.
       const regressionContainers = docker.containerNames.filter((name) =>
@@ -1014,7 +1017,7 @@ assert.ok(source.includes("http"), "REGRESSION_EXPECTED_FAILURE: trivially true 
       expect(attempt2.regressionTest?.status).toBe("unavailable");
       expect(attempt2.regressionTest?.prePatch).toBe("invalid_test");
       const regressionCheck = attempt2.checks.find((c) => c.name === "regression_test");
-      expect(regressionCheck?.passed).toBe(true);
+      expect(regressionCheck?.status).toBe("advisory");
       expect(regressionCheck?.detail).toContain("No generated regression test was available");
     },
   );
@@ -1107,8 +1110,9 @@ assert.ok(source.includes("unicorn"), "REGRESSION_EXPECTED_FAILURE: fails before
       expect(attempt.regressionTest?.postPatch).toBe("failed");
       expect(attempt.regressionTest?.hashMatched).toBe(true);
       const regressionCheck = attempt.checks.find((c) => c.name === "regression_test");
-      expect(regressionCheck?.passed).toBe(true);
+      expect(regressionCheck?.status).toBe("advisory");
       expect(regressionCheck?.detail).toContain("was blocked after the exact replay passed");
+      expect(attempt.reason).toContain("retained as advisory evidence");
 
       // The generated test never remains in the workspace, even when blocked.
       await expect(

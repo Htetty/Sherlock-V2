@@ -870,9 +870,6 @@ export async function runInvestigationPipeline(
 
         if (fixAttempt) {
           log(`Fix attempt ${fixAttempt.fixAttemptId} finished: ${fixAttempt.outcome}`);
-          for (const item of fixAttempt.checks) {
-            log(`  [${item.passed ? "pass" : "FAIL"}] ${item.name}: ${firstLine(item.detail)}`);
-          }
           if (fixAttempt.reason) {
             log(`  reason: ${fixAttempt.reason}`);
           }
@@ -880,10 +877,17 @@ export async function runInvestigationPipeline(
             log(`  changed files: ${fixAttempt.changedFiles.join(", ")}`);
           }
           if (fixAttempt.postPatchOutcome) {
-            log(`  post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
+            log(`Post-patch replay outcome: ${fixAttempt.postPatchOutcome}`);
           }
           if (fixAttempt.regressionTest) {
             const regression = fixAttempt.regressionTest;
+            const regressionCheck = fixAttempt.checks.find(
+              (item) => item.name === "regression_test",
+            );
+
+            if (regressionCheck) {
+              log(`Regression evidence: ${regressionCheck.status}`);
+            }
 
             if (regression.testName) {
               log(`Regression test generated: ${regression.testName}`);
@@ -900,6 +904,23 @@ export async function runInvestigationPipeline(
             if (regression.status === "unavailable") {
               log(`Regression test unavailable: ${regression.reason ?? "(no reason recorded)"}`);
             }
+
+            if (fixAttempt.outcome === "verified") {
+              log(
+                regression.status === "blocked"
+                  ? "Verification decision: accepted from the exact saved replay; generated regression evidence was blocked"
+                  : regression.status === "unavailable"
+                    ? "Verification decision: accepted from the exact saved replay; generated regression evidence was unavailable"
+                    : "Verification decision: accepted from the exact saved replay and proven generated regression test",
+              );
+            } else {
+              log(`Verification decision: rejected (${fixAttempt.outcome})`);
+            }
+          }
+          for (const item of fixAttempt.checks) {
+            log(
+              `  [${item.status === "passed" ? "pass" : item.status === "failed" ? "FAIL" : "advisory"}] ${item.name}: ${firstLine(item.detail)}`,
+            );
           }
           for (const run of fixAttempt.testRuns) {
             log(`  test: ${run.command} -> exit ${run.exitCode} (${run.durationMs}ms)`);
@@ -1056,7 +1077,7 @@ export async function runInvestigationPipeline(
       const failedChecks =
         fixAttempt && fixAttempt.outcome !== "verified"
           ? fixAttempt.checks
-              .filter((item) => !item.passed)
+              .filter((item) => item.status === "failed")
               .map((item) => `${item.name}: ${item.detail}`)
           : [];
 
@@ -1222,7 +1243,7 @@ export async function runInvestigationPipeline(
           changedFiles: fixAttempt.changedFiles,
           reason: fixAttempt.outcome === "verified" ? null : fixAttempt.reason,
           verification: fixAttempt.checks
-            .filter((item) => item.passed)
+            .filter((item) => item.status === "passed")
             .map((item) => item.detail),
           repositoryValidation: fixAttempt.repositoryValidation
             ? fixAttempt.repositoryValidation.categories.map((item) =>

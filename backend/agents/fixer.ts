@@ -1511,7 +1511,7 @@ function formatAttemptFeedback(
     : "EVIDENCE DELTA\nPost-patch replay not reached (the patch was rejected before replay).";
 
   const failedChecks = attempt.checks
-    .filter((item) => !item.passed)
+    .filter((item) => item.status === "failed")
     .map((item) => `  ${item.name}: ${item.detail}`);
 
   const tail = [
