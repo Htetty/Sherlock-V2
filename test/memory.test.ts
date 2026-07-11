@@ -11,6 +11,7 @@ import {
   mergeEntriesByTitle,
   renderPastInvestigations,
   repoKey,
+  writeMemorySelectionArtifacts,
   MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
   MAX_FIX_DIFF_CHARS,
   MAX_RENDERED_PAST_INVESTIGATIONS_BYTES,
@@ -118,6 +119,101 @@ describe("renderPastInvestigations fix diffs", () => {
   });
 });
 
+describe("memory selection artifacts", () => {
+  test("writes the chosen worked and failed memories into a dedicated folder", async () => {
+    const investigationDir = await mkdtemp(path.join(tmpdir(), "sherlock-investigation-"));
+    const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-repo-"));
+    const worked: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "Archive cache fix",
+      issueTerms: ["archive", "cache"],
+      outcome: "verified",
+      whatWorked: "Invalidating the all cache fixed the replay.",
+    };
+    const failed: MemoryEntry = {
+      ...entry(2),
+      issueTitle: "Archive UI-only attempt",
+      issueTerms: ["archive"],
+      outcome: "failed",
+      whatWorked: "",
+      whatFailed: "Changing only the UI left the API stale.",
+    };
+    const rendered = await renderPastInvestigations([worked, failed], repoPath);
+
+    await writeMemorySelectionArtifacts({
+      investigationDir,
+      queryTerms: ["archive", "cache"],
+      storedEntryCount: 8,
+      selectedEntries: [worked, failed],
+      renderedMemory: rendered,
+    });
+
+    const manifest = JSON.parse(
+      await readFile(path.join(investigationDir, "memory", "selection.json"), "utf8"),
+    ) as {
+      selectedEntryCount: number;
+      selectionAppliedTo: string[];
+      selected: Array<{
+        memoryRole: string;
+        issueTitle: string;
+        outcome: string;
+        selectionReason: string;
+      }>;
+    };
+    const renderedArtifact = await readFile(
+      path.join(investigationDir, "memory", "rendered.txt"),
+      "utf8",
+    );
+
+    expect(manifest.selectedEntryCount).toBe(2);
+    expect(manifest.selectionAppliedTo).toEqual(["reproducer", "fixer"]);
+    expect(manifest.selected).toMatchObject([
+      {
+        memoryRole: "worked",
+        issueTitle: "Archive cache fix",
+        outcome: "verified",
+        selectionReason: "strongest_match",
+      },
+      {
+        memoryRole: "failed",
+        issueTitle: "Archive UI-only attempt",
+        outcome: "failed",
+        selectionReason: "failed_example",
+      },
+    ]);
+    expect(renderedArtifact).toContain("memory role: WORKED EXAMPLE");
+    expect(renderedArtifact).toContain("memory role: FAILED EXAMPLE");
+    expect(renderedArtifact.trim()).toBe(rendered);
+  });
+
+  test("redacts secrets from both selection artifacts", async () => {
+    const investigationDir = await mkdtemp(path.join(tmpdir(), "sherlock-investigation-"));
+    const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-repo-"));
+    const secretEntry: MemoryEntry = {
+      ...entry(1),
+      rootCause: "Authorization: Bearer sk-super-secret-token",
+      whatFailed: "Bearer sk-super-secret-token was logged",
+    };
+    const rendered = await renderPastInvestigations([secretEntry], repoPath);
+
+    await writeMemorySelectionArtifacts({
+      investigationDir,
+      queryTerms: ["secret"],
+      storedEntryCount: 1,
+      selectedEntries: [secretEntry],
+      renderedMemory: rendered,
+    });
+
+    const artifacts = `${await readFile(
+      path.join(investigationDir, "memory", "selection.json"),
+      "utf8",
+    )}\n${await readFile(path.join(investigationDir, "memory", "rendered.txt"), "utf8")}`;
+
+    expect(artifacts).toContain("[REDACTED]");
+    expect(artifacts).not.toContain("sk-super-secret-token");
+  });
+});
+
 describe("failed-attempt memory", () => {
   const failedAttempt = (n: number, diff: string | null = "diff --git a/x b/x"): FailedMemoryAttempt => ({
     approach: `Approach ${n}`,
@@ -132,6 +228,28 @@ describe("failed-attempt memory", () => {
     const rendered = await renderPastInvestigations([entry(1)], repoPath);
     expect(rendered).toContain('PAST: "Issue 1" -> verified');
     expect(rendered).not.toContain("ALREADY TRIED AND FAILED");
+  });
+
+  test("renders worked and failed lessons separately", async () => {
+    const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-repo-"));
+    const rendered = await renderPastInvestigations(
+      [
+        {
+          ...entry(1),
+          whatWorked: "Invalidating the all-tasks cache fixed the replay.",
+          whatFailed: "Invalidating only the completed cache left stale data.",
+        },
+      ],
+      repoPath,
+    );
+
+    expect(rendered).toContain("memory role: WORKED EXAMPLE");
+    expect(rendered).toContain(
+      "what worked: Invalidating the all-tasks cache fixed the replay.",
+    );
+    expect(rendered).toContain(
+      "what failed: Invalidating only the completed cache left stale data.",
+    );
   });
 
   test("renders at most two failed attempts with hash, signature, and reason", async () => {
@@ -231,10 +349,72 @@ describe("failed-attempt memory", () => {
     // Newer failed attempts are attached.
     expect(merged?.failedAttempts?.[0]?.proposalHash).toBe("hash-9");
 
-    // And matchMemory surfaces the merged entry.
+    // Balanced matching surfaces both investigations: the failure no longer
+    // hides the verified fix, and the verified fix no longer hides the
+    // failure example.
     const matches = matchMemory([verified, laterFailed], ["archive", "crashes"]);
-    expect(matches).toHaveLength(1);
-    expect(matches[0].outcome).toBe("verified");
+    expect(matches).toHaveLength(2);
+    expect(matches.map((item) => item.outcome)).toEqual(["failed", "verified"]);
+  });
+
+  test("reserves a failed example even when verified matches score higher", () => {
+    const strongestVerified: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "Archive task cache stale",
+      issueTerms: ["archive", "task", "cache", "stale"],
+      outcome: "verified",
+    };
+    const secondVerified: MemoryEntry = {
+      ...entry(2),
+      issueTitle: "Archive cache invalidation",
+      issueTerms: ["archive", "cache", "invalidation"],
+      outcome: "verified",
+    };
+    const failed: MemoryEntry = {
+      ...entry(3),
+      issueTitle: "Archive attempt failed",
+      issueTerms: ["archive"],
+      outcome: "failed",
+      whatWorked: "",
+      whatFailed: "Changing only the UI did not alter the API response.",
+      failedAttempts: [failedAttempt(7)],
+    };
+
+    const matches = matchMemory(
+      [strongestVerified, secondVerified, failed],
+      ["archive", "task", "cache", "stale"],
+    );
+
+    expect(matches).toHaveLength(3);
+    expect(matches[0]).toBe(strongestVerified);
+    expect(matches).toContain(failed);
+    expect(matches.some((item) => item.outcome === "verified")).toBe(true);
+    expect(matches.some((item) => item.outcome === "failed")).toBe(true);
+  });
+
+  test("reserves a verified example when the strongest match is a failure", () => {
+    const failed: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "Login request returns five hundred",
+      issueTerms: ["login", "request", "returns", "five", "hundred"],
+      outcome: "failed",
+      whatWorked: "",
+      whatFailed: "Changing the client error message did not fix the handler.",
+    };
+    const verified: MemoryEntry = {
+      ...entry(2),
+      issueTitle: "Login handler status",
+      issueTerms: ["login", "handler"],
+      outcome: "verified",
+      whatWorked: "Return 401 from the server handler.",
+    };
+
+    const matches = matchMemory(
+      [failed, verified],
+      ["login", "request", "returns", "five", "hundred"],
+    );
+
+    expect(matches.map((item) => item.outcome)).toEqual(["failed", "verified"]);
   });
 
   test("no verified entry means the newest entry wins unchanged", () => {

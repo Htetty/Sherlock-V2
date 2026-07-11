@@ -44,6 +44,7 @@ import {
   loadMemory,
   matchMemory,
   renderPastInvestigations,
+  writeMemorySelectionArtifacts,
   MAX_FAILED_ATTEMPTS_PER_MEMORY_ENTRY,
   MAX_FAILED_DIFF_BYTES,
   MAX_FAILED_REASON_BYTES,
@@ -322,6 +323,13 @@ export async function runInvestigationPipeline(
       pastEntries,
       repoContext.repoPath,
     );
+    await writeMemorySelectionArtifacts({
+      investigationDir: store.dir,
+      queryTerms: issueTerms,
+      storedEntryCount: memoryEntries.length,
+      selectedEntries: pastEntries,
+      renderedMemory: pastInvestigations,
+    });
 
     log(
       `Memory: ${memoryEntries.length} stored entr${memoryEntries.length === 1 ? "y" : "ies"} for this repo; using top ${pastEntries.length} match(es).`,

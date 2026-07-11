@@ -134,25 +134,159 @@ function getMaxMemoryEntries(): number {
     : DEFAULT_MAX_MEMORY_ENTRIES;
 }
 
-// Top matches by issue-term overlap. Zero-overlap entries are excluded -
-// an empty result means the PAST INVESTIGATIONS section is omitted entirely.
-// Stored terms and the stored issue title are re-tokenized before comparison
-// so multi-word terms (e.g. "active filter") still match single-word tokens.
+// Balanced matches by issue-term overlap. Zero-overlap entries are excluded.
+// When history contains both kinds, reserve space for the best verified
+// (worked) example and the best failed/blocked (negative) example instead of
+// letting three high-scoring successes or failures crowd out the other side.
+// The third slot remains the strongest remaining contextual match.
 export function matchMemory(
   entries: MemoryEntry[],
   issueTerms: string[],
 ): MemoryEntry[] {
-  const terms = new Set(issueTerms);
-
-  return [...mergeEntriesByTitle(entries).values()]
-    .map((entry) => ({
+  const terms = new Set(issueTerms.flatMap(splitTokens));
+  const candidates = entries
+    .map((entry, index) => ({
       entry,
+      index,
       score: overlapScore(entry, terms),
     }))
     .filter(({ score }) => score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_MATCHES)
-    .map(({ entry }) => entry);
+    .sort(
+      (a, b) =>
+        b.score - a.score ||
+        Date.parse(b.entry.createdAt) - Date.parse(a.entry.createdAt) ||
+        b.index - a.index,
+    );
+
+  if (candidates.length === 0) {
+    return [];
+  }
+
+  const selected: typeof candidates = [];
+  const selectedIndexes = new Set<number>();
+  const add = (candidate: (typeof candidates)[number] | undefined) => {
+    if (!candidate || selectedIndexes.has(candidate.index) || selected.length >= MAX_MATCHES) {
+      return;
+    }
+
+    selected.push(candidate);
+    selectedIndexes.add(candidate.index);
+  };
+
+  // Keep the strongest match first for replay/context relevance, then force
+  // positive/negative diversity when those examples exist.
+  add(candidates[0]);
+  add(candidates.find(({ entry }) => entry.outcome === "verified"));
+  add(
+    candidates.find(({ entry }) =>
+      entry.outcome === "failed" || entry.outcome === "blocked",
+    ) ??
+      candidates.find(
+        ({ entry }) =>
+          entry.outcome === "verified" && (entry.failedAttempts?.length ?? 0) > 0,
+      ),
+  );
+
+  const seenRoleForTitle = new Set(
+    selected.map(({ entry }) => `${entry.issueTitle.toLowerCase()}::${memoryRole(entry)}`),
+  );
+
+  for (const candidate of candidates) {
+    if (selected.length >= MAX_MATCHES) {
+      break;
+    }
+
+    const roleKey = `${candidate.entry.issueTitle.toLowerCase()}::${memoryRole(candidate.entry)}`;
+
+    if (seenRoleForTitle.has(roleKey)) {
+      continue;
+    }
+
+    add(candidate);
+    seenRoleForTitle.add(roleKey);
+  }
+
+  return selected.map(({ entry }) => entry);
+}
+
+export function memoryRole(entry: MemoryEntry): "worked" | "failed" | "context" {
+  if (entry.outcome === "verified") {
+    return "worked";
+  }
+
+  if (entry.outcome === "failed" || entry.outcome === "blocked") {
+    return "failed";
+  }
+
+  return "context";
+}
+
+export async function writeMemorySelectionArtifacts(input: {
+  investigationDir: string;
+  queryTerms: string[];
+  storedEntryCount: number;
+  selectedEntries: MemoryEntry[];
+  renderedMemory: string;
+}): Promise<void> {
+  const memoryDir = path.join(input.investigationDir, "memory");
+  await mkdir(memoryDir, { recursive: true });
+
+  const selected = input.selectedEntries.map((entry, index) => ({
+    order: index + 1,
+    selectionReason:
+      index === 0
+        ? "strongest_match"
+        : memoryRole(entry) === "worked"
+          ? "worked_example"
+          : memoryRole(entry) === "failed"
+            ? "failed_example"
+            : "additional_context",
+    memoryRole: memoryRole(entry),
+    issueTitle: redactSecrets(entry.issueTitle),
+    outcome: entry.outcome,
+    commitSha: entry.commitSha,
+    createdAt: entry.createdAt,
+    issueTerms: entry.issueTerms.map((term) => redactSecrets(term)),
+    rootCause: redactSecrets(entry.rootCause),
+    patchedFiles: entry.patchedFiles,
+    whatWorked: redactSecrets(entry.whatWorked),
+    whatFailed: redactSecrets(entry.whatFailed),
+    hasReproductionPlan: Boolean(entry.reproductionPlan),
+    hasVerifiedFixDiff: entry.outcome === "verified" && Boolean(entry.fixDiff),
+    failedAttempts: (entry.failedAttempts ?? []).map((attempt) => ({
+      approach: redactSecrets(attempt.approach),
+      proposalHash: attempt.proposalHash,
+      failureReason: redactSecrets(attempt.failureReason),
+      failureSignature: attempt.failureSignature
+        ? redactSecrets(attempt.failureSignature)
+        : null,
+      hasDiff: Boolean(attempt.diff),
+    })),
+  }));
+
+  await Promise.all([
+    writeFile(
+      path.join(memoryDir, "selection.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          queryTerms: input.queryTerms.map((term) => redactSecrets(term)),
+          storedEntryCount: input.storedEntryCount,
+          selectedEntryCount: selected.length,
+          selectionAppliedTo: ["reproducer", "fixer"],
+          selected,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    ),
+    writeFile(
+      path.join(memoryDir, "rendered.txt"),
+      input.renderedMemory ? `${redactSecrets(input.renderedMemory)}\n` : "(no memory selected)\n",
+      "utf8",
+    ),
+  ]);
 }
 
 // Repeated-title merge (Change 2): reruns of the same issue append
@@ -278,10 +412,12 @@ function renderEntry(
   mode: DiffRenderMode,
 ): string {
   const lines = [
-    `PAST: "${entry.issueTitle}" -> ${entry.outcome}`,
-    `  root cause: ${entry.rootCause || "(not recorded)"}`,
+    `PAST: "${redactSecrets(entry.issueTitle)}" -> ${entry.outcome}`,
+    `  memory role: ${memoryRole(entry) === "worked" ? "WORKED EXAMPLE" : memoryRole(entry) === "failed" ? "FAILED EXAMPLE" : "CONTEXT ONLY"}`,
+    `  root cause: ${redactSecrets(entry.rootCause) || "(not recorded)"}`,
     `  patched: ${entry.patchedFiles.join(", ") || "(none)"}`,
-    `  lesson: ${entry.whatWorked || entry.whatFailed || "(none recorded)"}`,
+    `  what worked: ${redactSecrets(entry.whatWorked) || "(none recorded)"}`,
+    `  what failed: ${redactSecrets(entry.whatFailed) || "(none recorded)"}`,
   ];
 
   if (staleFile) {
@@ -299,7 +435,7 @@ function renderEntry(
         : `  verified fix diff (patched files are UNCHANGED since this fix — reapply this exact change unless current evidence contradicts it):`,
       mode === "no_diffs"
         ? "    (diff omitted: aggregate memory cap reached)"
-        : indentBlock(boundFixDiff(entry.fixDiff), "    "),
+        : indentBlock(redactSecrets(boundFixDiff(entry.fixDiff)), "    "),
     );
   }
 
@@ -318,7 +454,10 @@ function renderEntry(
       "    diff:",
       mode !== "full" || !attempt.diff
         ? `      ${attempt.diff ? "(diff omitted: aggregate memory cap reached)" : "(diff unavailable; patch did not reach application)"}`
-        : indentBlock(truncateUtf8Bytes(attempt.diff, MAX_FAILED_DIFF_BYTES), "      "),
+        : indentBlock(
+            redactSecrets(truncateUtf8Bytes(attempt.diff, MAX_FAILED_DIFF_BYTES)),
+            "      ",
+          ),
     );
   }
 
