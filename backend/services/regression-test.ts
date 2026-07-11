@@ -11,6 +11,7 @@ import { lstat, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildTargetEnv,
+  getSandboxAddressing,
   getSandboxNetworkPolicy,
   runContainerCommand,
   type ContainerCommandResult,
@@ -343,11 +344,19 @@ export function classifyPostPatchRun(run: {
   return "execution_failed";
 }
 
-// The sandbox application URL as seen from inside a sibling container:
-// localhost would be the test container itself, so the Docker host gateway
-// name is substituted. The only network target a generated test may use.
+// The sandbox application URL as seen from inside a sibling container under
+// HOST addressing: localhost would be the test container itself, so the
+// Docker host gateway name is substituted. The only network target a
+// generated test may use. (Under network addressing the URL already names
+// the app container and is used unchanged — see runRegressionTest.)
 export function rewriteTargetUrlForContainer(baseUrl: string): string {
   return baseUrl.replace(/localhost|127\.0\.0\.1/, "host.docker.internal");
+}
+
+function sandboxNetworkFromEnv(): string | null {
+  const addressing = getSandboxAddressing();
+
+  return addressing.mode === "network" ? addressing.network : null;
 }
 
 // The running app container, identified so a strict-policy regression
@@ -366,10 +375,17 @@ export async function runRegressionTest(
     targetUrl?: string | null;
     appNetwork?: AppNetworkTarget | null;
     networkPolicy?: SandboxNetworkPolicy;
+    // Shared sandbox network of a containerized worker (see SandboxAddressing
+    // in container.ts); null = host addressing. Defaults from the environment.
+    sandboxNetwork?: string | null;
     timeoutMs?: number;
   },
 ): Promise<ContainerCommandResult> {
   const policy = options.networkPolicy ?? getSandboxNetworkPolicy();
+  const sandboxNetwork =
+    options.sandboxNetwork !== undefined
+      ? options.sandboxNetwork
+      : sandboxNetworkFromEnv();
 
   let network: ContainerNetwork | undefined;
   let addHostGateway = false;
@@ -385,6 +401,19 @@ export async function runRegressionTest(
     // host gateway, no internet of its own.
     network = { joinContainer: options.appNetwork.containerName };
     targetUrlForTest = `http://localhost:${options.appNetwork.internalPort}`;
+  } else if (sandboxNetwork) {
+    // Permissive (or fallback) under network addressing: the target URL's
+    // hostname is the app container's name on the shared sandbox network, so
+    // the test container attaches to that same network and uses the URL
+    // as-is — a host-gateway alias could never resolve a container name.
+    network = { attachNetwork: sandboxNetwork };
+    targetUrlForTest = options.targetUrl;
+
+    if (policy === "strict") {
+      console.warn(
+        "Regression test needs app access but no app container was identified; falling back to the shared sandbox network.",
+      );
+    }
   } else {
     // Permissive, or strict without an identified app container (e.g. tests
     // injecting a bespoke restart): previous behavior — default bridge with

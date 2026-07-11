@@ -15,7 +15,10 @@ import {
   runInvestigationPipeline,
   type InvestigationPipelineInput,
 } from "./services/investigation.js";
-import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
+import {
+  createInvestigationStateStoreFromEnv,
+  missingSupabaseStateStoreEnv,
+} from "./services/investigation-state-store.js";
 
 export function isSyncInvestigationEndpointEnabled(
   env: NodeJS.ProcessEnv = process.env,
@@ -27,14 +30,81 @@ export function isSyncInvestigationEndpointEnabled(
   return env.ALLOW_SYNC_INVESTIGATIONS === "true";
 }
 
+// A single readiness check. `ok` is a boolean only; `name` is a variable
+// NAME, never a value — this result is serialized to /readyz, so it must
+// never carry a secret or the contents of any environment variable.
+export type ApiReadinessCheck = { name: string; ok: boolean };
+
+export type ApiReadiness = { ready: boolean; checks: ApiReadinessCheck[] };
+
+// Config-level readiness for the API/webhook service: are the variables the
+// service needs to accept and enqueue investigations present? This is the
+// "safe" subset of readiness — it reports presence/absence by NAME and never
+// touches values, never dials a dependency, and never runs customer code.
+// Deep dependency readiness (Redis, Docker, Playwright, target image) is the
+// worker preflight's job (npm run worker:check); the API only needs to know
+// it is configured well enough to receive webhooks and put jobs on the queue.
+export function evaluateApiReadiness(
+  env: NodeJS.ProcessEnv = process.env,
+): ApiReadiness {
+  const checks: ApiReadinessCheck[] = [
+    // GitHub App identity: required to authenticate webhook installations.
+    { name: "APP_ID", ok: Boolean(env.APP_ID) },
+    // Either an inline key or a path to one is acceptable.
+    { name: "PRIVATE_KEY", ok: Boolean(env.PRIVATE_KEY || env.PRIVATE_KEY_PATH) },
+    // Webhook signature verification secret (probot). API-only: the worker
+    // never receives webhooks, so its preflight does not check this.
+    { name: "WEBHOOK_SECRET", ok: Boolean(env.WEBHOOK_SECRET) },
+    // Anthropic is required by the pipeline the enqueued job will run.
+    { name: "ANTHROPIC_API_KEY", ok: Boolean(env.ANTHROPIC_API_KEY) },
+  ];
+
+  // REDIS_URL: in production the queue is the only investigation path, and
+  // the localhost default is guaranteed wrong inside a container — silently
+  // falling back to it would report "ready" while every enqueue fails. In
+  // development the default (redis://localhost:6379) is fine, so the check
+  // only applies when NODE_ENV=production.
+  if (env.NODE_ENV === "production") {
+    checks.push({ name: "REDIS_URL", ok: Boolean(env.REDIS_URL) });
+  }
+
+  // Only enforce Supabase credentials when that state store is selected.
+  if (env.SHERLOCK_STATE_STORE === "supabase") {
+    checks.push({
+      name: "state-store:supabase",
+      ok: missingSupabaseStateStoreEnv(env).length === 0,
+    });
+  }
+
+  return { ready: checks.every((check) => check.ok), checks };
+}
+
 export function createApp(env: NodeJS.ProcessEnv = process.env) {
   const app = express();
 
   app.use(cors());
   app.use(express.json());
 
-  app.get("/health", (_req, res) => {
+  // Liveness: the process is up and the event loop is serving requests.
+  // Intentionally trivial and dependency-free so an orchestrator can tell a
+  // hung process from a merely-not-ready one. /health is kept as an alias for
+  // backward compatibility.
+  const liveness = (_req: express.Request, res: express.Response) => {
     res.json({ status: "ok" });
+  };
+  app.get("/healthz", liveness);
+  app.get("/health", liveness);
+
+  // Readiness: configured well enough to accept and enqueue investigations.
+  // Returns 503 until every required variable is present so a load balancer
+  // holds traffic off a misconfigured instance. The body lists variable NAMES
+  // and booleans only — never values — so it is safe to expose internally.
+  app.get("/readyz", (_req, res) => {
+    const readiness = evaluateApiReadiness(env);
+    res.status(readiness.ready ? 200 : 503).json({
+      status: readiness.ready ? "ready" : "not_ready",
+      checks: readiness.checks,
+    });
   });
 
   app.post("/investigations", async (req, res) => {

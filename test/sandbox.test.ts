@@ -280,6 +280,112 @@ describe("container-only sandbox", () => {
     expect(caught?.message).toContain("no fixed internal port could be detected");
   });
 
+  test("network addressing: the app joins the shared sandbox network and the base URL targets the container name, with no host port published", async () => {
+    const repoPath = await createFixtureRepo();
+    const { adapter, spawned } = createFakeDocker([""]);
+    const probedUrls: string[] = [];
+
+    const session = await runSandboxInvestigation({
+      repoPath,
+      docker: adapter,
+      // The containerized production worker: sibling containers are only
+      // reachable over the shared sandbox network, never via localhost.
+      containerized: true,
+      addressing: { mode: "network", network: "sherlock-sandbox" },
+      probe: async (url) => {
+        probedUrls.push(url);
+        return true;
+      },
+    });
+
+    // Install containers keep the default bridge (they need registries, not
+    // the worker), while the app container attaches to the sandbox network.
+    const install = spawned[0];
+    expect(install.join(" ")).not.toContain("--network");
+
+    const app = appContainers(spawned)[0];
+    expect(app).toContain("--network=sherlock-sandbox");
+
+    // Nothing is published on the Docker host.
+    expect(app).not.toContain("-p");
+
+    // The worker probes the app container by name over the shared network.
+    const containerName = app[app.indexOf("--name") + 1];
+    const hostPort = session.result.hostPort!;
+    expect(session.result.baseUrl).toBe(`http://${containerName}:${hostPort}`);
+    expect(probedUrls[0]).toBe(`http://${containerName}:${hostPort}`);
+    expect(app.join(" ")).toContain(`-e PORT=${hostPort}`);
+
+    // The restriction set is unchanged by the addressing mode.
+    for (const flag of ["--cap-drop=ALL", "--read-only", `--user=${CONTAINER_DEFAULTS.user}`]) {
+      expect(app).toContain(flag);
+    }
+
+    await session.stop();
+  });
+
+  test("network addressing: hardcoded-port apps are reached at the detected internal port on the container name", async () => {
+    const repoPath = await createFixtureRepo();
+    const { adapter, spawned, removed } = createFakeDocker([
+      "Taskboard running on http://localhost:3000",
+      "Taskboard running on http://localhost:3000",
+    ]);
+
+    let probeCount = 0;
+    const session = await runSandboxInvestigation({
+      repoPath,
+      startupTimeoutMs: 1_000,
+      docker: adapter,
+      containerized: true,
+      addressing: { mode: "network", network: "sherlock-sandbox" },
+      probe: async () => {
+        await new Promise((resolve) => setImmediate(resolve));
+        probeCount += 1;
+        return probeCount > 1;
+      },
+    });
+
+    const apps = appContainers(spawned);
+    expect(apps).toHaveLength(2);
+    expect(removed).toContain(apps[0][apps[0].indexOf("--name") + 1]);
+
+    // Second attempt: same sandbox network, PORT is the detected fixed port,
+    // and the base URL targets it directly on the new container's name.
+    const secondName = apps[1][apps[1].indexOf("--name") + 1];
+    expect(apps[1]).toContain("--network=sherlock-sandbox");
+    expect(apps[1]).not.toContain("-p");
+    expect(apps[1].join(" ")).toContain("PORT=3000");
+    expect(session.result.baseUrl).toBe(`http://${secondName}:3000`);
+    expect(session.result.strategy).toBe("container-fixed-port");
+
+    await session.stop();
+  });
+
+  test("a containerized worker without a sandbox network fails fast with the misconfiguration, not a probe timeout", async () => {
+    const repoPath = await createFixtureRepo();
+    const { adapter, spawned } = createFakeDocker([""]);
+
+    let caught: Error | null = null;
+
+    try {
+      await runSandboxInvestigation({
+        repoPath,
+        docker: adapter,
+        containerized: true,
+        addressing: { mode: "host" },
+        probe: async () => true,
+      });
+    } catch (error) {
+      caught = error as Error;
+    }
+
+    expect(caught).toBeInstanceOf(SandboxUnreachableError);
+    expect(caught?.message).toContain("SHERLOCK_SANDBOX_NETWORK");
+    expect(caught?.message).toContain("cannot reach sibling target-app containers");
+    // Nothing was executed against the misconfigured environment.
+    expect(spawned).toHaveLength(0);
+  });
+
   test("retries with a new runtime workspace when Docker reports a host-port bind conflict", async () => {
     const repoPath = await createFixtureRepo();
     const { adapter, spawned } = createFakeDocker([

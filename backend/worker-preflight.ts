@@ -10,12 +10,13 @@
 import "dotenv/config";
 import { execFile } from "node:child_process";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { redactSecrets } from "./services/report.js";
+import { getSandboxAddressing, isContainerizedWorker } from "./services/container.js";
 import { missingSupabaseStateStoreEnv } from "./services/investigation-state-store.js";
 
 const execFileAsync = promisify(execFile);
@@ -51,6 +52,11 @@ export type PreflightDeps = {
   launchChromium?: () => Promise<void>;
   checkWritableDir?: (dir: string) => Promise<void>;
   fileExists?: (filePath: string) => boolean;
+  // Identity of the current container (Docker sets the hostname to the short
+  // container id); injectable so attachment tests need no real container.
+  hostname?: () => string;
+  // Reads /proc/self/cgroup for the full container id; injectable likewise.
+  readTextFile?: (filePath: string) => string;
 };
 
 const defaultRunCommand = async (
@@ -107,6 +113,9 @@ export async function runWorkerPreflight(
   const launchChromium = deps.launchChromium ?? defaultLaunchChromium;
   const checkWritableDir = deps.checkWritableDir ?? defaultCheckWritableDir;
   const fileExists = deps.fileExists ?? existsSync;
+  const getHostname = deps.hostname ?? hostname;
+  const readTextFile =
+    deps.readTextFile ?? ((filePath: string) => readFileSync(filePath, "utf8"));
 
   const checks: CheckResult[] = [];
   const add = (name: string, status: CheckStatus, detail: string, mandatory = true) => {
@@ -225,6 +234,91 @@ export async function runWorkerPreflight(
     add("docker:target-image", "FAIL", "Skipped: Docker daemon is not reachable.");
   }
 
+  // --- Sandbox addressing ----------------------------------------------------
+  // A containerized worker can never reach sibling target containers through
+  // its own localhost: it must share a Docker network with them
+  // (SHERLOCK_SANDBOX_NETWORK; docker-compose.prod.yml configures this).
+  const addressing = getSandboxAddressing(env);
+  const containerized = isContainerizedWorker(env, fileExists);
+
+  if (addressing.mode === "network") {
+    if (!dockerDaemonReachable) {
+      add("sandbox:addressing", "FAIL", "Skipped: Docker daemon is not reachable.");
+    } else {
+      let containersJson: string | null = null;
+
+      try {
+        // One inspect proves the network exists AND yields its attached
+        // containers for the self-attachment check below.
+        const { stdout } = await runCommand("docker", [
+          "network",
+          "inspect",
+          addressing.network,
+          "--format",
+          "{{json .Containers}}",
+        ]);
+        containersJson = stdout;
+      } catch (error) {
+        add(
+          "sandbox:addressing",
+          "FAIL",
+          `SHERLOCK_SANDBOX_NETWORK="${addressing.network}" but that Docker network does not exist: ${message(error)}`,
+        );
+      }
+
+      if (containersJson !== null && !containerized) {
+        // Host-run worker with network addressing: there is no worker
+        // container to be attached, so existence is all we can verify.
+        add(
+          "sandbox:addressing",
+          "PASS",
+          `Shared sandbox network "${addressing.network}" exists.`,
+        );
+      } else if (containersJson !== null) {
+        // The network existing is not enough: an unattached worker resolves
+        // no target container names and every sandbox probe times out.
+        // Identity must be PROVEN by container id — a configured name (env
+        // var) is never proof, because any attached container's name could
+        // be claimed by an unattached worker. Sources, in order: the full id
+        // from /proc/self/cgroup, else the hostname when it is Docker's
+        // default (the short container id, >= 12 lowercase hex chars).
+        const selfId = resolveSelfContainerId(getHostname, readTextFile);
+
+        if (selfId === null) {
+          add(
+            "sandbox:addressing",
+            "FAIL",
+            `Could not determine this worker's container id (the hostname is not a Docker container id and /proc/self/cgroup yielded none), so attachment to "${addressing.network}" cannot be verified. Run the worker with Docker's default hostname (remove hostname:/--hostname overrides).`,
+          );
+        } else if (isAttachedToNetwork(containersJson, selfId)) {
+          add(
+            "sandbox:addressing",
+            "PASS",
+            `Shared sandbox network "${addressing.network}" exists and this worker container (id ${selfId.slice(0, 12)}…) is attached to it.`,
+          );
+        } else {
+          add(
+            "sandbox:addressing",
+            "FAIL",
+            `Shared sandbox network "${addressing.network}" exists but this worker container (id ${selfId.slice(0, 12)}…) is NOT attached to it, so target containers on that network are unreachable. Attach the worker (compose: list the network under the worker's networks:; docker run: add --network ${addressing.network}).`,
+          );
+        }
+      }
+    }
+  } else if (containerized) {
+    add(
+      "sandbox:addressing",
+      "FAIL",
+      "Worker runs inside a container but SHERLOCK_SANDBOX_NETWORK is not set; target apps published on the host loopback are unreachable from here. Set SHERLOCK_SANDBOX_NETWORK to the shared sandbox network (see docker-compose.prod.yml).",
+    );
+  } else {
+    add(
+      "sandbox:addressing",
+      "PASS",
+      "Host-run worker uses loopback port publishing (host addressing).",
+    );
+  }
+
   // --- Redis ---------------------------------------------------------------
   try {
     await pingRedis(redisUrl);
@@ -283,6 +377,70 @@ export async function runWorkerPreflight(
     checks,
     ok: checks.every((check) => !check.mandatory || check.status !== "FAIL"),
   };
+}
+
+// Docker container ids are 64 lowercase hex chars; the default container
+// hostname is the first 12. Anything shorter is not a safe prefix: it could
+// accidentally (or deliberately) match another container's id.
+const MIN_CONTAINER_ID_PREFIX = 12;
+const CONTAINER_ID_HOSTNAME = /^[0-9a-f]{12,64}$/;
+const CGROUP_CONTAINER_ID = /([0-9a-f]{64})/;
+
+// Proof of the current container's identity, by id only:
+// 1. /proc/self/cgroup contains the full 64-hex container id on Docker
+//    (e.g. .../docker/<id> or docker-<id>.scope) — works even under a
+//    custom hostname.
+// 2. Otherwise the hostname, only when it looks like a Docker container id
+//    (>= 12 lowercase hex chars — the Docker/Compose default).
+// Returns null when neither yields an id; callers must fail closed.
+function resolveSelfContainerId(
+  getHostname: () => string,
+  readTextFile: (filePath: string) => string,
+): string | null {
+  try {
+    const match = readTextFile("/proc/self/cgroup").match(CGROUP_CONTAINER_ID);
+
+    if (match) {
+      return match[1];
+    }
+  } catch {
+    // No cgroup file (macOS, non-Linux CI): fall through to the hostname.
+  }
+
+  const host = getHostname().trim();
+
+  return CONTAINER_ID_HOSTNAME.test(host) ? host : null;
+}
+
+// `docker network inspect --format {{json .Containers}}` output: FULL
+// container ids mapped to endpoint details. Attached means an id matches the
+// proven self id as a >= 12-char hex prefix (either may be the shorter one:
+// hostname-derived ids are 12 chars, cgroup-derived ids are 64). Endpoint
+// names are deliberately NOT matched — names are claimable via env/config
+// and would let an unattached worker pass. Unparseable output is NOT
+// attached: the check must never pass on evidence it could not read.
+function isAttachedToNetwork(containersJson: string, selfId: string): boolean {
+  if (selfId.length < MIN_CONTAINER_ID_PREFIX) {
+    return false;
+  }
+
+  let containers: unknown;
+
+  try {
+    containers = JSON.parse(containersJson.trim());
+  } catch {
+    return false;
+  }
+
+  if (!containers || typeof containers !== "object" || Array.isArray(containers)) {
+    return false;
+  }
+
+  return Object.keys(containers as Record<string, unknown>).some(
+    (containerId) =>
+      containerId.length >= MIN_CONTAINER_ID_PREFIX &&
+      (containerId.startsWith(selfId) || selfId.startsWith(containerId)),
+  );
 }
 
 export function formatPreflightReport(report: PreflightReport): string {
