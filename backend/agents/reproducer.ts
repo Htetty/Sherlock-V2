@@ -699,9 +699,7 @@ export async function runReproducerAgent(
     findingsCursor.network = evidence.networkFailures.length;
   };
 
-  const messages: Anthropic.Messages.MessageParam[] = [
-    { role: "user", content: buildInitialMessage(input) },
-  ];
+  const messages: Anthropic.Messages.MessageParam[] = [];
 
   const finish = async (
     status: ReproducerAgentStatus,
@@ -851,6 +849,40 @@ export async function runReproducerAgent(
   };
 
   try {
+    // The fallback may start after a one-shot plan partially mutated the app
+    // and repository. Exploration must begin from the same pristine source
+    // state that official replays use, never from abandoned setup residue.
+    const initialReset = await resetWorkspace(input.repoPath, input.sourceCommit);
+
+    if (!initialReset.ok) {
+      return await finish(
+        "failed",
+        `Workspace reset before reproducer exploration failed: ${initialReset.error}`,
+        null,
+        null,
+      );
+    }
+
+    const initialRestart = await input.restart();
+
+    if (!initialRestart.ok || !initialRestart.baseUrl) {
+      return await finish(
+        "environment_failed",
+        `Sandbox restart before reproducer exploration failed: ${initialRestart.log ?? "(no log)"}`,
+        null,
+        null,
+      );
+    }
+
+    sessionBaseUrl = initialRestart.baseUrl;
+    messages.push({
+      role: "user",
+      content: buildInitialMessage({
+        ...input,
+        sandboxResult: { ...input.sandboxResult, baseUrl: sessionBaseUrl },
+      }),
+    });
+
     while (true) {
       if (Date.now() - startedAt > budgets.maxWallTimeMs) {
         return await finishExhausted("Wall-time budget exhausted.");
@@ -862,12 +894,22 @@ export async function runReproducerAgent(
 
       counters.turns += 1;
 
+      // Once deterministic live evidence contains the failure, exploration
+      // has achieved its purpose. Force the next turn to freeze a plan so the
+      // model cannot spend the remaining budget re-querying the same state.
+      const forcePlanSubmission =
+        counters.submissions === 0 &&
+        (!uiFirstRequired || uiFirstSatisfied()) &&
+        failureObservedLive(findings);
+
       const message = await createMessage({
         model: MODEL,
         max_tokens: budgets.maxResponseTokens,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
-        tool_choice: { type: "any", disable_parallel_tool_use: true },
+        tool_choice: forcePlanSubmission
+          ? { type: "tool", name: "submit_plan", disable_parallel_tool_use: true }
+          : { type: "any", disable_parallel_tool_use: true },
         messages: [...messages],
       });
 
@@ -1581,6 +1623,7 @@ Rules:
 - Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.
 - Submissions are limited; explore until you have SEEN the failure before submitting.
+- Once you have seen the reported failure in live evidence, stop exploring and submit the shortest self-contained plan on your next turn.
 - PAST INVESTIGATIONS may list REPRODUCTION PLANS ALREADY TRIED. A plan whose steps and assertion behaviorally match a listed plan hash will be REJECTED automatically without replay — submit a materially different plan (different steps or assertion), and treat the recorded replay signature as evidence of what that plan actually did.
 - Respond with exactly one tool call per turn.`;
 

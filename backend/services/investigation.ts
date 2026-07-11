@@ -41,7 +41,7 @@ import {
   appendMemory,
   boundFixDiff,
   findStaleFile,
-  hashRepoFiles,
+  hashRepoFilesAtCommit,
   loadMemory,
   matchMemory,
   renderPastInvestigations,
@@ -326,6 +326,7 @@ export async function runInvestigationPipeline(
     const pastInvestigations = await renderPastInvestigations(
       pastEntries,
       repoContext.repoPath,
+      repoContext.commit,
     );
     await writeMemorySelectionArtifacts({
       investigationDir: store.dir,
@@ -611,7 +612,11 @@ export async function runInvestigationPipeline(
     if (replayCandidate?.reproductionPlan) {
       log("Memory replay candidate found.");
 
-      const staleFile = await findStaleFile(replayCandidate, repoContext.repoPath);
+      const staleFile = await findStaleFile(
+        replayCandidate,
+        repoContext.repoPath,
+        repoContext.commit,
+      );
 
       if (staleFile) {
         log(
@@ -914,6 +919,7 @@ export async function runInvestigationPipeline(
           pastInvestigations: await renderPastInvestigations(
             pastEntries,
             repoContext.repoPath,
+            repoContext.commit,
           ),
           // Cross-run duplicate guard seed (Change 3): canonical hashes of
           // patches that already failed for this issue. Omitted when empty.
@@ -1302,7 +1308,11 @@ export async function runInvestigationPipeline(
         outcome,
         rootCause: memoryFields.rootCause,
         patchedFiles,
-        fileHashes: await hashRepoFiles(repoContext.repoPath, patchedFiles),
+        fileHashes: await hashRepoFilesAtCommit(
+          repoContext.repoPath,
+          repoContext.commit,
+          patchedFiles,
+        ),
         whatWorked: memoryFields.whatWorked,
         whatFailed: memoryFields.whatFailed,
         createdAt: new Date().toISOString(),

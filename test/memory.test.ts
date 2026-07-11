@@ -1,11 +1,15 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   appendMemory,
   boundFixDiff,
+  findStaleFile,
+  hashRepoFilesAtCommit,
   loadMemory,
   matchMemory,
   mergeEntriesByTitle,
@@ -18,6 +22,8 @@ import {
   type FailedMemoryAttempt,
   type MemoryEntry,
 } from "../backend/services/memory.js";
+
+const execFileAsync = promisify(execFile);
 
 const previousDataDir = process.env.SHERLOCK_DATA_DIR;
 const previousMaxEntries = process.env.SHERLOCK_MAX_MEMORY_ENTRIES;
@@ -104,6 +110,55 @@ describe("renderPastInvestigations fix diffs", () => {
     const rendered = await renderPastInvestigations([withDiff], repoPath);
     expect(rendered).toContain("[STALE: server.js changed since this fix");
     expect(rendered).toContain("verified fix diff (STALE");
+  });
+
+  test("the exact source commit overrides legacy post-patch hashes", async () => {
+    const repoPath = await mkdtemp(path.join(tmpdir(), "sherlock-repo-"));
+    const original = "const state = 'buggy';\n";
+    await writeFile(path.join(repoPath, "server.js"), original);
+    await execFileAsync("git", ["init", "--quiet"], { cwd: repoPath });
+    await execFileAsync("git", ["add", "server.js"], { cwd: repoPath });
+    await execFileAsync(
+      "git",
+      [
+        "-c",
+        "user.email=test@sherlock.dev",
+        "-c",
+        "user.name=Sherlock Test",
+        "commit",
+        "--quiet",
+        "-m",
+        "source",
+      ],
+      { cwd: repoPath },
+    );
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], {
+      cwd: repoPath,
+    });
+    const sourceCommit = stdout.trim();
+    await writeFile(path.join(repoPath, "server.js"), "const state = 'fixed';\n");
+
+    const legacyEntry: MemoryEntry = {
+      ...entry(1),
+      commitSha: sourceCommit,
+      fileHashes: {
+        "server.js": createHash("sha256").update("const state = 'fixed';\n").digest("hex"),
+      },
+      fixDiff: DIFF,
+    };
+
+    expect(await findStaleFile(legacyEntry, repoPath, sourceCommit)).toBeNull();
+    const rendered = await renderPastInvestigations(
+      [legacyEntry],
+      repoPath,
+      sourceCommit,
+    );
+    expect(rendered).not.toContain("[STALE:");
+
+    const sourceHashes = await hashRepoFilesAtCommit(repoPath, sourceCommit, ["server.js"]);
+    expect(sourceHashes["server.js"]).toBe(
+      createHash("sha256").update(original).digest("hex"),
+    );
   });
 
   test("entries without a diff render as before", async () => {

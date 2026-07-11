@@ -17,6 +17,7 @@ import {
   getRegressionTimeoutMs,
   hashTestContents,
   materializeTest,
+  REGRESSION_FAILURE_MARKER_PREFIX,
   runRegressionTest,
   validateRegressionProposalSafety,
   validateRegressionProposalShape,
@@ -108,7 +109,9 @@ describe("regression proposal validation", () => {
 describe("regression generation prompt", () => {
   test("requires verified reproduction routes and the exact behavioral failure marker", () => {
     // Marker extraction: exactly one required.
-    expect(extractRegressionFailureMarker(VALID_CONTENTS)).toBe(MARKER);
+    expect(extractRegressionFailureMarker(VALID_CONTENTS)).toBe(
+      REGRESSION_FAILURE_MARKER_PREFIX,
+    );
     expect(extractRegressionFailureMarker("assert.ok(false, 'plain');")).toBeNull();
 
     const plan = {
@@ -221,6 +224,25 @@ describe("regression run classification", () => {
     expect(classifyPrePatchRun(run(1, "", true), MARKER)).toBe("timed_out");
     expect(classifyPrePatchRun(run(127, "spawn failed"), MARKER)).toBe("execution_failed");
     expect(classifyPrePatchRun(run(1, "segfault"), MARKER)).toBe("execution_failed");
+  });
+
+  test("pre-patch: escaped quotes in the assertion message do not hide the behavioral marker", () => {
+    const contents = String.raw`assert.ok(
+  false,
+  "REGRESSION_EXPECTED_FAILURE: response contained \"Write report\" after archive"
+);`;
+    const marker = extractRegressionFailureMarker(contents);
+
+    expect(marker).toBe(REGRESSION_FAILURE_MARKER_PREFIX);
+    expect(
+      classifyPrePatchRun(
+        run(
+          1,
+          'AssertionError [ERR_ASSERTION]: REGRESSION_EXPECTED_FAILURE: response contained "Write report" after archive',
+        ),
+        marker!,
+      ),
+    ).toBe("failed_as_expected");
   });
 
   test("post-patch classification", () => {

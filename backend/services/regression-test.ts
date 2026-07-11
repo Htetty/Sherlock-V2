@@ -102,15 +102,18 @@ export function getRegressionTimeoutMs(env: NodeJS.ProcessEnv = process.env): nu
 // trips a different assertion is an invalid test, not proof of the bug.
 export const REGRESSION_FAILURE_MARKER_PREFIX = "REGRESSION_EXPECTED_FAILURE:";
 
-// Exactly one marker message must exist in the test contents; returns it.
+// Exactly one stable marker prefix must exist in the test contents. Compare
+// the prefix rather than the complete JavaScript string literal: generated
+// assertion messages may contain escaped quotes or backslashes whose source
+// representation differs from the runtime text printed by Node.
 export function extractRegressionFailureMarker(contents: string): string | null {
-  const matches = contents.match(/REGRESSION_EXPECTED_FAILURE:[^"'`\n]*/g) ?? [];
+  const matches = contents.match(/REGRESSION_EXPECTED_FAILURE:/g) ?? [];
 
   if (matches.length !== 1) {
     return null;
   }
 
-  return matches[0].trim();
+  return REGRESSION_FAILURE_MARKER_PREFIX;
 }
 
 const BANNED_CONTENT_PATTERNS: { pattern: RegExp; label: string }[] = [

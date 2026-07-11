@@ -186,7 +186,10 @@ function stepRecord(action: string, outcome: "passed" | "failed", error: string 
 
 // Sessions share one scripted step queue; each openLiveSession call returns a
 // fresh session over the same queue.
-function stubSessionFactory(stepQueue: StepRecord[]) {
+function stubSessionFactory(
+  stepQueue: StepRecord[],
+  afterStep?: (evidence: SessionEvidence, step: ReproductionPlan["steps"][number]) => void,
+) {
   let opened = 0;
   let closed = 0;
   let cursor = 0;
@@ -203,12 +206,11 @@ function stubSessionFactory(stepQueue: StepRecord[]) {
       executeStep: async (step) => {
         const scripted = stepQueue[cursor];
         cursor += 1;
-
-        if (!scripted) {
-          return { ...stepRecord(step.action, "passed"), id: step.id };
-        }
-
-        return { ...scripted, id: step.id, action: step.action };
+        const result = !scripted
+          ? { ...stepRecord(step.action, "passed"), id: step.id }
+          : { ...scripted, id: step.id, action: step.action };
+        afterStep?.(evidence, step);
+        return result;
       },
       readPageDigest: async () =>
         'URL: http://localhost:3000/\nTitle: Tasks\nInteractive elements:\n- button testId="archive-btn" text="Archive completed"',
@@ -312,7 +314,7 @@ describe("reproducer agent loop", () => {
     expect(result.submissions).toEqual([
       expect.objectContaining({ index: 1, valid: true, replayOutcome: "reproduced" }),
     ]);
-    expect(restartCalls()).toBe(1);
+    expect(restartCalls()).toBe(2); // pristine exploration + official replay
     expect(replayedPlans).toHaveLength(1);
     // Live session was closed before the official replay.
     expect(sessions.closedCount()).toBeGreaterThanOrEqual(1);
@@ -385,7 +387,7 @@ describe("reproducer agent loop", () => {
     const sessions = stubSessionFactory([]);
     const model = scriptedModel([
       toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
     ]);
 
     const dirtyFile = path.join(input.repoPath, "tasks-data.json");
@@ -413,7 +415,7 @@ describe("reproducer agent loop", () => {
 
     expect(result.status).toBe("reproduced");
     expect(result.submissions).toHaveLength(2);
-    expect(restartCalls()).toBe(2);
+    expect(restartCalls()).toBe(3); // pristine exploration + two official replays
     // git clean ran before EACH replay: the untracked file was gone both times.
     expect(dirtySeenAtReplay).toEqual([false, false]);
 
@@ -427,9 +429,7 @@ describe("reproducer agent loop", () => {
     const sessions = stubSessionFactory([]);
     const model = scriptedModel([
       toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION), // never reached
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
     ]);
 
     const result = await runReproducerAgent(input, {
@@ -453,8 +453,7 @@ describe("reproducer agent loop", () => {
     const sessions = stubSessionFactory([]);
     const model = scriptedModel([
       toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION),
-      toolUseMessage("submit_plan", VALID_SUBMISSION),
+      toolUseMessage("submit_plan", VALID_SUBMISSION_VARIANT),
     ]);
 
     const result = await runReproducerAgent(input, {
@@ -477,6 +476,8 @@ describe("reproducer agent loop", () => {
         reason: "The reported Archive button does not exist in this app.",
       }),
     ]);
+    const abandonedSetup = path.join(input.repoPath, "tasks-data.json");
+    await writeFile(abandonedSetup, "dirty one-shot state", "utf8");
 
     const result = await runReproducerAgent(input, {
       createMessage: model.createMessage,
@@ -488,7 +489,33 @@ describe("reproducer agent loop", () => {
 
     expect(result.status).toBe("plan_failed");
     expect(result.reason).toContain("Archive button does not exist");
-    expect(restartCalls()).toBe(0);
+    expect(restartCalls()).toBe(1); // pristine exploration only
+    expect(existsSync(abandonedSetup)).toBe(false);
+  });
+
+  test("observing a live runtime failure forces the next turn to submit a plan", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory(
+      [stepRecord("request", "passed")],
+      (evidence) => evidence.pageErrors.push("Converting circular structure to JSON"),
+    );
+    const model = scriptedModel([
+      toolUseMessage("request", { method: "GET", path: "/api/tasks" }),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => replayResult("reproduced", "Failure observed."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(model.calls[1].tool_choice).toMatchObject({
+      type: "tool",
+      name: "submit_plan",
+    });
+    expect(result.turns).toBe(2);
   });
 
   test("detectApiIssueSignal recognizes clear API failures and rejects vague text", () => {
@@ -1037,7 +1064,7 @@ describe("duplicate-plan guard", () => {
     });
 
     expect(replays).toBe(1);
-    expect(restartCalls()).toBe(1); // No restart for duplicates.
+    expect(restartCalls()).toBe(2); // Pristine exploration + one replay; none for duplicates.
     expect(result.status).toBe("failed");
     expect(result.failureCode).toBe("reproducer_repeated_plan");
 

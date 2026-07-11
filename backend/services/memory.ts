@@ -3,9 +3,11 @@
 // Contract: docs/fable/08-memory-prompt.md
 
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { ReproductionPlan } from "./plan.js";
 import { truncateUtf8Bytes } from "./reproduction-evidence.js";
 import { redactSecrets } from "./report.js";
@@ -25,6 +27,7 @@ export const MAX_RENDERED_PAST_INVESTIGATIONS_BYTES = 32 * 1024;
 export const MAX_FAILED_PLANS_PER_MEMORY_ENTRY = 2;
 export const MAX_FAILED_PLAN_REASON_BYTES = 500;
 const memoryWriteLocks = new Map<string, Promise<void>>();
+const execFileAsync = promisify(execFile);
 
 export type MemoryOutcome =
   | "verified"
@@ -39,8 +42,10 @@ export type MemoryEntry = {
   outcome: MemoryOutcome;
   rootCause: string;
   patchedFiles: string[];
-  // Content hashes of patchedFiles at record time, used for staleness checks
-  // (shallow clones cannot diff against old commits).
+  // Content hashes of patchedFiles at the SOURCE commit (before the fix),
+  // used for staleness checks. The working tree may contain the verified patch
+  // when memory is recorded, so hashing it directly would make an identical
+  // future clone look stale.
   fileHashes: Record<string, string>;
   whatWorked: string;
   whatFailed: string;
@@ -394,11 +399,15 @@ type DiffRenderMode = "full" | "no_failed_diffs" | "no_diffs";
 export async function renderPastInvestigations(
   entries: MemoryEntry[],
   repoPath: string,
+  currentCommit?: string,
 ): Promise<string> {
   const prepared: Array<{ entry: MemoryEntry; staleFile: string | null }> = [];
 
   for (const entry of entries) {
-    prepared.push({ entry, staleFile: await findStaleFile(entry, repoPath) });
+    prepared.push({
+      entry,
+      staleFile: await findStaleFile(entry, repoPath, currentCommit),
+    });
   }
 
   const render = (mode: DiffRenderMode) =>
@@ -522,7 +531,15 @@ function indentBlock(text: string, prefix: string): string {
 export async function findStaleFile(
   entry: MemoryEntry,
   repoPath: string,
+  currentCommit?: string,
 ): Promise<string | null> {
+  // Exact commit identity is stronger than legacy file hashes. Older memory
+  // entries accidentally stored post-patch hashes, but a clean clone at the
+  // same source commit is still byte-identical to the plan's original source.
+  if (currentCommit && currentCommit === entry.commitSha) {
+    return null;
+  }
+
   for (const file of entry.patchedFiles) {
     const recorded = entry.fileHashes[file];
     const current = await hashFile(path.join(repoPath, file));
@@ -550,6 +567,31 @@ export async function hashRepoFiles(
 
     if (hash !== null) {
       hashes[file] = hash;
+    }
+  }
+
+  return hashes;
+}
+
+export async function hashRepoFilesAtCommit(
+  repoPath: string,
+  commitSha: string,
+  files: string[],
+): Promise<Record<string, string>> {
+  const hashes: Record<string, string> = {};
+
+  for (const file of files) {
+    try {
+      const gitPath = file.split(path.sep).join("/");
+      const { stdout } = await execFileAsync(
+        "git",
+        ["show", `${commitSha}:${gitPath}`],
+        { cwd: repoPath, encoding: "buffer", maxBuffer: 20 * 1024 * 1024 },
+      );
+      hashes[file] = createHash("sha256").update(stdout).digest("hex");
+    } catch {
+      // A newly created patch file does not exist at the source commit. Omit
+      // it; findStaleFile already treats missing current files conservatively.
     }
   }
 
