@@ -30,6 +30,12 @@ import {
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
 import {
+  createArtifactCleanupService,
+  createRedisArtifactCleanupProtection,
+  getArtifactRetentionConfig,
+  startArtifactCleanupScheduler,
+} from "./services/artifact-retention.js";
+import {
   createDeliveryGitHubRestClient,
   createFileDeliveryStateStore,
 } from "./services/delivery.js";
@@ -173,6 +179,20 @@ const concurrencyGate = createInvestigationConcurrencyGate(() =>
   asScriptRunner(connection),
 );
 
+const artifactRetentionConfig = getArtifactRetentionConfig();
+const artifactCleanup = createArtifactCleanupService({
+  deliveryStore,
+  protection: createRedisArtifactCleanupProtection({
+    queue: deliveryQueue,
+    redis: asScriptRunner(connection),
+    // If protected queue state is larger than the configured bounded scan,
+    // cleanup skips safely instead of loading an unbounded job set.
+    maxQueueJobs: artifactRetentionConfig.maxDirectoriesPerScan,
+  }),
+  config: artifactRetentionConfig,
+  log: (message) => console.log(message),
+});
+
 const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
   INVESTIGATION_QUEUE_NAME,
   async (job: Job<InvestigationJobPayload | DeliveryJobPayload>, token?: string) => {
@@ -206,6 +226,12 @@ const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
 
 worker.on("completed", (job) => {
   console.log(`[queue] Job ${job.id} completed.`);
+  // BullMQ has moved the job to its terminal set before this event. Cleanup
+  // remains detached and non-fatal; a delivery job that is still waiting,
+  // delayed, or active protects the artifacts through the activity probe.
+  void artifactCleanup
+    .cleanupInvestigation(job.data.investigationId)
+    .catch(() => {});
 });
 
 worker.on("failed", (job, error) => {
@@ -222,6 +248,11 @@ console.log(
   `Sherlock investigation worker started (queue "${INVESTIGATION_QUEUE_NAME}", concurrency ${concurrency}).`,
 );
 
+const stopArtifactCleanup = startArtifactCleanupScheduler({
+  cleanup: artifactCleanup,
+  config: artifactRetentionConfig,
+});
+
 // Graceful shutdown: worker.close() waits for active jobs, whose pipeline
 // finally-blocks stop sandbox processes/containers and clean workspaces.
 let shuttingDown = false;
@@ -232,6 +263,7 @@ async function shutdown(signal: string) {
   }
 
   shuttingDown = true;
+  stopArtifactCleanup();
   console.log(`Received ${signal}; closing worker, queue connection, and sandboxes...`);
 
   try {

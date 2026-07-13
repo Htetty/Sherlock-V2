@@ -237,6 +237,12 @@ export type ConcurrencySlot = {
   leaseId?: string;
 };
 
+export function buildConcurrencyLeaseMemberPrefix(
+  investigationId: string,
+): string {
+  return `${investigationId}|`;
+}
+
 export type ConcurrencyDecision =
   | { acquired: true; tenantActive: number; repoActive: number }
   | {
@@ -277,7 +283,9 @@ export function createInvestigationConcurrencyGate(
     `${REPO_CONCURRENCY_KEY_PREFIX}${slot.repoKey}`,
   ];
   const memberFor = (slot: ConcurrencySlot) =>
-    slot.leaseId ?? slot.investigationId;
+    slot.leaseId
+      ? `${buildConcurrencyLeaseMemberPrefix(slot.investigationId)}${slot.leaseId}`
+      : slot.investigationId;
 
   return {
     acquireInvestigationConcurrency: async (slot) => {

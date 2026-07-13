@@ -667,6 +667,11 @@ export function createFileDeliveryStateStore(
   rootDir: string = getArtifactsRoot(),
 ): DeliveryStateStore {
   const resolvedRoot = path.resolve(rootDir);
+  // Locks live outside investigation directories so retention cleanup can
+  // remove artifacts/<id>/ while still holding the same lock delivery uses.
+  // A lock inside the deletion target would disappear mid-critical-section
+  // and permit a concurrent delivery retry to recreate state underneath it.
+  const lockRoot = path.join(resolvedRoot, "_delivery-locks");
   const dirFor = (investigationId: string) => {
     if (!isInvestigationId(investigationId)) {
       throw new Error("Refusing delivery-state path for unsafe investigation id.");
@@ -687,6 +692,14 @@ export function createFileDeliveryStateStore(
       throw new Error("Refusing a non-directory delivery-state location.");
     }
     return dir;
+  };
+
+  const ensureLockRoot = async () => {
+    await mkdir(lockRoot, { recursive: true });
+    const info = await lstat(lockRoot);
+    if (!info.isDirectory() || info.isSymbolicLink()) {
+      throw new Error("Refusing a non-directory delivery-lock location.");
+    }
   };
 
   return {
@@ -745,8 +758,11 @@ export function createFileDeliveryStateStore(
       }
     },
     async withLock(investigationId, operation) {
-      const dir = await ensureDir(investigationId);
-      const lockDir = path.join(dir, ".delivery.lock");
+      if (!isInvestigationId(investigationId)) {
+        throw new Error("Refusing delivery lock for unsafe investigation id.");
+      }
+      await ensureLockRoot();
+      const lockDir = path.join(lockRoot, `${investigationId}.lock`);
       const ownerFile = path.join(lockDir, "owner");
       const lockOwner = randomUUID();
 

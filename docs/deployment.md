@@ -108,6 +108,11 @@ Both services load this one file (`env_file`). Names by service:
 | `SUPABASE_SERVICE_ROLE_KEY` | ✓ | ✓ | **backend-only** secret; never ship to clients |
 | `SHERLOCK_SANDBOX_NETWORK_POLICY` | | ✓ | `strict` (default) or `permissive` |
 | `SHERLOCK_RUN_STARTUP_CHECKS` | | ✓ | set to `true` (compose does this) to fail fast |
+| `SHERLOCK_SUCCESSFUL_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `0` after fully delivered verified fix |
+| `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `168`, measured after terminal comment delivery |
+| `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` | | ✓ | optional bounded scan interval; default `60` |
+| `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` | | ✓ | optional detached startup scan; default `true` |
+| `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` | | ✓ | optional scan bound; default `250` |
 | `WEBHOOK_PROXY_URL` | ✓ | | smee relay for non-public hosts; blank in prod |
 
 `NODE_ENV`, `SHERLOCK_RUN_STARTUP_CHECKS`, `TMPDIR`, and

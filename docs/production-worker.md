@@ -30,6 +30,19 @@ Required environment variables (values are never printed by any check):
   (`claude-sonnet-5`) used for all model calls
 - `REDIS_URL` — optional; the default is reported explicitly when unset
 - `SHERLOCK_TARGET_IMAGE`, `ARTIFACTS_DIR`, `SHERLOCK_DATA_DIR` — optional overrides
+- `SHERLOCK_SUCCESSFUL_ARTIFACT_RETENTION_HOURS` — raw-artifact retention
+  after a verified fix, pull request, and terminal comment are fully delivered
+  (default `0`, immediate)
+- `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` — raw-artifact retention for
+  terminal non-success investigations, measured from confirmed terminal
+  comment delivery (default `168`, seven days)
+- `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` — periodic bounded scan
+  interval (default `60`; `0` disables periodic scans)
+- `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` — run a detached bounded scan when
+  the worker starts (default `true`)
+- `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` — maximum artifact-root entries
+  and pending queue jobs considered by one scan (default `250`; excess queue
+  state makes cleanup retain everything)
 - `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable
   investigation-state persistence (see "Investigation state store" below).
   When `supabase`, also set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
@@ -148,6 +161,29 @@ Security:
   `SUPABASE_SERVICE_ROLE_KEY` is missing, runtime writes stay non-fatal
   (swallowed by the pipeline) and `npm run worker:check` fails clearly
   (`state-store:supabase`).
+
+## Investigation artifact retention
+
+The worker treats raw investigation artifacts as a separate storage class
+from repository memory, graph caches, Redis queue state, and Supabase rows.
+Cleanup only targets a validated `ARTIFACTS_DIR/inv_*` directory. It never
+targets `SHERLOCK_DATA_DIR`, Redis, or Supabase.
+
+Deletion eligibility is proved from the local `delivery-state.json`. A
+verified fix is eligible only after its branch is pushed, its pull request is
+created or safely reused, and its terminal issue comment is confirmed posted.
+Non-success outcomes begin their retention clock only after the terminal
+comment is posted. Pending or failed branch/PR/comment delivery, missing or
+malformed delivery state, active/delayed/waiting BullMQ work, and a live
+investigation concurrency lease all retain artifacts.
+
+The worker checks eligibility after BullMQ emits a completed event, starts one
+bounded scan without delaying worker startup, and repeats the scan at the
+configured interval. Cleanup is idempotent and best-effort: filesystem or
+Redis uncertainty retains artifacts and does not change the investigation
+result. Deleting raw artifacts removes manual replay/debug evidence, but does
+not delete repository memory under `SHERLOCK_DATA_DIR/memory`, graph caches,
+structured Supabase state, or queue records.
 
 ## Not included (deliberately, for now)
 
