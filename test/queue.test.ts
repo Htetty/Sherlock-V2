@@ -5,7 +5,11 @@
 import { UnrecoverableError } from "bullmq";
 import { describe, expect, test } from "vitest";
 import {
+  DELIVERY_JOB_ATTEMPTS,
+  DELIVERY_JOB_NAME,
+  DELIVERY_RETRY_BACKOFF_MS,
   INVESTIGATION_JOB_RETENTION,
+  enqueueDeliveryJob,
   type InvestigationJobPayload,
 } from "../backend/queue/investigation-queue.js";
 import {
@@ -18,8 +22,27 @@ import {
   processInvestigationJob,
   type WorkerDeps,
 } from "../backend/queue/process-investigation.js";
+import {
+  createInMemoryDeliveryStateStore,
+  terminalCommentMarker,
+  type DeliveryGitHubClient,
+} from "../backend/services/delivery.js";
 import type { InvestigationStage } from "../backend/services/investigation.js";
 import { createInMemoryInvestigationStateStore } from "../backend/services/investigation-state-store.js";
+
+// Minimal delivery wiring for worker tests that exercise the investigation
+// path: durable in-memory state, no queued retry job, and a GitHub client
+// that must never be needed (these tests never leave a pending PR).
+function testDelivery(): WorkerDeps["delivery"] {
+  return {
+    store: createInMemoryDeliveryStateStore(),
+    enqueue: async () => {},
+    createGitHubClient: (): DeliveryGitHubClient => {
+      throw new Error("The delivery GitHub client should not be used in this test.");
+    },
+    findTerminalComment: async () => false,
+  };
+}
 
 const jobPayload: InvestigationJobPayload = {
   investigationId: "inv_0TEST123ABC",
@@ -47,6 +70,7 @@ describe("investigation worker processing", () => {
     const comments: { issueNumber: number; body: string }[] = [];
 
     const deps: WorkerDeps = {
+      delivery: testDelivery(),
       runPipeline: async (payload, options) => {
         pipelineCalls.push(payload);
         await options.onStage?.("reproducing");
@@ -90,8 +114,13 @@ describe("investigation worker processing", () => {
       installationToken: "short-lived-token",
       installationPermissions: { contents: "write", issues: "write" },
     });
-    expect(comments).toEqual([{ issueNumber: 1, body: "RESULT COMMENT" }]);
-    expect(stages).toEqual(["running", "reproducing", "completed"]);
+    // Exactly one terminal comment, rebuilt from the durable delivery state
+    // and stamped with the idempotency marker.
+    expect(comments).toHaveLength(1);
+    expect(comments[0].issueNumber).toBe(1);
+    expect(comments[0].body).toContain("Outcome: verified_fix");
+    expect(comments[0].body).toContain(terminalCommentMarker("inv_0TEST123ABC"));
+    expect(stages).toEqual(["running", "reproducing", "delivering", "completed"]);
   });
 
   test("classifies retryable vs non-retryable failures and reports final failures", async () => {
@@ -126,6 +155,7 @@ describe("investigation worker processing", () => {
     });
 
     const failingDeps = (error: unknown): WorkerDeps => ({
+      delivery: testDelivery(),
       runPipeline: async () => {
         throw error;
       },
@@ -198,6 +228,7 @@ describe("worker-level state store writes", () => {
 
     const deps: WorkerDeps = {
       stateStore,
+      delivery: testDelivery(),
       runPipeline: async (payload) => {
         pipelineRan = true;
         return {
@@ -248,6 +279,7 @@ describe("worker-level state store writes", () => {
 
     const deps: WorkerDeps = {
       stateStore,
+      delivery: testDelivery(),
       runPipeline: async (payload) => {
         pipelineRan = true;
         return {
@@ -298,6 +330,7 @@ describe("worker-level state store writes", () => {
 
     const makeDeps = (error: unknown): WorkerDeps => ({
       stateStore,
+      delivery: testDelivery(),
       runPipeline: async () => {
         throw error;
       },
@@ -359,13 +392,17 @@ describe("worker-level state store writes", () => {
     expect(escaped).toContain("[REDACTED]");
   });
 
-  test("a post-pipeline failure does not overwrite the pipeline's own final outcome", async () => {
-    // The pipeline (stub) returns a result but records nothing itself; a later
-    // comment-post failure must not cause the worker to stamp a final outcome.
+  test("a post-pipeline comment failure keeps the pipeline outcome and records the failed delivery", async () => {
+    // The pipeline (stub) returns a result; the terminal comment then fails
+    // permanently. The recorded outcome must stay the pipeline's own outcome,
+    // with the comment failure captured as delivery state — and no second
+    // "worker failure" comment may be posted over it.
     const stateStore = createInMemoryInvestigationStateStore();
+    const comments: string[] = [];
 
     const deps: WorkerDeps = {
       stateStore,
+      delivery: testDelivery(),
       runPipeline: async (payload) => ({
         investigationId: payload.investigationId!,
         outcome: "verified_fix",
@@ -374,8 +411,9 @@ describe("worker-level state store writes", () => {
       }),
       getInstallationToken: async () => ({ token: "t", permissions: null }),
       // Non-transient failure AFTER the pipeline produced a result.
-      postIssueComment: async () => {
-        throw new Error("GitHub comment API is down");
+      postIssueComment: async ({ body }) => {
+        comments.push(body);
+        throw new Error("GitHub comment API rejected the request");
       },
       reportStage: () => {},
     };
@@ -388,15 +426,55 @@ describe("worker-level state store writes", () => {
     ).rejects.toBeInstanceOf(UnrecoverableError);
 
     const record = await stateStore.get?.(jobPayload.investigationId);
-    // Worker recorded the error but did NOT claim a terminal outcome, because
-    // the pipeline already owns the outcome for a completed run.
-    expect(record?.errors.length).toBeGreaterThan(0);
-    expect(record?.status).toBe("running");
-    expect(record?.outcome).toBeNull();
+    // The delivery layer recorded the pipeline's true outcome and the failed
+    // terminal-comment delivery — the worker did not stamp "failed" over it.
+    expect(record?.status).toBe("finished");
+    expect(record?.outcome).toBe("verified_fix");
+    expect(record?.terminalComment?.status).toBe("failed");
+    // Only the (failed) terminal comment attempt; no extra failure comment.
+    expect(comments).toHaveLength(1);
   });
 });
 
 describe("production safety", () => {
+  test("delivery jobs contain only non-secret identity and use their own bounded retry policy", async () => {
+    const calls: unknown[][] = [];
+    const queue = {
+      add: async (...args: unknown[]) => {
+        calls.push(args);
+        return {};
+      },
+    };
+
+    await enqueueDeliveryJob(queue as never, {
+      investigationId: jobPayload.investigationId,
+      tenantId: jobPayload.tenantId,
+      installationId: jobPayload.installationId,
+      repositoryOwner: jobPayload.repositoryOwner,
+      repositoryName: jobPayload.repositoryName,
+      issueNumber: jobPayload.issueNumber,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0][0]).toBe(DELIVERY_JOB_NAME);
+    expect(calls[0][1]).toEqual({
+      investigationId: jobPayload.investigationId,
+      tenantId: jobPayload.tenantId,
+      installationId: jobPayload.installationId,
+      repositoryOwner: jobPayload.repositoryOwner,
+      repositoryName: jobPayload.repositoryName,
+      issueNumber: jobPayload.issueNumber,
+    });
+    expect(calls[0][2]).toMatchObject({
+      attempts: DELIVERY_JOB_ATTEMPTS,
+      backoff: { type: "exponential", delay: DELIVERY_RETRY_BACKOFF_MS },
+    });
+    const serialized = JSON.stringify(calls[0][1]);
+    expect(serialized).not.toContain("short-lived-token");
+    expect(serialized).not.toContain("ANTHROPIC");
+    expect(serialized).not.toContain("WEBHOOK_SECRET");
+  });
+
   test("the synchronous HTTP endpoint is disabled in production but health stays available", async () => {
     // Gate logic across environments.
     expect(isSyncInvestigationEndpointEnabled({ NODE_ENV: "development" })).toBe(true);

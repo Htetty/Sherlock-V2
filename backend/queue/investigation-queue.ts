@@ -8,6 +8,10 @@ import { Redis } from "ioredis";
 
 export const INVESTIGATION_QUEUE_NAME = "sherlock-investigations";
 export const INVESTIGATION_JOB_NAME = "investigate";
+// Delivery-only job: finishes GitHub delivery (branch/PR/terminal comment)
+// for an investigation whose execution already reached a terminal result.
+// It never reruns the investigation pipeline.
+export const DELIVERY_JOB_NAME = "deliver";
 
 // Transient infrastructure failures get a small bounded retry with
 // exponential backoff (5s, 10s, 20s). Logical outcomes never reach retry:
@@ -49,6 +53,44 @@ export type InvestigationJobPayload = {
   sourceRef: string | null;
   deliveryId: string | null;
 };
+
+// Delivery-only job payload: just enough non-secret identity to load the
+// durable delivery state and mint a fresh installation token. Deliberately
+// carries no issue/comment text and no credentials.
+export type DeliveryJobPayload = {
+  investigationId: string;
+  tenantId: string;
+  installationId: number;
+  repositoryOwner: string;
+  repositoryName: string;
+  issueNumber: number;
+};
+
+// Delivery retries are decoupled from investigation retries: GitHub-side
+// blips deserve a slower, slightly longer backoff (30s, 1m, 2m) than the
+// pipeline's 5s-based schedule, and their attempts must not consume the
+// investigation job's budget.
+export const DELIVERY_JOB_ATTEMPTS = 4;
+export const DELIVERY_RETRY_BACKOFF_MS = 30_000;
+
+// Deterministic delivery job id: at most one delivery job per investigation
+// (BullMQ deduplicates by id while the job is retained).
+export function buildDeliveryJobId(investigationId: string): string {
+  return `deliver_${investigationId}`;
+}
+
+export async function enqueueDeliveryJob(
+  queue: Pick<Queue, "add">,
+  payload: DeliveryJobPayload,
+): Promise<void> {
+  await queue.add(DELIVERY_JOB_NAME, payload, {
+    jobId: buildDeliveryJobId(payload.investigationId),
+    attempts: DELIVERY_JOB_ATTEMPTS,
+    backoff: { type: "exponential", delay: DELIVERY_RETRY_BACKOFF_MS },
+    removeOnComplete: INVESTIGATION_JOB_RETENTION.removeOnComplete,
+    removeOnFail: INVESTIGATION_JOB_RETENTION.removeOnFail,
+  });
+}
 
 // Deterministic, non-secret tenant identity for future B2B SaaS plans.
 // Deliberately the single indirection point for tenancy: when Sherlock gains

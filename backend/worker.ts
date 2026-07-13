@@ -15,15 +15,24 @@ import "dotenv/config";
 import { Worker, type Job } from "bullmq";
 import { createProbot } from "probot";
 import {
+  DELIVERY_JOB_NAME,
   INVESTIGATION_QUEUE_NAME,
+  createInvestigationQueue,
   createRedisConnection,
+  enqueueDeliveryJob,
+  type DeliveryJobPayload,
   type InvestigationJobPayload,
 } from "./queue/investigation-queue.js";
 import {
+  processDeliveryJob,
   processInvestigationJobWithConcurrency,
   type WorkerDeps,
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
+import {
+  createDeliveryGitHubRestClient,
+  createFileDeliveryStateStore,
+} from "./services/delivery.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
 import {
@@ -52,12 +61,63 @@ async function getInstallationOctokit(installationId: number) {
   return probot.auth(installationId);
 }
 
-// Lifecycle state store (no-op unless SHERLOCK_STATE_STORE=file); shared
-// across jobs. Never carries secrets and never fails an investigation.
+// Lifecycle state store (selected by SHERLOCK_STATE_STORE; no-op default);
+// shared across jobs. Never carries secrets and never fails an investigation.
 const stateStore = createInvestigationStateStoreFromEnv();
+
+// Durable delivery state under the artifacts volume, plus a queue producer
+// used to enqueue delivery-only retry jobs. The producer gets its own Redis
+// connection: the worker connection is reserved for blocking commands.
+const deliveryStore = createFileDeliveryStateStore();
+const deliveryQueueConnection = createRedisConnection();
+const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
 
 const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
+  delivery: {
+    store: deliveryStore,
+    enqueue: (payload: DeliveryJobPayload) =>
+      enqueueDeliveryJob(deliveryQueue, payload),
+    createGitHubClient: createDeliveryGitHubRestClient,
+    findTerminalComment: async ({
+      installationId,
+      owner,
+      repo,
+      issueNumber,
+      marker,
+      createdAfter,
+    }) => {
+      const octokit = await getInstallationOctokit(installationId);
+
+      // Bounded scan of the issue's comments for the terminal marker; enough
+      // for any real issue thread without risking an unbounded pagination.
+      for (let page = 1; page <= 3; page += 1) {
+        const { data } = await octokit.rest.issues.listComments({
+          owner,
+          repo,
+          issue_number: issueNumber,
+          per_page: 100,
+          page,
+          since: createdAfter,
+        });
+
+        if (
+          data.some(
+            (comment: { body?: string | null }) =>
+              typeof comment.body === "string" && comment.body.includes(marker),
+          )
+        ) {
+          return true;
+        }
+
+        if (data.length < 100) {
+          break;
+        }
+      }
+
+      return false;
+    },
+  },
   runPipeline: (payload, pipelineOptions) =>
     runInvestigationPipeline(payload, { ...pipelineOptions, stateStore }),
   getInstallationToken: async (installationId) => {
@@ -101,6 +161,8 @@ const proceed = await enforceStartupChecks(
 
 if (!proceed) {
   await connection.quit().catch(() => {});
+  await deliveryQueue.close().catch(() => {});
+  await deliveryQueueConnection.quit().catch(() => {});
   process.exit(1);
 }
 
@@ -111,25 +173,34 @@ const concurrencyGate = createInvestigationConcurrencyGate(() =>
   asScriptRunner(connection),
 );
 
-const worker = new Worker<InvestigationJobPayload>(
+const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
   INVESTIGATION_QUEUE_NAME,
-  async (job: Job<InvestigationJobPayload>, token?: string) =>
-    processInvestigationJobWithConcurrency(
-      job,
+  async (job: Job<InvestigationJobPayload | DeliveryJobPayload>, token?: string) => {
+    // Delivery-only jobs finish GitHub delivery from durable state. They are
+    // cheap API work: no pipeline, and no tenant/repo concurrency slot.
+    if (job.name === DELIVERY_JOB_NAME) {
+      return processDeliveryJob(job as Job<DeliveryJobPayload>, deps);
+    }
+
+    const investigationJob = job as Job<InvestigationJobPayload>;
+
+    return processInvestigationJobWithConcurrency(
+      investigationJob,
       {
         ...deps,
         reportStage: async (stage) => {
-          console.log(`[${job.data.investigationId}] Stage: ${stage}`);
-          await job.updateProgress({ stage });
+          console.log(`[${investigationJob.data.investigationId}] Stage: ${stage}`);
+          await investigationJob.updateProgress({ stage });
         },
       },
       {
         gate: concurrencyGate,
         delayJob: async (delayMs) => {
-          await job.moveToDelayed(Date.now() + delayMs, token);
+          await investigationJob.moveToDelayed(Date.now() + delayMs, token);
         },
       },
-    ),
+    );
+  },
   { connection, concurrency },
 );
 
@@ -165,7 +236,9 @@ async function shutdown(signal: string) {
 
   try {
     await worker.close();
+    await deliveryQueue.close();
     await connection.quit();
+    await deliveryQueueConnection.quit();
   } catch (error) {
     console.error("Error during shutdown:", error);
   }

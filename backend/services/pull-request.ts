@@ -15,8 +15,8 @@ import { redactSecrets } from "./report.js";
 
 const execFileAsync = promisify(execFile);
 
-const SHERLOCK_AUTHOR_NAME = "sherlock[bot]";
-const SHERLOCK_AUTHOR_EMAIL = "sherlock[bot]@users.noreply.github.com";
+export const SHERLOCK_AUTHOR_NAME = "sherlock[bot]";
+export const SHERLOCK_AUTHOR_EMAIL = "sherlock[bot]@users.noreply.github.com";
 const MAX_SLUG_CHARS = 24;
 const MAX_BODY_CHARS = 20_000;
 
@@ -36,6 +36,15 @@ const REQUIRED_CHECKS = [
 
 const SECRET_FILE_PATTERN = /(^\.env|\.pem$|\.key$)/i;
 
+// Shared secret-path gate: true when a changed file must never be committed,
+// pushed, or persisted into a delivery retry plan.
+export function isForbiddenPullRequestPath(filePath: string): boolean {
+  return SECRET_FILE_PATTERN.test(path.basename(filePath));
+}
+
+// Terminal-issue-comment delivery is owned by the delivery layer
+// (backend/services/delivery.ts), not the pull-request flow, so there is
+// deliberately no issue-comment status in this union.
 export type PullRequestStatus =
   | "created"
   | "already_exists"
@@ -43,8 +52,7 @@ export type PullRequestStatus =
   | "branch_creation_failed"
   | "commit_failed"
   | "push_failed"
-  | "pull_request_failed"
-  | "issue_comment_failed";
+  | "pull_request_failed";
 
 export type PullRequestResult = {
   status: PullRequestStatus;
@@ -162,7 +170,7 @@ export async function createFixPullRequest(
   }
 
   // --- Preconditions ----------------------------------------------------------
-  const preconditionError = await checkPreconditions(input);
+  const preconditionError = await checkPullRequestPreconditions(input);
 
   if (preconditionError) {
     return finish("precondition_failed", preconditionError);
@@ -204,9 +212,7 @@ export async function createFixPullRequest(
 
     const approved = new Set(input.fixAttempt.changedFiles);
     const unexpected = staged.filter((file) => !approved.has(file));
-    const secretFiles = staged.filter((file) =>
-      SECRET_FILE_PATTERN.test(path.basename(file)),
-    );
+    const secretFiles = staged.filter((file) => isForbiddenPullRequestPath(file));
 
     if (staged.length === 0) {
       throw new Error("Nothing was staged for the fix commit.");
@@ -316,7 +322,12 @@ async function openPullRequest(
   }
 }
 
-async function checkPreconditions(input: PullRequestInput): Promise<string | null> {
+// Shared with delivery-plan capture so moving branch/PR work out of the
+// investigation pipeline does not bypass any verification, scope, workspace,
+// or regression-evidence gate enforced by the original PR flow.
+export async function checkPullRequestPreconditions(
+  input: PullRequestInput,
+): Promise<string | null> {
   if (input.fixAttempt.outcome !== "verified") {
     return `Fix outcome is "${input.fixAttempt.outcome}"; only verified fixes may open a pull request.`;
   }
@@ -395,7 +406,15 @@ async function checkPreconditions(input: PullRequestInput): Promise<string | nul
   return null;
 }
 
-async function chooseBranchName(input: PullRequestInput) {
+// Deterministic branch name for a fix attempt. The fix-attempt id suffix keys
+// the branch to one attempt of one investigation, so a delivery retry that
+// lost the recorded branch name can re-derive the same branch instead of
+// creating a second one.
+export function buildFixBranchName(input: {
+  issueNumber: number;
+  issueTitle: string;
+  fixAttemptId: string;
+}): string {
   const slug =
     input.issueTitle
       .toLowerCase()
@@ -403,9 +422,17 @@ async function chooseBranchName(input: PullRequestInput) {
       .replace(/^-+|-+$/g, "")
       .slice(0, MAX_SLUG_CHARS)
       .replace(/-+$/g, "") || "fix";
-  const shortId = input.fixAttempt.fixAttemptId.slice(-6).toLowerCase();
+  const shortId = input.fixAttemptId.slice(-6).toLowerCase();
 
-  let branch = `sherlock/fix-${input.issueNumber}-${slug}-${shortId}`;
+  return `sherlock/fix-${input.issueNumber}-${slug}-${shortId}`;
+}
+
+async function chooseBranchName(input: PullRequestInput) {
+  let branch = buildFixBranchName({
+    issueNumber: input.issueNumber,
+    issueTitle: input.issueTitle,
+    fixAttemptId: input.fixAttempt.fixAttemptId,
+  });
 
   // Never reuse an existing remote branch; add fresh entropy until unique.
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -413,7 +440,11 @@ async function chooseBranchName(input: PullRequestInput) {
       return branch;
     }
 
-    branch = `sherlock/fix-${input.issueNumber}-${slug}-${shortId}-${randomBytes(2).toString("hex")}`;
+    branch = `${buildFixBranchName({
+      issueNumber: input.issueNumber,
+      issueTitle: input.issueTitle,
+      fixAttemptId: input.fixAttempt.fixAttemptId,
+    })}-${randomBytes(2).toString("hex")}`;
   }
 
   throw new Error("Could not find a unique Sherlock branch name.");
@@ -444,13 +475,17 @@ async function remoteBranchExists(input: PullRequestInput, branch: string) {
   }
 }
 
-function buildPullRequestTitle(input: PullRequestInput) {
+export function buildPullRequestTitle(
+  input: Pick<PullRequestInput, "fixAttempt">,
+) {
   const summary = input.fixAttempt.summary ?? "Fix verified by reproduction replay";
 
   return redactSecrets(`Sherlock: ${summary}`).slice(0, 120);
 }
 
-function buildCommitMessage(input: PullRequestInput) {
+export function buildCommitMessage(
+  input: Pick<PullRequestInput, "investigationId" | "fixAttempt">,
+) {
   const summary = (input.fixAttempt.summary ?? "verified fix").replace(/\s+/g, " ").trim();
 
   return redactSecrets(
@@ -645,7 +680,12 @@ export function createGitHubRestClient(options: {
       );
 
       if (!response.ok) {
-        throw new Error(`GitHub PR lookup failed: ${response.status} ${response.statusText}`);
+        // status carries through so the worker retry classifier can tell a
+        // transient 5xx/429 from a permanent 4xx on delivery retries.
+        throw Object.assign(
+          new Error(`GitHub PR lookup failed: ${response.status} ${response.statusText}`),
+          { status: response.status },
+        );
       }
 
       const pulls = (await response.json()) as { number: number; html_url: string }[];
@@ -670,8 +710,11 @@ export function createGitHubRestClient(options: {
 
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
-        throw new Error(
-          `GitHub PR creation failed: ${response.status} ${response.statusText} ${detail.slice(0, 300)}`,
+        throw Object.assign(
+          new Error(
+            `GitHub PR creation failed: ${response.status} ${response.statusText} ${detail.slice(0, 300)}`,
+          ),
+          { status: response.status },
         );
       }
 

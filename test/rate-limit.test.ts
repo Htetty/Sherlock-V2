@@ -25,6 +25,7 @@ import {
   type WorkerDeps,
 } from "../backend/queue/process-investigation.js";
 import type { InvestigationJobPayload } from "../backend/queue/investigation-queue.js";
+import { createInMemoryDeliveryStateStore } from "../backend/services/delivery.js";
 import type { InvestigationPipelineResult } from "../backend/services/investigation.js";
 
 const noLog = () => {};
@@ -486,6 +487,14 @@ function buildWorkerDeps(
         }) as InvestigationPipelineResult),
     getInstallationToken: async () => null,
     postIssueComment: async () => {},
+    delivery: {
+      store: createInMemoryDeliveryStateStore(),
+      enqueue: async () => {},
+      createGitHubClient: () => {
+        throw new Error("The delivery GitHub client should not be used in this test.");
+      },
+      findTerminalComment: async () => false,
+    },
     log: noLog,
   };
 }
