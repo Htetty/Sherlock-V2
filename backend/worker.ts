@@ -46,6 +46,15 @@ import {
   createInvestigationConcurrencyGate,
 } from "./services/rate-limit.js";
 import {
+  asOperationalRedis,
+  cleanupResultOperationalRecord,
+  cleanupScanOperationalRecord,
+  createWorkerHeartbeat,
+  getProductionMonitoringConfig,
+  getWorkerId,
+  writeArtifactCleanupStatus,
+} from "./services/production-monitoring.js";
+import {
   describeWorkerError,
   enforceStartupChecks,
   runWorkerPreflight,
@@ -56,7 +65,11 @@ const concurrency = Math.max(
   Number(process.env.INVESTIGATION_WORKER_CONCURRENCY ?? 1) || 1,
 );
 
+const monitoringConfig = getProductionMonitoringConfig();
+const workerId = getWorkerId();
+
 const connection = createRedisConnection();
+const operationalRedis = asOperationalRedis(connection);
 
 // Reuses the GitHub App credentials (APP_ID / PRIVATE_KEY) already required
 // by the bot to mint short-lived installation tokens; secrets never travel
@@ -224,6 +237,25 @@ const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
   { connection, concurrency },
 );
 
+const workerHeartbeat = createWorkerHeartbeat({
+  redis: operationalRedis,
+  workerId,
+  intervalMs: monitoringConfig.heartbeatIntervalMs,
+  ttlMs: monitoringConfig.heartbeatTtlMs,
+  log: (message) => console.error(message),
+});
+workerHeartbeat.start();
+
+async function publishCleanupStatus(
+  record: Parameters<typeof writeArtifactCleanupStatus>[1],
+) {
+  try {
+    await writeArtifactCleanupStatus(operationalRedis, record);
+  } catch {
+    console.error("[artifact-cleanup] Redis status update failed.");
+  }
+}
+
 worker.on("completed", (job) => {
   console.log(`[queue] Job ${job.id} completed.`);
   // BullMQ has moved the job to its terminal set before this event. Cleanup
@@ -231,6 +263,9 @@ worker.on("completed", (job) => {
   // delayed, or active protects the artifacts through the activity probe.
   void artifactCleanup
     .cleanupInvestigation(job.data.investigationId)
+    .then((result) =>
+      publishCleanupStatus(cleanupResultOperationalRecord(workerId, result)),
+    )
     .catch(() => {});
 });
 
@@ -251,6 +286,11 @@ console.log(
 const stopArtifactCleanup = startArtifactCleanupScheduler({
   cleanup: artifactCleanup,
   config: artifactRetentionConfig,
+  onScanComplete: (result) => {
+    // Visibility is best-effort and must not hold the retention scheduler open
+    // during a Redis interruption.
+    void publishCleanupStatus(cleanupScanOperationalRecord(workerId, result));
+  },
 });
 
 // Graceful shutdown: worker.close() waits for active jobs, whose pipeline
@@ -268,6 +308,7 @@ async function shutdown(signal: string) {
 
   try {
     await worker.close();
+    await workerHeartbeat.stop();
     await deliveryQueue.close();
     await connection.quit();
     await deliveryQueueConnection.quit();

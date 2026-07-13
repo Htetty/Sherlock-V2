@@ -32,10 +32,17 @@
 #
 name: sherlock
 
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "${SHERLOCK_DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${SHERLOCK_DOCKER_LOG_MAX_FILES:-3}"
+
 services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *bounded-logging
     # Append-only persistence so queued/claimed jobs survive a restart.
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -53,6 +60,7 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    logging: *bounded-logging
     env_file:
       - ${SHERLOCK_ENV_FILE:-.env.production}
     environment:
@@ -87,6 +95,7 @@ services:
       context: .
       dockerfile: Dockerfile.worker
     restart: unless-stopped
+    logging: *bounded-logging
     env_file:
       - ${SHERLOCK_ENV_FILE:-.env.production}
     environment:
@@ -94,6 +103,9 @@ services:
       # Fail fast on a broken host: the preflight must pass before any job is
       # consumed. (The worker image also defaults this to true.)
       SHERLOCK_RUN_STARTUP_CHECKS: "true"
+      # Prevent the ops check from mistaking the container's /var/lib/docker
+      # for the host daemon's storage filesystem.
+      SHERLOCK_WORKER_CONTAINERIZED: "true"
       # Docker-outside-of-Docker path alignment: target containers are
       # siblings and bind-mount the clone workspace, which the daemon resolves
       # on the HOST filesystem. TMPDIR must therefore be a path that is
@@ -131,6 +143,15 @@ services:
     # Graceful shutdown drains the active job and sweeps leftover target
     # containers; give the pipeline room to finish rather than SIGKILL at 10s.
     stop_grace_period: 120s
+    # This checks the shared Redis heartbeat written by this worker instance,
+    # not merely whether its Node process still exists. It does not prove that
+    # external model/GitHub/Docker dependencies can complete an investigation.
+    healthcheck:
+      test: ["CMD", "node", "./lib/backend/worker-health.js"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
 networks:
   sandbox:

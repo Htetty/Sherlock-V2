@@ -443,6 +443,39 @@ describe("failed investigation retention", () => {
     );
   });
 
+  test("bounded scans report the oldest retained failed-artifact age", async () => {
+    const root = await temporaryRoot();
+    const investigationId = nextInvestigationId();
+    const deliveredAtMs = 1_000;
+    const nowMs = deliveredAtMs + 2 * 60 * 60_000;
+    const store = await persistState(
+      root,
+      terminalState({
+        investigationId,
+        outcome: "execution_failed",
+        deliveredAt: new Date(deliveredAtMs).toISOString(),
+      }),
+    );
+    const cleanup = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: config({ failedRetentionMs: 7 * 24 * 60 * 60_000 }),
+      now: () => nowMs,
+      log: () => {},
+    });
+
+    await expect(cleanup.scanExpired()).resolves.toMatchObject({
+      scanned: 1,
+      deleted: 0,
+      retained: 1,
+      protected: 0,
+      errors: 0,
+      oldestRetainedFailedAgeMs: nowMs - deliveredAtMs,
+      bounded: true,
+    });
+  });
+
   test("failed investigation is removed only after its delivered TTL", async () => {
     const root = await temporaryRoot();
     const investigationId = nextInvestigationId();

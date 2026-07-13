@@ -254,12 +254,21 @@ export type ArtifactCleanupStatus =
 export type ArtifactCleanupResult = {
   investigationId: string;
   status: ArtifactCleanupStatus;
+  // Safe aggregate used only for operational visibility. No artifact,
+  // repository, issue, or delivery content leaves the cleanup service.
+  retainedFailedAgeMs?: number;
 };
 
 export type ArtifactCleanupScanResult = {
+  // Root entries examined is the hard bound; scanned counts only valid
+  // Sherlock investigation directories.
   examined: number;
+  scanned: number;
   deleted: number;
+  retained: number;
+  protected: number;
   errors: number;
+  oldestRetainedFailedAgeMs: number | null;
   bounded: boolean;
 };
 
@@ -328,16 +337,25 @@ export function createArtifactCleanupService(
         }
 
         const state = await options.deliveryStore.load(investigationId);
+        const currentTime = now();
         const expiry = state ? artifactExpiry(state, config) : null;
+        const retainedFailedAgeMs = state
+          ? failedArtifactAge(state, currentTime)
+          : null;
+        const retained = (status: ArtifactCleanupStatus) => ({
+          investigationId,
+          status,
+          ...(retainedFailedAgeMs === null ? {} : { retainedFailedAgeMs }),
+        });
 
         if (!state || expiry === null) {
-          return { investigationId, status: "not_terminal" };
+          return retained("not_terminal");
         }
-        if (now() < expiry) {
-          return { investigationId, status: "not_expired" };
+        if (currentTime < expiry) {
+          return retained("not_expired");
         }
         if (await snapshot.isProtected(state)) {
-          return { investigationId, status: "protected" };
+          return retained("protected");
         }
 
         await removeDirectory(target);
@@ -366,7 +384,7 @@ export function createArtifactCleanupService(
 
     async scanExpired() {
       if (scanRunning) {
-        return { examined: 0, deleted: 0, errors: 0, bounded: true };
+        return emptyScanResult();
       }
       scanRunning = true;
 
@@ -376,7 +394,7 @@ export function createArtifactCleanupService(
           snapshot = await options.protection.snapshot();
         } catch {
           safeLog(log, null, "activity snapshot unavailable; scan skipped");
-          return { examined: 0, deleted: 0, errors: 1, bounded: false };
+          return emptyScanResult({ errors: 1, bounded: false });
         }
 
         let directory;
@@ -384,20 +402,24 @@ export function createArtifactCleanupService(
           const rootInfo = await lstat(rootDir);
           if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
             safeLog(log, null, "artifact root is unsafe; scan skipped");
-            return { examined: 0, deleted: 0, errors: 1, bounded: false };
+            return emptyScanResult({ errors: 1, bounded: false });
           }
           directory = await opendir(rootDir);
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-            return { examined: 0, deleted: 0, errors: 0, bounded: true };
+            return emptyScanResult();
           }
           safeLog(log, null, "artifact root unavailable; scan skipped");
-          return { examined: 0, deleted: 0, errors: 1, bounded: false };
+          return emptyScanResult({ errors: 1, bounded: false });
         }
 
         let examined = 0;
+        let scanned = 0;
         let deleted = 0;
+        let retained = 0;
+        let protectedCount = 0;
         let errors = 0;
+        let oldestRetainedFailedAgeMs: number | null = null;
         let bounded = true;
 
         for await (const entry of directory) {
@@ -410,22 +432,58 @@ export function createArtifactCleanupService(
           if (!isInvestigationId(entry.name) || !entry.isDirectory()) {
             continue;
           }
+          scanned += 1;
 
           const result = await cleanupInvestigationWithSnapshot(
             entry.name,
             snapshot,
           );
           if (result.status === "deleted") deleted += 1;
+          if (result.status !== "deleted" && result.status !== "missing") {
+            retained += 1;
+          }
+          if (result.status === "protected") protectedCount += 1;
           if (result.status === "error" || result.status === "unsafe") errors += 1;
+          if (result.retainedFailedAgeMs !== undefined) {
+            oldestRetainedFailedAgeMs = Math.max(
+              oldestRetainedFailedAgeMs ?? 0,
+              result.retainedFailedAgeMs,
+            );
+          }
         }
-        return { examined, deleted, errors, bounded };
+        return {
+          examined,
+          scanned,
+          deleted,
+          retained,
+          protected: protectedCount,
+          errors,
+          oldestRetainedFailedAgeMs,
+          bounded,
+        };
       } catch {
         safeLog(log, null, "scan failed; artifacts retained");
-        return { examined: 0, deleted: 0, errors: 1, bounded: false };
+        return emptyScanResult({ errors: 1, bounded: false });
       } finally {
         scanRunning = false;
       }
     },
+  };
+}
+
+function emptyScanResult(
+  overrides: Partial<ArtifactCleanupScanResult> = {},
+): ArtifactCleanupScanResult {
+  return {
+    examined: 0,
+    scanned: 0,
+    deleted: 0,
+    retained: 0,
+    protected: 0,
+    errors: 0,
+    oldestRetainedFailedAgeMs: null,
+    bounded: true,
+    ...overrides,
   };
 }
 
@@ -462,6 +520,20 @@ function artifactExpiry(
   }
 
   return null;
+}
+
+function failedArtifactAge(state: DeliveryState, nowMs: number): number | null {
+  if (
+    !RETAINED_FAILURE_OUTCOMES.has(state.executionOutcome) ||
+    state.fixVerified ||
+    state.terminalComment.status !== "posted" ||
+    !state.terminalComment.postedAt
+  ) {
+    return null;
+  }
+
+  const deliveredAt = Date.parse(state.terminalComment.postedAt);
+  return Number.isFinite(deliveredAt) ? Math.max(0, nowMs - deliveredAt) : null;
 }
 
 async function resolveSafeInvestigationDirectory(
@@ -535,11 +607,19 @@ function safeLog(
 export function startArtifactCleanupScheduler(input: {
   cleanup: ArtifactCleanupService;
   config: ArtifactRetentionConfig;
+  onScanComplete?: (
+    result: ArtifactCleanupScanResult,
+  ) => void | Promise<void>;
 }): () => void {
+  const scan = async () => {
+    const result = await input.cleanup.scanExpired();
+    await input.onScanComplete?.(result);
+  };
+
   if (input.config.cleanupOnStartup) {
     // Startup must never wait for filesystem or Redis cleanup. The scan is
     // bounded, fail-closed, and deliberately detached from worker creation.
-    void input.cleanup.scanExpired().catch(() => {});
+    void scan().catch(() => {});
   }
 
   if (input.config.cleanupIntervalMs <= 0) {
@@ -547,7 +627,7 @@ export function startArtifactCleanupScheduler(input: {
   }
 
   const timer = setInterval(() => {
-    void input.cleanup.scanExpired().catch(() => {});
+    void scan().catch(() => {});
   }, input.config.cleanupIntervalMs);
   timer.unref();
 

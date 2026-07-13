@@ -43,6 +43,14 @@ Required environment variables (values are never printed by any check):
 - `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` — maximum artifact-root entries
   and pending queue jobs considered by one scan (default `250`; excess queue
   state makes cleanup retain everything)
+- `SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS`,
+  `SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS`, and
+  `SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS` — shared Redis heartbeat timing
+  (defaults `15`, `45`, and `60`; interval must remain below max age below TTL)
+- `SHERLOCK_QUEUE_MAX_WAIT_AGE_SECONDS` — oldest-waiting warning threshold
+  used by the production ops check (default `600`)
+- `SHERLOCK_DISK_WARNING_PERCENT` and `SHERLOCK_DISK_CRITICAL_PERCENT` —
+  filesystem thresholds (defaults `80` and `90`)
 - `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable
   investigation-state persistence (see "Investigation state store" below).
   When `supabase`, also set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
@@ -64,6 +72,28 @@ default) runs the preflight before the BullMQ worker is created; if a
 mandatory check fails, the process exits nonzero **before consuming any
 job**. Asynchronous Redis/worker errors are logged through a redacting
 error handler instead of failing silently.
+
+## Runtime health and production checks
+
+Every worker writes a small per-instance heartbeat to shared Redis with a TTL.
+The Compose healthcheck runs `npm run worker:health`, which requires the
+current container's own heartbeat to be fresh; a live-but-stuck process or a
+worker that cannot update Redis therefore does not stay healthy forever.
+Graceful shutdown removes only the record owned by that process, and a crash
+leaves a record that expires. Replica hostnames keep scaled workers separate.
+
+Run `npm run ops:check:prod` inside the worker container for a safe combined
+report covering API liveness, Redis, all worker heartbeats, queue counts and
+oldest waiting/delayed ages, artifact/data/temp/root filesystem capacity, and
+the most recent Phase 2 cleanup counters. A critical required filesystem,
+missing fresh heartbeat, unreachable API/Redis, or unavailable queue fails
+nonzero. Optional host Docker storage is reported unavailable unless a
+trustworthy host path is mounted and configured with
+`SHERLOCK_DOCKER_STORAGE_PATH`.
+
+These checks do not call GitHub or Anthropic, start Docker workloads, read job
+payloads/artifact contents, or prove a full investigation can succeed. Use the
+deployment runbook's controlled end-to-end investigation for that evidence.
 
 ## Building and running the production image
 

@@ -113,6 +113,11 @@ Both services load this one file (`env_file`). Names by service:
 | `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` | | ✓ | optional bounded scan interval; default `60` |
 | `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` | | ✓ | optional detached startup scan; default `true` |
 | `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` | | ✓ | optional scan bound; default `250` |
+| `SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS` | | ✓ | optional Redis heartbeat interval; default `15` |
+| `SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | | ✓ | optional freshness limit; default `45` |
+| `SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS` | | ✓ | optional Redis expiry; default `60` |
+| `SHERLOCK_QUEUE_MAX_WAIT_AGE_SECONDS` | | ✓ | optional queue backlog warning age; default `600` |
+| `SHERLOCK_DISK_WARNING_PERCENT` / `SHERLOCK_DISK_CRITICAL_PERCENT` | | ✓ | optional filesystem thresholds; defaults `80` / `90` |
 | `WEBHOOK_PROXY_URL` | ✓ | | smee relay for non-public hosts; blank in prod |
 
 `NODE_ENV`, `SHERLOCK_RUN_STARTUP_CHECKS`, `TMPDIR`, and
@@ -321,6 +326,8 @@ doctor/smoke steps before anything goes live.
      node -e "fetch('http://127.0.0.1:4000/readyz').then(r=>r.text()).then(console.log)"
    # deep worker host check
    docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run worker:check
+   # concise API/Redis/worker/queue/storage/cleanup state
+   docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run ops:check:prod
    # redis health
    docker compose --env-file .env.production -f docker-compose.prod.yml exec redis redis-cli ping
    # recent logs (see Operating below for follow mode)
@@ -328,7 +335,7 @@ doctor/smoke steps before anything goes live.
    docker compose --env-file .env.production -f docker-compose.prod.yml logs --tail=100 worker
    ```
 
-   Expected: `ps` shows redis/api `healthy` and the worker running, `/readyz`
+   Expected: `ps` shows redis/api/worker `healthy`, `/readyz`
    returns ready, redis answers `PONG`, api logs show webhook deliveries once
    the App is pointed at the host, and worker logs show
    `PASS worker preflight`.
@@ -369,6 +376,47 @@ instead of exposing a URL.
 All commands below use the production env file; on a staging host substitute
 `--env-file .env.staging` (or use the `sherlock-compose` alias from
 [Required environment variables](#required-environment-variables)).
+
+**Production state check**
+
+```sh
+docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run ops:check:prod
+```
+
+Run this after every deploy and on a five-minute schedule from the host. It
+prints only fixed labels, counts, ages, percentages, and PASS/WARN/FAIL. FAIL
+exits nonzero; WARN stays zero so an operator can distinguish urgent outages
+from capacity and backlog signals. It never reads queue payloads, artifact
+contents, environment values, or API response bodies.
+
+The signals answer different questions: `/healthz` proves the API process is
+serving; Redis PING proves the shared queue store responds; the expiring
+per-worker heartbeat proves a worker recently reached Redis; queue age and
+disk/cleanup status expose accumulating operational risk. None proves GitHub,
+Anthropic, Docker, a customer repository, and its tests can complete an
+investigation. Keep a controlled end-to-end investigation in the release
+procedure.
+
+Operator response:
+
+- **Missing/stale heartbeat:** inspect `docker compose ... ps worker` and the
+  worker's recent logs. Check Redis reachability and startup preflight before
+  restarting it. A stopped worker's record expires automatically.
+- **Old waiting work:** first verify a fresh heartbeat and active count, then
+  inspect worker capacity and delayed jobs. Scale only after ruling out a
+  repeatedly failing dependency or intentionally delayed retries.
+- **Disk warning/critical:** stop adding load at critical usage, inspect the
+  named volume/host filesystem and cleanup counters, and add capacity or fix
+  cleanup failures. Do not bulk-delete artifact directories; retention
+  protects active and incompletely delivered investigations.
+- **Cleanup warning:** use the last-run age, scanned/deleted/retained/protected/
+  failure counts, and oldest retained failure age to distinguish an idle
+  system from a failed or bounded scan. Cleanup uncertainty retains data.
+
+Docker Compose rotates each service's local `json-file` logs at 10 MB with
+three files by default. `SHERLOCK_DOCKER_LOG_MAX_SIZE` and
+`SHERLOCK_DOCKER_LOG_MAX_FILES` tune those bounds through `--env-file`; remote
+log shipping and host capacity alerts remain operator responsibilities.
 
 **Logs**
 

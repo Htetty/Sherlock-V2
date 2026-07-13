@@ -1,0 +1,681 @@
+// Lightweight, payload-free operational signals for the hosted worker.
+// Redis records contain only worker identity, timestamps, and bounded cleanup
+// counters. Queue inspection reads counts and job timestamps only; job data is
+// never returned or formatted.
+
+import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
+import type { StatsFs } from "node:fs";
+import type { Queue } from "bullmq";
+import type { Redis } from "ioredis";
+import type {
+  ArtifactCleanupResult,
+  ArtifactCleanupScanResult,
+} from "./artifact-retention.js";
+
+export const WORKER_HEARTBEAT_KEY_PREFIX =
+  "sherlock:ops:worker-heartbeat:";
+export const ARTIFACT_CLEANUP_STATUS_KEY_PREFIX =
+  "sherlock:ops:artifact-cleanup:";
+
+const SAFE_WORKER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const MAX_OPERATIONAL_RECORD_BYTES = 4_096;
+const MAX_OPERATIONAL_RECORDS = 100;
+const MAX_SCAN_ITERATIONS = 20;
+const HEARTBEAT_DELETE_SCRIPT = `
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+`;
+
+export type OperationalRedis = {
+  ping(): Promise<string>;
+  set(
+    key: string,
+    value: string,
+    expiryMode: "PX",
+    ttlMs: number,
+  ): Promise<unknown>;
+  get(key: string): Promise<string | null>;
+  eval(
+    script: string,
+    numKeys: number,
+    ...args: (string | number)[]
+  ): Promise<unknown>;
+  scan(
+    cursor: string,
+    match: "MATCH",
+    pattern: string,
+    count: "COUNT",
+    countValue: number,
+  ): Promise<[string, string[]]>;
+  mget(...keys: string[]): Promise<Array<string | null>>;
+};
+
+export function asOperationalRedis(redis: Redis): OperationalRedis {
+  return redis as unknown as OperationalRedis;
+}
+
+export type ProductionMonitoringConfig = {
+  heartbeatIntervalMs: number;
+  heartbeatTtlMs: number;
+  heartbeatMaxAgeMs: number;
+  queueMaxWaitingAgeMs: number;
+  diskWarningPercent: number;
+  diskCriticalPercent: number;
+  cleanupStatusMaxAgeMs: number;
+  requestTimeoutMs: number;
+};
+
+export const PRODUCTION_MONITORING_DEFAULTS = {
+  heartbeatIntervalMs: 15_000,
+  heartbeatTtlMs: 60_000,
+  heartbeatMaxAgeMs: 45_000,
+  queueMaxWaitingAgeMs: 10 * 60_000,
+  diskWarningPercent: 80,
+  diskCriticalPercent: 90,
+  cleanupStatusMaxAgeMs: 3 * 60 * 60_000,
+  requestTimeoutMs: 5_000,
+} as const;
+
+export function getProductionMonitoringConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): ProductionMonitoringConfig {
+  const heartbeatIntervalMs = seconds(
+    env,
+    "SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS",
+    PRODUCTION_MONITORING_DEFAULTS.heartbeatIntervalMs,
+  );
+  const heartbeatTtlMs = seconds(
+    env,
+    "SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS",
+    PRODUCTION_MONITORING_DEFAULTS.heartbeatTtlMs,
+  );
+  const heartbeatMaxAgeMs = seconds(
+    env,
+    "SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS",
+    PRODUCTION_MONITORING_DEFAULTS.heartbeatMaxAgeMs,
+  );
+  const diskWarningPercent = percentage(
+    env,
+    "SHERLOCK_DISK_WARNING_PERCENT",
+    PRODUCTION_MONITORING_DEFAULTS.diskWarningPercent,
+  );
+  const diskCriticalPercent = percentage(
+    env,
+    "SHERLOCK_DISK_CRITICAL_PERCENT",
+    PRODUCTION_MONITORING_DEFAULTS.diskCriticalPercent,
+  );
+
+  if (heartbeatIntervalMs >= heartbeatMaxAgeMs) {
+    throw new Error(
+      "SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS must be lower than SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS.",
+    );
+  }
+  if (heartbeatMaxAgeMs >= heartbeatTtlMs) {
+    throw new Error(
+      "SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS must be lower than SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS.",
+    );
+  }
+  if (diskWarningPercent >= diskCriticalPercent) {
+    throw new Error(
+      "SHERLOCK_DISK_WARNING_PERCENT must be lower than SHERLOCK_DISK_CRITICAL_PERCENT.",
+    );
+  }
+
+  return {
+    heartbeatIntervalMs,
+    heartbeatTtlMs,
+    heartbeatMaxAgeMs,
+    queueMaxWaitingAgeMs: seconds(
+      env,
+      "SHERLOCK_QUEUE_MAX_WAIT_AGE_SECONDS",
+      PRODUCTION_MONITORING_DEFAULTS.queueMaxWaitingAgeMs,
+    ),
+    diskWarningPercent,
+    diskCriticalPercent,
+    cleanupStatusMaxAgeMs: minutes(
+      env,
+      "SHERLOCK_CLEANUP_STATUS_MAX_AGE_MINUTES",
+      PRODUCTION_MONITORING_DEFAULTS.cleanupStatusMaxAgeMs,
+    ),
+    requestTimeoutMs: seconds(
+      env,
+      "SHERLOCK_OPS_REQUEST_TIMEOUT_SECONDS",
+      PRODUCTION_MONITORING_DEFAULTS.requestTimeoutMs,
+    ),
+  };
+}
+
+function seconds(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallbackMs: number,
+): number {
+  return positiveNumber(env[key], key, fallbackMs / 1_000) * 1_000;
+}
+
+function minutes(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallbackMs: number,
+): number {
+  return positiveNumber(env[key], key, fallbackMs / 60_000) * 60_000;
+}
+
+function percentage(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallback: number,
+): number {
+  const value = positiveNumber(env[key], key, fallback);
+  if (value > 100) {
+    throw new Error(`${key} must be at most 100.`);
+  }
+  return value;
+}
+
+function positiveNumber(
+  value: string | undefined,
+  key: string,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${key} must be a positive number.`);
+  }
+  return parsed;
+}
+
+export function getWorkerId(
+  env: NodeJS.ProcessEnv = process.env,
+  host: () => string = hostname,
+): string {
+  const workerId = env.SHERLOCK_WORKER_ID?.trim() || host();
+  if (!SAFE_WORKER_ID.test(workerId)) {
+    throw new Error(
+      "SHERLOCK_WORKER_ID must contain only letters, numbers, dot, underscore, or hyphen (maximum 100 characters).",
+    );
+  }
+  return workerId;
+}
+
+export type WorkerHeartbeatRecord = {
+  version: 1;
+  workerId: string;
+  ownerId: string;
+  startedAt: string;
+  updatedAt: string;
+};
+
+export type WorkerHeartbeatController = {
+  start(): void;
+  beat(): Promise<boolean>;
+  stop(): Promise<void>;
+};
+
+export function createWorkerHeartbeat(input: {
+  redis: OperationalRedis;
+  workerId: string;
+  intervalMs: number;
+  ttlMs: number;
+  now?: () => number;
+  log?: (message: string) => void;
+}): WorkerHeartbeatController {
+  if (!SAFE_WORKER_ID.test(input.workerId)) {
+    throw new Error("Unsafe worker identifier.");
+  }
+  if (input.intervalMs <= 0 || input.ttlMs <= input.intervalMs) {
+    throw new Error("Worker heartbeat TTL must exceed its interval.");
+  }
+
+  const now = input.now ?? Date.now;
+  const log = input.log ?? (() => {});
+  const key = `${WORKER_HEARTBEAT_KEY_PREFIX}${input.workerId}`;
+  const ownerId = randomUUID();
+  const startedAt = new Date(now()).toISOString();
+  let lastValue: string | null = null;
+  let timer: NodeJS.Timeout | null = null;
+  let stopped = false;
+  let pending: Promise<boolean> | null = null;
+
+  const write = async () => {
+    if (stopped) return false;
+    const record: WorkerHeartbeatRecord = {
+      version: 1,
+      workerId: input.workerId,
+      ownerId,
+      startedAt,
+      updatedAt: new Date(now()).toISOString(),
+    };
+    const value = JSON.stringify(record);
+    try {
+      await input.redis.set(key, value, "PX", input.ttlMs);
+      lastValue = value;
+      return true;
+    } catch {
+      log(`[worker-heartbeat:${input.workerId}] Redis update failed.`);
+      return false;
+    }
+  };
+
+  const beat = () => {
+    // Coalesce timer ticks while Redis is unavailable. A reconnect must not
+    // release an unbounded chain of stale heartbeat writes.
+    if (pending) return pending;
+    pending = write().finally(() => {
+      pending = null;
+    });
+    return pending;
+  };
+
+  return {
+    start() {
+      if (timer || stopped) return;
+      void beat();
+      timer = setInterval(() => void beat(), input.intervalMs);
+      timer.unref();
+    },
+    beat,
+    async stop() {
+      if (stopped) return;
+      stopped = true;
+      if (timer) clearInterval(timer);
+      timer = null;
+      await pending?.catch(() => false);
+      if (lastValue) {
+        await input.redis
+          .eval(HEARTBEAT_DELETE_SCRIPT, 1, key, lastValue)
+          .catch(() => {});
+      }
+    },
+  };
+}
+
+function parseHeartbeat(value: string | null): WorkerHeartbeatRecord | null {
+  if (!value || Buffer.byteLength(value, "utf8") > MAX_OPERATIONAL_RECORD_BYTES) {
+    return null;
+  }
+  try {
+    const record = JSON.parse(value) as Partial<WorkerHeartbeatRecord>;
+    if (
+      record.version !== 1 ||
+      typeof record.workerId !== "string" ||
+      !SAFE_WORKER_ID.test(record.workerId) ||
+      typeof record.ownerId !== "string" ||
+      record.ownerId.length > 100 ||
+      typeof record.startedAt !== "string" ||
+      !Number.isFinite(Date.parse(record.startedAt)) ||
+      typeof record.updatedAt !== "string" ||
+      !Number.isFinite(Date.parse(record.updatedAt))
+    ) {
+      return null;
+    }
+    return record as WorkerHeartbeatRecord;
+  } catch {
+    return null;
+  }
+}
+
+export type WorkerHeartbeatSummary = {
+  total: number;
+  fresh: number;
+  stale: number;
+  oldestAgeMs: number | null;
+  truncated: boolean;
+};
+
+export async function readWorkerHeartbeatSummary(
+  redis: OperationalRedis,
+  options: { now?: () => number; maxAgeMs: number },
+): Promise<WorkerHeartbeatSummary> {
+  const now = options.now ?? Date.now;
+  const { values, truncated } = await scanOperationalValues(
+    redis,
+    WORKER_HEARTBEAT_KEY_PREFIX,
+  );
+  let fresh = 0;
+  let stale = 0;
+  let oldestAgeMs: number | null = null;
+
+  for (const value of values) {
+    const record = parseHeartbeat(value);
+    const updatedAt = record ? Date.parse(record.updatedAt) : Number.NaN;
+    const age = Number.isFinite(updatedAt) ? now() - updatedAt : Number.NaN;
+    if (record && age >= 0 && age <= options.maxAgeMs) {
+      fresh += 1;
+      oldestAgeMs = Math.max(oldestAgeMs ?? 0, age);
+    } else {
+      stale += 1;
+    }
+  }
+
+  return {
+    total: values.length,
+    fresh,
+    stale,
+    oldestAgeMs,
+    truncated,
+  };
+}
+
+export async function readWorkerHeartbeat(
+  redis: OperationalRedis,
+  workerId: string,
+  options: { now?: () => number; maxAgeMs: number },
+): Promise<{ healthy: boolean; ageMs: number | null }> {
+  if (!SAFE_WORKER_ID.test(workerId)) {
+    return { healthy: false, ageMs: null };
+  }
+  const value = await redis.get(`${WORKER_HEARTBEAT_KEY_PREFIX}${workerId}`);
+  const record = parseHeartbeat(value);
+  if (!record || record.workerId !== workerId) {
+    return { healthy: false, ageMs: null };
+  }
+  const ageMs = (options.now ?? Date.now)() - Date.parse(record.updatedAt);
+  return {
+    healthy: ageMs >= 0 && ageMs <= options.maxAgeMs,
+    ageMs: ageMs >= 0 ? ageMs : null,
+  };
+}
+
+export type QueueOperationalSummary = {
+  waiting: number;
+  active: number;
+  delayed: number;
+  completed: number;
+  failed: number;
+  oldestWaitingAgeMs: number | null;
+  oldestDelayedAgeMs: number | null;
+};
+
+export async function readQueueOperationalSummary(
+  queue: Pick<Queue, "getJobCounts" | "getJobs">,
+  now: () => number = Date.now,
+): Promise<QueueOperationalSummary> {
+  const counts = await queue.getJobCounts(
+    "waiting",
+    "active",
+    "delayed",
+    "completed",
+    "failed",
+  );
+  const waiting = Number(counts.waiting ?? 0);
+  const delayed = Number(counts.delayed ?? 0);
+  const [oldestWaiting, oldestDelayed] = await Promise.all([
+    waiting > 0 ? queue.getJobs("waiting", 0, 0, true) : Promise.resolve([]),
+    delayed > 0 ? queue.getJobs("delayed", 0, 0, true) : Promise.resolve([]),
+  ]);
+
+  return {
+    waiting,
+    active: Number(counts.active ?? 0),
+    delayed,
+    completed: Number(counts.completed ?? 0),
+    failed: Number(counts.failed ?? 0),
+    oldestWaitingAgeMs: jobAge(oldestWaiting[0]?.timestamp, now()),
+    oldestDelayedAgeMs: jobAge(oldestDelayed[0]?.timestamp, now()),
+  };
+}
+
+function jobAge(timestamp: unknown, nowMs: number): number | null {
+  return typeof timestamp === "number" && Number.isFinite(timestamp)
+    ? Math.max(0, nowMs - timestamp)
+    : null;
+}
+
+export type FilesystemTarget = {
+  name: string;
+  path: string | null;
+  optional: boolean;
+};
+
+export type FilesystemUsage = {
+  name: string;
+  optional: boolean;
+  available: boolean;
+  usedPercent: number | null;
+};
+
+export type FilesystemUsageAdapter = {
+  statfs(path: string): Promise<Pick<StatsFs, "blocks" | "bavail" | "bsize">>;
+};
+
+export async function readFilesystemUsage(
+  targets: FilesystemTarget[],
+  adapter: FilesystemUsageAdapter,
+): Promise<FilesystemUsage[]> {
+  return Promise.all(
+    targets.map(async (target) => {
+      if (!target.path) {
+        return {
+          name: target.name,
+          optional: target.optional,
+          available: false,
+          usedPercent: null,
+        };
+      }
+      try {
+        const stats = await adapter.statfs(target.path);
+        const blocks = Number(stats.blocks);
+        const available = Number(stats.bavail);
+        if (!Number.isFinite(blocks) || blocks <= 0 || !Number.isFinite(available)) {
+          throw new Error("Invalid filesystem statistics.");
+        }
+        const usedPercent = Math.max(
+          0,
+          Math.min(100, ((blocks - available) / blocks) * 100),
+        );
+        return {
+          name: target.name,
+          optional: target.optional,
+          available: true,
+          usedPercent,
+        };
+      } catch {
+        return {
+          name: target.name,
+          optional: target.optional,
+          available: false,
+          usedPercent: null,
+        };
+      }
+    }),
+  );
+}
+
+export type ArtifactCleanupOperationalRecord = {
+  version: 1;
+  workerId: string;
+  ranAt: string;
+  kind: "scan" | "completed-job";
+  scanned: number;
+  deleted: number;
+  retained: number;
+  protected: number;
+  failures: number;
+  bounded: boolean;
+  oldestRetainedFailedAgeMs: number | null;
+};
+
+export function cleanupScanOperationalRecord(
+  workerId: string,
+  result: ArtifactCleanupScanResult,
+  now: () => number = Date.now,
+): ArtifactCleanupOperationalRecord {
+  return {
+    version: 1,
+    workerId,
+    ranAt: new Date(now()).toISOString(),
+    kind: "scan",
+    scanned: result.scanned,
+    deleted: result.deleted,
+    retained: result.retained,
+    protected: result.protected,
+    failures: result.errors,
+    bounded: result.bounded,
+    oldestRetainedFailedAgeMs: result.oldestRetainedFailedAgeMs,
+  };
+}
+
+export function cleanupResultOperationalRecord(
+  workerId: string,
+  result: ArtifactCleanupResult,
+  now: () => number = Date.now,
+): ArtifactCleanupOperationalRecord {
+  const retained =
+    result.status !== "deleted" && result.status !== "missing" ? 1 : 0;
+  return {
+    version: 1,
+    workerId,
+    ranAt: new Date(now()).toISOString(),
+    kind: "completed-job",
+    scanned: result.status === "missing" ? 0 : 1,
+    deleted: result.status === "deleted" ? 1 : 0,
+    retained,
+    protected: result.status === "protected" ? 1 : 0,
+    failures:
+      result.status === "error" || result.status === "unsafe" ? 1 : 0,
+    bounded: true,
+    oldestRetainedFailedAgeMs: result.retainedFailedAgeMs ?? null,
+  };
+}
+
+export async function writeArtifactCleanupStatus(
+  redis: OperationalRedis,
+  record: ArtifactCleanupOperationalRecord,
+  ttlMs = 24 * 60 * 60_000,
+): Promise<void> {
+  if (!SAFE_WORKER_ID.test(record.workerId) || ttlMs <= 0) {
+    throw new Error("Invalid cleanup status record.");
+  }
+  const value = JSON.stringify(record);
+  if (Buffer.byteLength(value, "utf8") > MAX_OPERATIONAL_RECORD_BYTES) {
+    throw new Error("Cleanup status record is too large.");
+  }
+  await redis.set(
+    `${ARTIFACT_CLEANUP_STATUS_KEY_PREFIX}${record.workerId}`,
+    value,
+    "PX",
+    ttlMs,
+  );
+}
+
+function parseCleanupRecord(
+  value: string | null,
+): ArtifactCleanupOperationalRecord | null {
+  if (!value || Buffer.byteLength(value, "utf8") > MAX_OPERATIONAL_RECORD_BYTES) {
+    return null;
+  }
+  try {
+    const record = JSON.parse(value) as Partial<ArtifactCleanupOperationalRecord>;
+    const counts = [
+      record.scanned,
+      record.deleted,
+      record.retained,
+      record.protected,
+      record.failures,
+    ];
+    if (
+      record.version !== 1 ||
+      typeof record.workerId !== "string" ||
+      !SAFE_WORKER_ID.test(record.workerId) ||
+      typeof record.ranAt !== "string" ||
+      !Number.isFinite(Date.parse(record.ranAt)) ||
+      (record.kind !== "scan" && record.kind !== "completed-job") ||
+      counts.some(
+        (count) =>
+          !Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > 1_000_000,
+      ) ||
+      typeof record.bounded !== "boolean" ||
+      (record.oldestRetainedFailedAgeMs !== null &&
+        (typeof record.oldestRetainedFailedAgeMs !== "number" ||
+          !Number.isFinite(record.oldestRetainedFailedAgeMs) ||
+          record.oldestRetainedFailedAgeMs < 0))
+    ) {
+      return null;
+    }
+    return record as ArtifactCleanupOperationalRecord;
+  } catch {
+    return null;
+  }
+}
+
+export type ArtifactCleanupOperationalSummary = {
+  records: number;
+  latest: ArtifactCleanupOperationalRecord | null;
+  latestAgeMs: number | null;
+  workersWithFailures: number;
+  truncated: boolean;
+};
+
+export async function readArtifactCleanupStatus(
+  redis: OperationalRedis,
+  now: () => number = Date.now,
+): Promise<ArtifactCleanupOperationalSummary> {
+  const { values, truncated } = await scanOperationalValues(
+    redis,
+    ARTIFACT_CLEANUP_STATUS_KEY_PREFIX,
+  );
+  const records = values
+    .map(parseCleanupRecord)
+    .filter((record): record is ArtifactCleanupOperationalRecord => Boolean(record));
+  const latest = records.reduce<ArtifactCleanupOperationalRecord | null>(
+    (current, record) =>
+      !current || Date.parse(record.ranAt) > Date.parse(current.ranAt)
+        ? record
+        : current,
+    null,
+  );
+  const latestAgeMs = latest
+    ? Math.max(0, now() - Date.parse(latest.ranAt))
+    : null;
+
+  return {
+    records: records.length,
+    latest,
+    latestAgeMs,
+    workersWithFailures: records.filter((record) => record.failures > 0).length,
+    truncated,
+  };
+}
+
+async function scanOperationalValues(
+  redis: OperationalRedis,
+  prefix: string,
+): Promise<{ values: Array<string | null>; truncated: boolean }> {
+  let cursor = "0";
+  let iterations = 0;
+  let truncated = false;
+  const keys = new Set<string>();
+
+  do {
+    const [nextCursor, page] = await redis.scan(
+      cursor,
+      "MATCH",
+      `${prefix}*`,
+      "COUNT",
+      Math.min(100, MAX_OPERATIONAL_RECORDS + 1),
+    );
+    cursor = nextCursor;
+    iterations += 1;
+    for (const key of page) {
+      if (!key.startsWith(prefix)) continue;
+      keys.add(key);
+      if (keys.size > MAX_OPERATIONAL_RECORDS) {
+        truncated = true;
+        break;
+      }
+    }
+    if (truncated || iterations >= MAX_SCAN_ITERATIONS) break;
+  } while (cursor !== "0");
+
+  if (cursor !== "0") truncated = true;
+  const boundedKeys = [...keys].slice(0, MAX_OPERATIONAL_RECORDS);
+  return {
+    values: boundedKeys.length > 0 ? await redis.mget(...boundedKeys) : [],
+    truncated,
+  };
+}
