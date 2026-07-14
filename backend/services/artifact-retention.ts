@@ -10,7 +10,10 @@
 import { lstat, opendir, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import type { JobType, Queue } from "bullmq";
-import { buildDeliveryJobId } from "../queue/investigation-queue.js";
+import {
+  buildDeliveryJobId,
+  buildLegacyDeliveryJobId,
+} from "../queue/investigation-queue.js";
 import { getArtifactsRoot, isInvestigationId } from "./artifacts.js";
 import {
   isFixFullyDelivered,
@@ -153,10 +156,13 @@ return 0
 `;
 
 export const ACTIVE_DELIVERY_JOB_SCRIPT = `
-if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-local terminal = redis.call('HMGET', KEYS[1], 'finishedOn', 'failedReason')
-if terminal[1] or terminal[2] then return 0 end
-return 1
+for _, key in ipairs(KEYS) do
+  if redis.call('EXISTS', key) == 1 then
+    local terminal = redis.call('HMGET', key, 'finishedOn', 'failedReason')
+    if not terminal[1] and not terminal[2] then return 1 end
+  end
+end
+return 0
 `;
 
 export function createRedisArtifactCleanupProtection(input: {
@@ -183,8 +189,9 @@ export function createRedisArtifactCleanupProtection(input: {
           const deliveryJobActive = Number(
             await input.redis.eval(
               ACTIVE_DELIVERY_JOB_SCRIPT,
-              1,
+              2,
               input.queue.toKey(buildDeliveryJobId(state.investigationId)),
+              input.queue.toKey(buildLegacyDeliveryJobId(state.investigationId)),
             ),
           );
           if (deliveryJobActive !== 0) {

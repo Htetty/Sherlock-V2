@@ -31,23 +31,25 @@ const payload: InvestigationJobPayload = {
 
 function createRedisMock() {
   const values = new Map<string, string>();
-  const setCalls: unknown[][] = [];
+  const evalCalls: unknown[][] = [];
   const redis = {
-    set: async (...args: unknown[]) => {
-      setCalls.push(args);
-      const [key, value] = args as [string, string];
-      if (values.has(key)) return null;
-      values.set(key, value);
-      return "OK";
-    },
-    eval: async (_script: string, _keys: number, key: string, value: string) => {
+    eval: async (...args: unknown[]) => {
+      evalCalls.push(args);
+      const [, keyCount, ...rest] = args as [string, number, ...string[]];
+      if (keyCount === 2) {
+        const [key, legacyKey, value] = rest;
+        if (values.has(key) || values.has(legacyKey)) return 0;
+        values.set(key, value);
+        return 1;
+      }
+      const [key, value] = rest;
       if (values.get(key) !== value) return 0;
       values.delete(key);
       return 1;
     },
     quit: async () => "OK",
   };
-  return { redis: redis as unknown as Redis, values, setCalls };
+  return { redis: redis as unknown as Redis, values, evalCalls };
 }
 
 function createQueueMock(addImpl?: () => Promise<void>) {
@@ -76,26 +78,27 @@ describe("webhook command Redis claim", () => {
   });
 
   test("claim identity, TTL, and stored data are bounded and safe", async () => {
-    const { redis, setCalls } = createRedisMock();
+    const { redis, evalCalls } = createRedisMock();
     const { queue, added } = createQueueMock();
     const adapter = createInvestigationQueueAdapter(redis, queue);
 
     await adapter.add(payload);
 
     const jobId = buildInvestigationJobId(payload);
-    expect(setCalls[0]).toEqual([
+    expect(evalCalls[0]).toEqual([
+      expect.stringContaining("EXISTS"),
+      2,
       `${WEBHOOK_COMMAND_CLAIM_PREFIX}${jobId}`,
+      expect.stringContaining(`${WEBHOOK_COMMAND_CLAIM_PREFIX}investigate_`),
       expect.any(String),
-      "EX",
       WEBHOOK_COMMAND_CLAIM_TTL_SECONDS,
-      "NX",
     ]);
     expect(WEBHOOK_COMMAND_CLAIM_TTL_SECONDS).toBe(
       INVESTIGATION_JOB_RETENTION.removeOnComplete.age,
     );
     expect(WEBHOOK_COMMAND_CLAIM_TTL_SECONDS).toBe(3 * 24 * 60 * 60);
 
-    const claimValue = String(setCalls[0][1]).toLowerCase();
+    const claimValue = String(evalCalls[0][4]).toLowerCase();
     const queuedPayload = JSON.stringify(added[0].data).toLowerCase();
     for (const secretName of ["token", "apikey", "private", "secret"]) {
       expect(claimValue).not.toContain(secretName);
@@ -119,6 +122,22 @@ describe("webhook command Redis claim", () => {
     expect(redelivery.deduplicated).toBe(true);
     expect(onClaimCalls).toBe(1);
     expect(added).toHaveLength(1);
+  });
+
+  test("an ea99a10 legacy claim prevents a duplicate during the opaque-ID upgrade", async () => {
+    const { redis, values } = createRedisMock();
+    values.set(
+      `${WEBHOOK_COMMAND_CLAIM_PREFIX}investigate_tenant-gh-2_hiimbex_testing-things_issue-1_comment-4242`,
+      "legacy-owner",
+    );
+    const { queue, added } = createQueueMock();
+    const adapter = createInvestigationQueueAdapter(redis, queue);
+
+    await expect(adapter.add(payload)).resolves.toMatchObject({
+      deduplicated: true,
+      rateLimited: false,
+    });
+    expect(added).toHaveLength(0);
   });
 
   test("enqueue failure compare-deletes its claim and permits retry", async () => {

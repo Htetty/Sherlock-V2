@@ -259,7 +259,7 @@ describe("delivery executor", () => {
     // Inspected GitHub before creating anything, and created each exactly once.
     expect(github.calls.getBranch).toBe(1);
     expect(github.calls.createBranchWithCommit).toBe(1);
-    expect(github.calls.findPullRequests).toBe(1);
+    expect(github.calls.findPullRequests).toBe(2);
     expect(github.calls.createPullRequest).toBe(1);
     // Exactly one terminal comment, truthful about the delivered PR.
     expect(comments).toHaveLength(1);
@@ -488,7 +488,7 @@ describe("delivery executor", () => {
     expect(comments).toHaveLength(0);
   });
 
-  test("transient comment failure retries and posts exactly one comment in the end", async () => {
+  test("an ambiguous comment create is attempted once and later retries fail closed", async () => {
     const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("created", {
         pullRequestNumber: 9,
@@ -506,16 +506,12 @@ describe("delivery executor", () => {
     expect(comments).toHaveLength(0);
 
     const stored = (await deliveryStore.load(INV)) ?? state;
+    expect(stored.terminalComment.createAttemptedAt).toEqual(expect.any(String));
     const retry = makeExecutorDeps({ deliveryStore });
-    const { state: delivered, complete } = await runDeliveryFromState(
-      stored,
-      retry.deps,
-      { isFinalAttempt: false },
-    );
-
-    expect(complete).toBe(true);
-    expect(delivered.terminalComment.status).toBe("posted");
-    expect(retry.comments).toHaveLength(1);
+    await expect(
+      runDeliveryFromState(stored, retry.deps, { isFinalAttempt: false }),
+    ).rejects.toBeInstanceOf(DeliveryRetryableError);
+    expect(retry.comments).toHaveLength(0);
   });
 
   test("an already-posted terminal comment (found by marker) is never duplicated", async () => {
@@ -636,6 +632,9 @@ describe("workspace-less branch reconstruction", () => {
       if (url.endsWith("/git/commits") && init?.method === "POST") {
         return Response.json({ sha: "c011117" });
       }
+      if (url.includes("/git/ref/heads/") && init?.method === undefined) {
+        return new Response(null, { status: 404 });
+      }
       if (url.endsWith("/git/refs")) {
         return Response.json({ ref: "refs/heads/sherlock/fix-42-delete" });
       }
@@ -653,6 +652,7 @@ describe("workspace-less branch reconstruction", () => {
         branch: "sherlock/fix-42-delete",
         baseCommitSha: "c0ffee123",
         message: RETRY_PAYLOAD.commitMessage,
+        authorDate: new Date(0).toISOString(),
         files: [{ path: "obsolete.mjs", contents: null, mode: "100644" }],
         expectedTreeSha: "deadcafe1",
         assertOwnership: async () => {},
@@ -793,7 +793,7 @@ describe("worker delivery decoupling", () => {
     expect(stored && isFixFullyDelivered(stored)).toBe(true);
   });
 
-  test("a transient comment failure queues a delivery-only job; the retry never reruns the pipeline", async () => {
+  test("an ambiguous comment create queues delivery-only reconciliation without rerunning the pipeline", async () => {
     const fixture = makeWorkerDeps({
       pipelineResult: verifiedPipelineResult(
         pullRequestResult("created", {
@@ -816,16 +816,15 @@ describe("worker delivery decoupling", () => {
     expect(fixture.comments).toHaveLength(0);
     expect(fixture.enqueued).toEqual([deliveryPayload]);
 
-    // The delivery job finishes the comment without touching the pipeline.
-    const result = await processDeliveryJob(
-      { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 4 } },
-      fixture.deps,
-    );
-
-    expect(result).toEqual({ investigationId: INV, outcome: "verified_fix" });
+    // The delivery retry reconciles but does not blindly create again.
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 4 } },
+        fixture.deps,
+      ),
+    ).rejects.toThrow(/acknowledgement remains ambiguous/i);
     expect(fixture.pipelineCalls()).toBe(1);
-    expect(fixture.comments).toHaveLength(1);
-    expect(fixture.comments[0]).toContain("opened a pull request");
+    expect(fixture.comments).toHaveLength(0);
   });
 
   test("unfinished PR delivery defers to the delivery job, which pushes, opens the PR, and comments once", async () => {

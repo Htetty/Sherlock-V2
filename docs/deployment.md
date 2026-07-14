@@ -109,7 +109,7 @@ Both services load this one file (`env_file`). Names by service:
 | `SHERLOCK_SANDBOX_NETWORK_POLICY` | | ✓ | `strict` (default) or `permissive` |
 | `SHERLOCK_RUN_STARTUP_CHECKS` | | ✓ | set to `true` (compose does this) to fail fast |
 | `SHERLOCK_SUCCESSFUL_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `0` after fully delivered verified fix |
-| `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `168`, measured after terminal comment delivery |
+| `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `168`, measured after terminal delivery is posted or permanently fails |
 | `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` | | ✓ | optional bounded scan interval; default `60` |
 | `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` | | ✓ | optional detached startup scan; default `true` |
 | `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` | | ✓ | optional scan bound; default `250` |
@@ -439,6 +439,13 @@ docker compose --env-file .env.production -f docker-compose.prod.yml restart wor
 The worker has a 120s stop grace period so an in-flight investigation can
 drain and its sibling containers are swept before exit; avoid `-t 0`.
 
+Do not run mixed old/new binaries during the opaque queue-ID upgrade. The
+normal single-host Compose recreate stops the old processes first and requires
+no queue drain: already-queued legacy IDs remain consumable, retained legacy
+webhook claims are checked during enqueue, and legacy delivery IDs remain
+protected from artifact cleanup. If a platform performs rolling replacement,
+stop webhook ingestion before replacing all api/worker replicas together.
+
 **Redeploy after a code change:**
 
 ```sh
@@ -478,8 +485,9 @@ docker compose --env-file .env.production -f docker-compose.prod.yml down
 
 ## Scaling workers
 
-The worker holds no ports and no per-replica state, so scale it horizontally
-on the host:
+The worker holds no ports, but delivery state and protected retry payloads are
+filesystem-coordinated. Scale it horizontally only when every replica mounts
+the same shared POSIX `ARTIFACTS_DIR` volume:
 
 ```sh
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --scale worker=3
@@ -487,12 +495,14 @@ docker compose --env-file .env.production -f docker-compose.prod.yml up -d --sca
 
 Each replica pulls from the same queue; BullMQ distributes jobs. Total
 concurrency ≈ `replicas × INVESTIGATION_WORKER_CONCURRENCY`. Replicas share the
-host Docker daemon and the `/var/tmp/sherlock` root (each job clones into its
-own subdirectory, so this is safe). Size to host CPU/RAM and Docker capacity;
-past a single host, run worker replicas on additional hosts pointed at the same
-managed Redis. Do **not** `--scale api` on a single host without changing the
-published port mapping (a fixed host port cannot be shared by replicas) — put
-api replicas behind the reverse proxy instead.
+host Docker daemon, the shared artifacts volume, and the `/var/tmp/sherlock`
+root (each job clones into its own subdirectory, so this is safe). Size to host
+CPU/RAM and Docker capacity. Managed Redis alone is not enough for multi-host
+workers: the current architecture requires one shared POSIX artifact volume
+with correct directory-rename, mode, and mtime semantics on every worker. Do **not**
+`--scale api` on a single host without changing the published port mapping (a
+fixed host port cannot be shared by replicas) — put api replicas behind the
+reverse proxy instead.
 
 ## Using managed Redis instead of the bundled service
 
@@ -531,9 +541,10 @@ internet without TLS in front.
 
 ## Known limitations of this first deployment
 
-- **Single host.** api, worker, and (bundled) Redis co-locate. Multi-host is
-  supported by pointing workers at managed Redis, but there is no orchestrator
-  manifest (Kubernetes/Nomad) yet.
+- **Single host.** api, worker, and (bundled) Redis co-locate. Multi-host workers
+  are not supported by Redis alone; all workers currently require the same
+  shared POSIX artifact volume, and there is no orchestrator manifest
+  (Kubernetes/Nomad) yet.
 - **Bundled Redis is a convenience, not production-grade.** It is single-node,
   unauthenticated (reachable only on the compose-internal network), and its
   durability is one append-only volume on the same host — a host loss loses

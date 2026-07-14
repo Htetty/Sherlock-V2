@@ -16,7 +16,7 @@ host with `npm run worker:check`.
 | Target image (`SHERLOCK_TARGET_IMAGE`, default `node:20-slim`) | base image for target containers | mandatory (pullable is enough) |
 | Redis (`REDIS_URL`, default `redis://localhost:6379`) | BullMQ queue | mandatory |
 | Playwright Chromium + native libs | reproduction browser (runs on the worker itself) | mandatory |
-| Writable `ARTIFACTS_DIR` (default `./artifacts`) | investigation evidence | mandatory |
+| Writable `ARTIFACTS_DIR` (default `./artifacts`) | investigation evidence and durable delivery state; every worker replica must mount the same shared POSIX volume | mandatory |
 | Writable `SHERLOCK_DATA_DIR` (default `~/.sherlock`) | repo memory | mandatory |
 | Writable temp dir | clone workspaces | mandatory |
 | `graphify` on PATH (`uv tool install "graphifyy[anthropic]"`) | graph repository context | optional — the pipeline degrades to heuristic context without it (WARN, not FAIL) |
@@ -203,9 +203,25 @@ Deletion eligibility is proved from the local `delivery-state.json`. A
 verified fix is eligible only after its branch is pushed, its pull request is
 created or safely reused, and its terminal issue comment is confirmed posted.
 Non-success outcomes begin their retention clock only after the terminal
-comment is posted. Pending or failed branch/PR/comment delivery, missing or
-malformed delivery state, active/delayed/waiting BullMQ work, and a live
-investigation concurrency lease all retain artifacts.
+comment is posted. A permanently failed terminal comment, or a posted terminal
+comment that truthfully records blocked/failed PR delivery, uses
+`SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` (default seven days); it is not kept
+forever. Pending delivery, missing or malformed delivery state,
+active/delayed/waiting BullMQ work, and a live investigation concurrency lease
+all retain artifacts.
+
+Delivery retries and cleanup coordinate through a short ownership-token lease
+on that shared POSIX artifact volume. This is local mutual exclusion and crash
+recovery, not an atomic fence around GitHub. Branches, pull requests, and owned
+comments are reconciled before creation and after ambiguous responses. A
+terminal-comment create with a lost acknowledgement is not blindly repeated;
+an operator may need to resolve a still-ambiguous pending delivery.
+
+The local delivery-state format remains version 2. Version-2 files written by
+commit `ea99a10` are compatible: their two bounded protected-payload references
+are integrity-checked and renamed to `protected-delivery/<sha256>` on first
+load. Older/unknown state versions fail closed; finish or explicitly migrate
+their pending deliveries with the version that created them before upgrading.
 
 The worker checks eligibility after BullMQ emits a completed event, starts one
 bounded scan without delaying worker startup, and repeats the scan at the

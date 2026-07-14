@@ -1,4 +1,12 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -128,6 +136,105 @@ describe("crash-recoverable delivery lease", () => {
 
     release.resolve();
     await active;
+  });
+
+  test.each([
+    ["claim", `.lock.claim-crashed`],
+    ["yield", `.lock.yield-crashed`],
+    ["stale recovery", `.lock.stale-crashed`],
+    ["failed recovery", `.lock.recovery-failed-crashed`],
+    ["recovery", `.lock.recovery`],
+    ["release", `.lock.release-crashed`],
+  ])("a crash during %s leaves only bounded, expiring state", async (_stage, suffix) => {
+    const artifacts = await root();
+    const lockRoot = path.join(artifacts, "_delivery-locks");
+    const stranded = path.join(lockRoot, `${INV}${suffix}`);
+    await mkdir(stranded, { recursive: true });
+    await utimes(stranded, new Date(0), new Date(0));
+
+    const store = createFileDeliveryStateStore(artifacts, {
+      ttlMs: 20,
+      heartbeatMs: 0,
+      now: () => 21,
+    });
+    await expect(store.withLock(INV, async () => "recovered")).resolves.toBe(
+      "recovered",
+    );
+    await expect(access(stranded)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("a crash during renewal expires the canonical lease and repeated recovery still progresses", async () => {
+    const artifacts = await root();
+    const lockDir = path.join(artifacts, "_delivery-locks", `${INV}.lock`);
+    await mkdir(lockDir, { recursive: true });
+    const owner = path.join(lockDir, "owner");
+    await writeFile(owner, "00000000-0000-4000-8000-000000000000", {
+      mode: 0o600,
+    });
+    await utimes(owner, new Date(0), new Date(0));
+
+    const store = createFileDeliveryStateStore(artifacts, {
+      ttlMs: 20,
+      heartbeatMs: 0,
+      now: () => 21,
+    });
+    await store.withLock(INV, async (lease) => lease.renew());
+    await store.withLock(INV, async (lease) => lease.renew());
+  });
+
+  test("a live recovery generation is never scavenged", async () => {
+    const artifacts = await root();
+    const recovery = path.join(
+      artifacts,
+      "_delivery-locks",
+      `${INV}.lock.recovery`,
+    );
+    await mkdir(recovery, { recursive: true });
+    const owner = path.join(recovery, "owner");
+    await writeFile(owner, "00000000-0000-4000-8000-000000000000", {
+      mode: 0o600,
+    });
+    await utimes(owner, new Date(15), new Date(15));
+    const store = createFileDeliveryStateStore(artifacts, {
+      ttlMs: 20,
+      heartbeatMs: 0,
+      now: () => 20,
+    });
+
+    await expect(store.withLock(INV, async () => {})).rejects.toBeInstanceOf(
+      DeliveryLockBusyError,
+    );
+    await expect(readFile(path.join(artifacts, "_delivery-locks", `${INV}.lock`, "owner"), "utf8"))
+      .resolves.toBe("00000000-0000-4000-8000-000000000000");
+  });
+
+  test("excessive temporary state fails safely and is operator-recoverable", async () => {
+    const artifacts = await root();
+    const lockRoot = path.join(artifacts, "_delivery-locks");
+    for (let index = 0; index < 17; index += 1) {
+      const temporary = path.join(
+        lockRoot,
+        `${INV}.lock.claim-crashed-${index}`,
+      );
+      await mkdir(temporary, { recursive: true });
+      await utimes(temporary, new Date(0), new Date(0));
+    }
+    const store = createFileDeliveryStateStore(artifacts, {
+      ttlMs: 20,
+      heartbeatMs: 0,
+      now: () => 21,
+    });
+    await expect(store.withLock(INV, async () => {})).rejects.toBeInstanceOf(
+      DeliveryLockBusyError,
+    );
+
+    await rm(path.join(lockRoot, `${INV}.lock.claim-crashed-16`), {
+      recursive: true,
+      force: true,
+    });
+    await expect(store.withLock(INV, async () => "recovered")).resolves.toBe(
+      "recovered",
+    );
   });
 
   test("the delivery retry horizon outlives an unrenewed production lease", () => {

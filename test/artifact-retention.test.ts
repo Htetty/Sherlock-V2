@@ -85,7 +85,7 @@ function terminalState(input: {
         },
     retryPlan: null,
     terminalPayload: {
-      path: `protected-delivery/terminal-${"a".repeat(64)}.json`,
+      path: `protected-delivery/${"a".repeat(64)}`,
       sha256: "a".repeat(64),
       sizeBytes: 10,
     },
@@ -439,7 +439,7 @@ describe("queue and concurrency protection", () => {
     ).toBe(true);
   });
 
-  test("large unrelated queue state still inspects only one safe delivery id", async () => {
+  test("large unrelated queue state inspects only current and legacy exact delivery ids", async () => {
     const evalRedis = vi.fn(async () => 0);
     const queue = {
       toKey: (value: string) => `bull:test:${value}`,
@@ -463,7 +463,7 @@ describe("queue and concurrency protection", () => {
     expect(deliveryProbe).toContain("HMGET");
     expect(deliveryProbe).not.toContain("HGETALL");
     expect(deliveryProbe).not.toContain("LPOS");
-    expect(evalRedis.mock.calls[0]?.[1]).toBe(1);
+    expect(evalRedis.mock.calls[0]?.[1]).toBe(2);
   });
 });
 

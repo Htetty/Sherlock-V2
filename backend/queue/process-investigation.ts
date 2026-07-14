@@ -76,6 +76,7 @@ export type WorkerDeps = {
     body: string;
     assertOwnership?: () => Promise<void>;
   }) => Promise<void>;
+  updateIssueComment?: DeliveryExecutorDeps["updateIssueComment"];
   reportStage?: (stage: InvestigationStage) => void | Promise<void>;
   // Lifecycle state store. Worker-level writes (queued/running before the
   // pipeline runs, and a terminal failure when setup fails before the pipeline)
@@ -99,8 +100,9 @@ export type WorkerDeps = {
       repo: string;
       issueNumber: number;
       marker: string;
+      reusableMarker: string;
       assertOwnership: () => Promise<void>;
-    }) => Promise<boolean>;
+    }) => ReturnType<DeliveryExecutorDeps["findTerminalComment"]>;
   };
   failedArtifactRetentionMs?: number;
   log?: (message: string) => void;
@@ -113,6 +115,7 @@ export type DeliveryWorkerDeps = Pick<
   WorkerDeps,
   | "getInstallationToken"
   | "postIssueComment"
+  | "updateIssueComment"
   | "stateStore"
   | "delivery"
   | "log"
@@ -125,6 +128,7 @@ function toDeliveryExecutorDeps(deps: DeliveryWorkerDeps): DeliveryExecutorDeps 
     getInstallationToken: deps.getInstallationToken,
     createGitHubClient: deps.delivery.createGitHubClient,
     postIssueComment: deps.postIssueComment,
+    updateIssueComment: deps.updateIssueComment,
     findTerminalComment: deps.delivery.findTerminalComment,
     isRetryableError: isTransientInfrastructureError,
     log: deps.log,

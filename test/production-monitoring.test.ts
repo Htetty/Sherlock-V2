@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { runOpsCheckCli } from "../backend/ops-check.js";
+import { buildInvestigationJobId } from "../backend/queue/investigation-queue.js";
 import {
   ARTIFACT_CLEANUP_STATUS_KEY_PREFIX,
   WORKER_HEARTBEAT_KEY_PREFIX,
@@ -23,6 +24,8 @@ import {
 } from "../backend/services/production-ops.js";
 
 const NOW = Date.parse("2026-07-13T12:00:00.000Z");
+const jobId = (index: number, kind: "investigate" | "deliver" = "investigate") =>
+  `${kind}_${index.toString(16).padStart(64, "0")}`;
 
 class FakeRedis implements OperationalRedis {
   readonly values = new Map<string, string>();
@@ -309,20 +312,20 @@ describe("payload-free queue summary", () => {
       }),
     };
     const redis = {
-      lrange: vi.fn().mockResolvedValue(["wait-1", "wait-2"]),
+      lrange: vi.fn().mockResolvedValue([jobId(1), jobId(2)]),
       zrange: vi.fn().mockResolvedValue([
-        "delay-1", String((NOW - 10_000) * 0x1000),
-        "delay-2", String((NOW + 10_000) * 0x1000),
-        "delay-3", String((NOW + 20_000) * 0x1000),
+        jobId(3), String((NOW - 10_000) * 0x1000),
+        jobId(4), String((NOW + 10_000) * 0x1000),
+        jobId(5), String((NOW + 20_000) * 0x1000),
       ]),
       hmget: vi.fn(async (key: string, field: string) => {
         expect(field).toBe("timestamp");
         const timestamps: Record<string, number> = {
-          "bull:test:wait-1": NOW - 70_000,
-          "bull:test:wait-2": NOW - 20_000,
-          "bull:test:delay-1": NOW - 30_000,
-          "bull:test:delay-2": NOW - 20_000,
-          "bull:test:delay-3": NOW - 10_000,
+          [`bull:test:${jobId(1)}`]: NOW - 70_000,
+          [`bull:test:${jobId(2)}`]: NOW - 20_000,
+          [`bull:test:${jobId(3)}`]: NOW - 30_000,
+          [`bull:test:${jobId(4)}`]: NOW - 20_000,
+          [`bull:test:${jobId(5)}`]: NOW - 10_000,
         };
         return [String(timestamps[key])];
       }),
@@ -401,7 +404,7 @@ describe("payload-free queue summary", () => {
       lrange: vi.fn(),
       zrange: vi
         .fn()
-        .mockResolvedValue(["delay-1", String((NOW - 5_000) * 0x1000)]),
+        .mockResolvedValue([jobId(1), String((NOW - 5_000) * 0x1000)]),
       hmget: vi.fn().mockResolvedValue([String(NOW - 600_000)]),
     };
     const summary = await readQueueOperationalSummary(
@@ -414,7 +417,7 @@ describe("payload-free queue summary", () => {
   });
 
   test("inspection is capped and reports creation ages as unproven", async () => {
-    const ids = Array.from({ length: 100 }, (_, index) => `delay-${index}`);
+    const ids = Array.from({ length: 100 }, (_, index) => jobId(index + 1));
     const entries = ids.flatMap((id, index) => [
       id,
       String((NOW + index * 1_000) * 0x1000),
@@ -465,7 +468,7 @@ describe("payload-free queue summary", () => {
       }),
     };
     const redis = {
-      lrange: vi.fn().mockResolvedValue(["wait-1"]),
+      lrange: vi.fn().mockResolvedValue([jobId(1)]),
       zrange: vi.fn(),
       hmget: vi.fn().mockResolvedValue([null]),
     };
@@ -474,6 +477,33 @@ describe("payload-free queue summary", () => {
       redis as never,
       () => NOW,
     );
+    expect(summary.waitingAgeComplete).toBe(false);
+    expect(summary.oldestWaitingAgeMs).toBeNull();
+  });
+
+  test("legacy semantic IDs are not used for metadata reads during compatibility", async () => {
+    const redis = {
+      lrange: vi.fn().mockResolvedValue([
+        "investigate_tenant-gh-2_owner_repo_issue-1_comment-2",
+      ]),
+      zrange: vi.fn(),
+      hmget: vi.fn(),
+    };
+    const summary = await readQueueOperationalSummary(
+      {
+        toKey: (value: string) => `bull:test:${value}`,
+        getJobCounts: async () => ({
+          waiting: 1,
+          active: 0,
+          delayed: 0,
+          completed: 0,
+          failed: 0,
+        }),
+      } as never,
+      redis as never,
+      () => NOW,
+    );
+    expect(redis.hmget).not.toHaveBeenCalled();
     expect(summary.waitingAgeComplete).toBe(false);
     expect(summary.oldestWaitingAgeMs).toBeNull();
   });
@@ -756,7 +786,7 @@ describe("operator command safety and failure semantics", () => {
       getJob: vi.fn(() => { throw new Error(`forbidden ${secret}`); }),
     };
     const redis = {
-      lrange: vi.fn().mockResolvedValue(["wait-1"]),
+      lrange: vi.fn().mockResolvedValue([jobId(1)]),
       zrange: vi.fn(),
       hmget: vi.fn().mockResolvedValue([String(NOW)]),
       hgetall: vi.fn(() => { throw new Error(`forbidden ${secret}`); }),
@@ -774,6 +804,64 @@ describe("operator command safety and failure semantics", () => {
     expect(queue.getJobs).not.toHaveBeenCalled();
     expect(queue.getJob).not.toHaveBeenCalled();
     expect(redis.hgetall).not.toHaveBeenCalled();
+  });
+
+  test("production-shaped identity canaries stay out of opaque IDs and monitoring output", async () => {
+    const markers = [
+      "tenant-customer-canary",
+      "owner-production-canary",
+      "repository-production-canary",
+      "884422",
+      "991177",
+      "issue-text-private-canary",
+      "github_pat_CREDENTIAL_CANARY",
+    ];
+    const jobId = buildInvestigationJobId({
+      tenantId: markers[0],
+      repositoryOwner: markers[1],
+      repositoryName: markers[2],
+      issueNumber: 884422,
+      triggeringCommentId: 991177,
+    });
+    expect(jobId).toMatch(/^investigate_[0-9a-f]{64}$/);
+    for (const marker of markers) expect(jobId).not.toContain(marker);
+
+    const summary = await readQueueOperationalSummary(
+      {
+        toKey: (value: string) => `bull:test:${value}`,
+        getJobCounts: async () => ({
+          waiting: 1,
+          active: 0,
+          delayed: 0,
+          completed: 0,
+          failed: 0,
+        }),
+      } as never,
+      {
+        lrange: async () => [jobId],
+        zrange: async () => [],
+        hmget: async (_key: string, ...fields: string[]) => {
+          expect(fields).toEqual(["timestamp"]);
+          return [String(NOW)];
+        },
+      } as never,
+      () => NOW,
+    );
+    const output = formatProductionOpsReport(
+      await runProductionOpsCheck(
+        getProductionMonitoringConfig({}),
+        baseAdapters({ queueSummary: async () => summary }),
+      ),
+    );
+    for (const marker of markers) expect(output).not.toContain(marker);
+
+    const source = readFileSync(
+      path.resolve("backend/services/production-monitoring.ts"),
+      "utf8",
+    );
+    expect(source).not.toMatch(/\.getJobs\s*\(/);
+    expect(source).not.toMatch(/\.getJob\s*\(/);
+    expect(source.toUpperCase()).not.toContain("HGETALL");
   });
 
   test("private artifact paths and contents from adapter errors are not printed", async () => {

@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 import {
+  chmod,
+  mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
+  stat,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -142,7 +147,7 @@ describe("credential-free delivery state", () => {
     expect(protectedPayload).toContain("BEGIN PRIVATE KEY");
   });
 
-  test("artifact references reject traversal and symlink escapes", async () => {
+  test("artifact references reject absolute, traversal, nested, and malformed hash paths", async () => {
     const artifacts = await root();
     const fixture = await pendingState(artifacts, [
       { path: "src/server.ts", contents: "export const ok = true;\n", mode: "100644" },
@@ -156,22 +161,114 @@ describe("credential-free delivery state", () => {
       }),
     ).rejects.toThrow(/unsafe/i);
 
-    const outside = path.join(artifacts, "outside.json");
-    await writeFile(outside, "{}\n", "utf8");
-    const link = path.join(
-      artifacts,
-      INV,
-      "protected-delivery",
-      "terminal-link.json",
-    );
-    await symlink(outside, link);
+    for (const referencePath of [
+      "/protected-delivery/" + "a".repeat(64),
+      `protected-delivery/nested/${"a".repeat(64)}`,
+      "protected-delivery/not-a-hash",
+    ]) {
+      await expect(
+        fixture.store.loadPayload(INV, {
+          path: referencePath,
+          sha256: "a".repeat(64),
+          sizeBytes: 10,
+        }),
+      ).rejects.toThrow(/unsafe/i);
+    }
     await expect(
       fixture.store.loadPayload(INV, {
-        path: "protected-delivery/terminal-link.json",
-        sha256: digest("{}\n"),
-        sizeBytes: 3,
+        path: `protected-delivery/${"a".repeat(64)}`,
+        sha256: "g".repeat(64),
+        sizeBytes: 10,
       }),
+    ).rejects.toThrow(/unsafe/i);
+  });
+
+  test("root, intermediate, and final symlinks are rejected", async () => {
+    const artifacts = await root();
+    const fixture = await pendingState(artifacts, [
+      { path: "src/server.ts", contents: "export const ok = true;\n", mode: "100644" },
+    ]);
+    const payloadDir = path.join(artifacts, INV, "protected-delivery");
+    const payloadPath = path.join(payloadDir, fixture.payload.sha256);
+
+    const outside = path.join(artifacts, "outside.json");
+    await writeFile(outside, await readFile(payloadPath), { mode: 0o600 });
+    await unlink(payloadPath);
+    await symlink(outside, payloadPath);
+    await expect(
+      fixture.store.loadPayload(INV, fixture.payload),
+    ).rejects.toThrow(/unsafe|escaped|loop/i);
+
+    await unlink(payloadPath);
+    const movedPayloadDir = path.join(artifacts, "moved-protected-delivery");
+    await rename(payloadDir, movedPayloadDir);
+    await symlink(movedPayloadDir, payloadDir);
+    await expect(
+      fixture.store.loadPayload(INV, fixture.payload),
+    ).rejects.toThrow(/unsafe/i);
+
+    const parent = await root();
+    const realArtifacts = path.join(parent, "real-artifacts");
+    const linkedArtifacts = path.join(parent, "linked-artifacts");
+    await mkdir(realArtifacts);
+    await symlink(realArtifacts, linkedArtifacts);
+    await expect(
+      createFileDeliveryStateStore(linkedArtifacts).persistPayload(
+        INV,
+        "terminal",
+        { safe: true },
+      ),
+    ).rejects.toThrow(/root|unsafe/i);
+  });
+
+  test("protected payloads require and preserve exact mode 0600", async () => {
+    const artifacts = await root();
+    const fixture = await pendingState(artifacts, [
+      { path: "src/server.ts", contents: "export const ok = true;\n", mode: "100644" },
+    ]);
+    const payloadPath = path.join(artifacts, INV, ...fixture.payload.path.split("/"));
+    expect((await stat(payloadPath)).mode & 0o777).toBe(0o600);
+    await expect(fixture.store.loadPayload(INV, fixture.payload)).resolves.toBeTruthy();
+
+    await chmod(payloadPath, 0o644);
+    await expect(
+      fixture.store.loadPayload(INV, fixture.payload),
     ).rejects.toThrow(/unsafe|changed/i);
+  });
+
+  test("ea99a10 version-2 payload names migrate to the exact hash filename", async () => {
+    const artifacts = await root();
+    const fixture = await pendingState(artifacts, [
+      { path: "src/server.ts", contents: "export const ok = true;\n", mode: "100644" },
+    ]);
+    const statePath = path.join(artifacts, INV, "delivery-state.json");
+    const rawState = JSON.parse(await readFile(statePath, "utf8"));
+    const migrations = [
+      { reference: rawState.terminalPayload, kind: "terminal" },
+      { reference: rawState.retryPlan.payload, kind: "retry" },
+    ];
+    for (const { reference, kind } of migrations) {
+      const current = path.join(artifacts, INV, ...reference.path.split("/"));
+      const legacyPath = `protected-delivery/${kind}-${reference.sha256}.json`;
+      await rename(current, path.join(artifacts, INV, ...legacyPath.split("/")));
+      reference.path = legacyPath;
+    }
+    await writeFile(statePath, `${JSON.stringify(rawState, null, 2)}\n`, {
+      mode: 0o600,
+    });
+
+    const migrated = await fixture.store.load(INV);
+    expect(migrated?.terminalPayload.path).toBe(
+      `protected-delivery/${migrated?.terminalPayload.sha256}`,
+    );
+    expect(migrated?.retryPlan?.payload.path).toBe(
+      `protected-delivery/${migrated?.retryPlan?.payload.sha256}`,
+    );
+    for (const { reference } of migrations) {
+      await expect(
+        stat(path.join(artifacts, INV, ...reference.path.split("/"))),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    }
   });
 
   test("content-addressed artifacts are integrity checked before use", async () => {

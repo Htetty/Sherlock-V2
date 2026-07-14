@@ -275,7 +275,7 @@ describe("Sherlock webhook (queued investigations)", () => {
     expect(jobIds[0]).not.toBe(jobIds[1]);
   });
 
-  test("tenant id derives from the installation and shapes the deterministic job id", () => {
+  test("tenant id derives from the installation while the deterministic job id stays opaque", () => {
     expect(deriveTenantIdFromInstallation(2)).toBe("tenant-gh-2");
     expect(deriveTenantIdFromInstallation(2)).toBe(deriveTenantIdFromInstallation(2));
 
@@ -287,9 +287,16 @@ describe("Sherlock webhook (queued investigations)", () => {
       triggeringCommentId: 4242,
     });
 
-    expect(jobId).toBe(
-      "investigate_tenant-gh-2_hiimbex_testing-things_issue-1_comment-4242",
-    );
+    expect(jobId).toMatch(/^investigate_[0-9a-f]{64}$/);
     expect(jobId).not.toContain(":");
+    for (const marker of [
+      "tenant-gh-2",
+      "hiimbex",
+      "testing-things",
+      "issue-1",
+      "comment-4242",
+    ]) {
+      expect(jobId).not.toContain(marker);
+    }
   });
 });

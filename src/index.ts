@@ -5,6 +5,7 @@
 
 import { Probot } from "probot";
 import { createInvestigationId } from "../backend/services/artifacts.js";
+import { deliveryCommentMarker } from "../backend/services/delivery.js";
 import {
   createInvestigationQueueAdapter,
   createRedisConnection,
@@ -212,7 +213,7 @@ export const createSherlockApp =
       }
 
       console.log(
-        `[${investigationId}] Queued investigation job ${jobId} (tenant ${tenantId}).`,
+        `[${investigationId}] Queued investigation job ${jobId}.`,
       );
 
       await postComment(
@@ -221,6 +222,8 @@ export const createSherlockApp =
           "",
           `Investigation: ${investigationId}`,
           "Sherlock will post results on this issue when the investigation completes.",
+          "",
+          deliveryCommentMarker(investigationId),
         ].join("\n"),
       );
     });

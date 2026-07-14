@@ -11,14 +11,17 @@
 // Anthropic calls, patch generation, regression testing, or repository
 // validation.
 //
-// Idempotency contract (per investigation):
+// Reconciliation contract (per investigation):
 //   - at most one Sherlock branch: the recorded/derived branch name is looked
 //     up on GitHub before any create;
-//   - at most one pull request: all PR states are reconciled for the exact
-//     repository, head, and base before any create;
-//   - at most one terminal issue comment: every terminal comment embeds an
-//     HTML marker, and the issue's comments are checked for that marker
-//     before posting.
+//   - one expected pull request identity: all PR states are reconciled for the
+//     exact repository, head, and base before create and after ambiguity;
+//   - terminal delivery prefers updating Sherlock's owned progress comment;
+//     a fallback create is intent-recorded and never blindly repeated.
+//
+// The POSIX lease coordinates healthy local workers. It cannot atomically
+// fence a remote GitHub request, so this module does not claim absolute remote
+// exactly-once behavior across process pauses or acknowledgement loss.
 //
 // No credentials or customer text are stored in delivery-state.json. PR text,
 // terminal-comment material, and post-patch source bytes live in separate
@@ -27,16 +30,18 @@
 
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   open,
   mkdir,
   mkdtemp,
-  readdir,
+  opendir,
   lstat,
   readFile,
+  realpath,
   rename,
   rm,
-  stat,
+  rmdir,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -173,6 +178,10 @@ export type DeliveryState = {
     status: DeliveryCommentStatus;
     postedAt: string | null;
     reason: string | null;
+    // Set before the only create request. If its acknowledgement is lost and
+    // no reusable Sherlock-owned comment exists, retries reconcile but do not
+    // blindly create another comment.
+    createAttemptedAt?: string | null;
   };
   createdAt: string;
   updatedAt: string;
@@ -326,7 +335,12 @@ export async function buildDeliveryState(
     // The retry plan is only needed while PR delivery is unfinished.
     retryPlan: pullRequest.status === "pending" ? retryPlan : null,
     terminalPayload,
-    terminalComment: { status: "pending", postedAt: null, reason: null },
+    terminalComment: {
+      status: "pending",
+      postedAt: null,
+      reason: null,
+      createAttemptedAt: null,
+    },
     createdAt: at,
     updatedAt: at,
   };
@@ -394,8 +408,8 @@ function sanitizeArtifactReference(
   if (
     !reference ||
     typeof reference.path !== "string" ||
-    path.posix.normalize(reference.path) !== reference.path ||
-    !reference.path.startsWith(`${DELIVERY_PAYLOAD_DIRECTORY}/`) ||
+    reference.path !==
+      `${DELIVERY_PAYLOAD_DIRECTORY}/${reference.sha256}` ||
     path.posix.isAbsolute(reference.path) ||
     reference.path.includes("\0") ||
     !SHA256_PATTERN.test(reference.sha256) ||
@@ -406,6 +420,27 @@ function sanitizeArtifactReference(
     return null;
   }
   return { ...reference };
+}
+
+function sanitizeLegacyArtifactReference(
+  reference: DeliveryArtifactReference,
+): DeliveryArtifactReference | null {
+  if (
+    !reference ||
+    typeof reference.path !== "string" ||
+    path.posix.isAbsolute(reference.path) ||
+    reference.path.includes("\0") ||
+    !SHA256_PATTERN.test(reference.sha256) ||
+    !Number.isSafeInteger(reference.sizeBytes) ||
+    reference.sizeBytes <= 0 ||
+    reference.sizeBytes > MAX_DELIVERY_PAYLOAD_BYTES
+  ) {
+    return null;
+  }
+  const match = reference.path.match(
+    /^protected-delivery\/(?:retry|terminal)-([0-9a-f]{64})\.json$/,
+  );
+  return match?.[1] === reference.sha256 ? { ...reference } : null;
 }
 
 function sanitizeRetryPlan(
@@ -745,6 +780,9 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
   }
 
   const state = structuredClone(value) as DeliveryState;
+  if (state.terminalComment && typeof state.terminalComment === "object") {
+    state.terminalComment.createAttemptedAt ??= null;
+  }
   if (
     state.version !== 2 ||
     !isInvestigationId(state.investigationId) ||
@@ -768,6 +806,9 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
         state.pullRequest.number <= 0)) ||
     !sanitizeArtifactReference(state.terminalPayload) ||
     !state.terminalComment ||
+    (state.terminalComment.createAttemptedAt !== null &&
+      (typeof state.terminalComment.createAttemptedAt !== "string" ||
+        !Number.isFinite(Date.parse(state.terminalComment.createAttemptedAt)))) ||
     (state.terminalComment.postedAt !== null &&
       (typeof state.terminalComment.postedAt !== "string" ||
         !Number.isFinite(Date.parse(state.terminalComment.postedAt))))
@@ -887,6 +928,22 @@ export function createFileDeliveryStateStore(
   // A lock inside the deletion target would disappear mid-critical-section
   // and permit a concurrent delivery retry to recreate state underneath it.
   const lockRoot = path.join(resolvedRoot, "_delivery-locks");
+  const ensureRoot = async () => {
+    try {
+      const info = await lstat(resolvedRoot);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new Error("Refusing an unsafe artifacts root.");
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await mkdir(resolvedRoot, { recursive: true });
+      const info = await lstat(resolvedRoot);
+      if (!info.isDirectory() || info.isSymbolicLink()) {
+        throw new Error("Refusing an unsafe artifacts root.");
+      }
+    }
+    return realpath(resolvedRoot);
+  };
   const dirFor = (investigationId: string) => {
     if (!isInvestigationId(investigationId)) {
       throw new Error("Refusing delivery-state path for unsafe investigation id.");
@@ -900,21 +957,119 @@ export function createFileDeliveryStateStore(
   };
 
   const ensureDir = async (investigationId: string) => {
+    const realRoot = await ensureRoot();
     const dir = dirFor(investigationId);
     await mkdir(dir, { recursive: true });
     const info = await lstat(dir);
     if (!info.isDirectory() || info.isSymbolicLink()) {
       throw new Error("Refusing a non-directory delivery-state location.");
     }
+    const realDir = await realpath(dir);
+    if (!realDir.startsWith(realRoot + path.sep)) {
+      throw new Error("Delivery-state path escaped the real artifacts root.");
+    }
     return dir;
   };
 
   const ensureLockRoot = async () => {
+    const realRoot = await ensureRoot();
     await mkdir(lockRoot, { recursive: true });
     const info = await lstat(lockRoot);
     if (!info.isDirectory() || info.isSymbolicLink()) {
       throw new Error("Refusing a non-directory delivery-lock location.");
     }
+    const realLocks = await realpath(lockRoot);
+    if (!realLocks.startsWith(realRoot + path.sep)) {
+      throw new Error("Delivery-lock path escaped the real artifacts root.");
+    }
+  };
+
+  const openVerifiedPayloadFile = async (
+    investigationId: string,
+    reference: DeliveryArtifactReference,
+    fileName: string,
+  ) => {
+    if (
+      fileName !== path.posix.basename(fileName) ||
+      fileName.includes("\0") ||
+      path.posix.isAbsolute(fileName)
+    ) {
+      throw new Error("Protected delivery artifact filename is unsafe.");
+    }
+
+    const realRoot = await ensureRoot();
+    const dir = dirFor(investigationId);
+    const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
+    const [dirInfo, payloadDirInfo] = await Promise.all([
+      lstat(dir),
+      lstat(payloadDir),
+    ]);
+    if (
+      !dirInfo.isDirectory() ||
+      dirInfo.isSymbolicLink() ||
+      !payloadDirInfo.isDirectory() ||
+      payloadDirInfo.isSymbolicLink()
+    ) {
+      throw new Error("Protected delivery artifact directory is unsafe.");
+    }
+
+    const [realDir, realPayloadDir] = await Promise.all([
+      realpath(dir),
+      realpath(payloadDir),
+    ]);
+    if (
+      !realDir.startsWith(realRoot + path.sep) ||
+      !realPayloadDir.startsWith(realDir + path.sep)
+    ) {
+      throw new Error("Protected delivery artifact escaped its real directory.");
+    }
+
+    const target = path.join(payloadDir, fileName);
+    const targetReal = await realpath(target);
+    if (!targetReal.startsWith(realPayloadDir + path.sep)) {
+      throw new Error("Protected delivery artifact escaped its protected directory.");
+    }
+
+    let handle;
+    try {
+      handle = await open(
+        target,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      );
+      const info = await handle.stat();
+      if (
+        !info.isFile() ||
+        (info.mode & 0o777) !== 0o600 ||
+        info.size !== reference.sizeBytes
+      ) {
+        throw new Error("Protected delivery artifact is unsafe or changed.");
+      }
+      const raw = await handle.readFile();
+      if (
+        raw.length !== reference.sizeBytes ||
+        sha256(raw) !== reference.sha256
+      ) {
+        throw new Error("Protected delivery artifact failed integrity verification.");
+      }
+      return raw;
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  };
+
+  const openVerifiedPayload = async (
+    investigationId: string,
+    reference: DeliveryArtifactReference,
+  ) => {
+    const safeReference = sanitizeArtifactReference(reference);
+    if (!safeReference) {
+      throw new Error("Protected delivery artifact reference is unsafe.");
+    }
+    return openVerifiedPayloadFile(
+      investigationId,
+      safeReference,
+      safeReference.sha256,
+    );
   };
 
   const readRecord = async <T>(
@@ -924,10 +1079,15 @@ export function createFileDeliveryStateStore(
     normalize: (value: unknown) => T,
   ): Promise<T | null> => {
     try {
+      const realRoot = await ensureRoot();
       const dir = dirFor(investigationId);
       const dirInfo = await lstat(dir);
       if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) {
         throw new Error("Refusing a non-directory delivery-state location.");
+      }
+      const realDir = await realpath(dir);
+      if (!realDir.startsWith(realRoot + path.sep)) {
+        throw new Error("Delivery-state path escaped the real artifacts root.");
       }
       const file = path.join(dir, fileName);
       const info = await lstat(file);
@@ -967,37 +1127,226 @@ export function createFileDeliveryStateStore(
     }
   };
 
-  const claimLock = async (lockDir: string, token: string) => {
-    const preparedDir = `${lockDir}.claim-${token}`;
-    await mkdir(preparedDir);
-    const preparedOwner = path.join(preparedDir, "owner");
-    let handle;
+  const migrateLegacyPayloadReference = async (
+    investigationId: string,
+    reference: DeliveryArtifactReference,
+  ): Promise<{
+    reference: DeliveryArtifactReference;
+    legacyPath: string | null;
+  }> => {
+    const current = sanitizeArtifactReference(reference);
+    if (current) return { reference: current, legacyPath: null };
+
+    const legacy = sanitizeLegacyArtifactReference(reference);
+    if (!legacy) {
+      throw new Error("Protected delivery artifact reference is unsafe.");
+    }
+    const legacyName = path.posix.basename(legacy.path);
+    const raw = await openVerifiedPayloadFile(
+      investigationId,
+      legacy,
+      legacyName,
+    );
+    const migrated = {
+      path: `${DELIVERY_PAYLOAD_DIRECTORY}/${legacy.sha256}`,
+      sha256: legacy.sha256,
+      sizeBytes: legacy.sizeBytes,
+    } satisfies DeliveryArtifactReference;
+    const dir = dirFor(investigationId);
+    const destination = path.join(
+      dir,
+      DELIVERY_PAYLOAD_DIRECTORY,
+      migrated.sha256,
+    );
     try {
-      await writeFile(preparedOwner, token, {
+      await writeFile(destination, raw, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const existing = await openVerifiedPayload(investigationId, migrated);
+    if (!existing.equals(raw)) {
+      throw new Error("Migrated protected delivery payload failed verification.");
+    }
+    return { reference: migrated, legacyPath: legacy.path };
+  };
+
+  const normalizeAndMigrateDeliveryState = async (
+    investigationId: string,
+    value: unknown,
+  ): Promise<DeliveryState> => {
+    if (!value || typeof value !== "object") {
+      return normalizeDeliveryState(value);
+    }
+    const candidate = structuredClone(value) as DeliveryState;
+    if (candidate.version !== 2 || candidate.investigationId !== investigationId) {
+      return normalizeDeliveryState(candidate);
+    }
+
+    const terminal = await migrateLegacyPayloadReference(
+      investigationId,
+      candidate.terminalPayload,
+    );
+    const retry = candidate.retryPlan
+      ? await migrateLegacyPayloadReference(
+          investigationId,
+          candidate.retryPlan.payload,
+        )
+      : null;
+    candidate.terminalPayload = terminal.reference;
+    if (candidate.retryPlan && retry) candidate.retryPlan.payload = retry.reference;
+    const normalized = normalizeDeliveryState(candidate);
+    const legacyPaths = [terminal.legacyPath, retry?.legacyPath].filter(
+      (value): value is string => value !== null && value !== undefined,
+    );
+    if (legacyPaths.length > 0) {
+      await writeRecord(investigationId, DELIVERY_STATE_FILE, normalized);
+      for (const legacyPath of legacyPaths) {
+        await unlink(
+          path.join(dirFor(investigationId), ...legacyPath.split("/")),
+        ).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
+    }
+    return normalized;
+  };
+
+  const inspectLeaseDirectory = async (directory: string) => {
+    const dirInfo = await lstat(directory).catch(() => null);
+    if (!dirInfo) return null;
+    if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) {
+      return { fresh: now() - dirInfo.mtimeMs <= lockTtlMs, valid: false };
+    }
+    const ownerPath = path.join(directory, "owner");
+    const [ownerInfo, token] = await Promise.all([
+      lstat(ownerPath).catch(() => null),
+      readFile(ownerPath, "utf8").catch(() => null),
+    ]);
+    const valid = Boolean(
+      ownerInfo?.isFile() &&
+      !ownerInfo.isSymbolicLink() &&
+      (ownerInfo.mode & 0o777) === 0o600 &&
+      typeof token === "string" &&
+      /^[0-9a-f-]{36}$/.test(token),
+    );
+    const mtimeMs = valid ? ownerInfo!.mtimeMs : dirInfo.mtimeMs;
+    return { fresh: now() - mtimeMs <= lockTtlMs, valid };
+  };
+
+  const removeExpiredLeaseDirectory = async (directory: string) => {
+    const observed = await inspectLeaseDirectory(directory);
+    if (!observed) return;
+    if (observed.fresh) {
+      throw new DeliveryLockBusyError("A live delivery lease is still present.");
+    }
+    await rm(directory, { recursive: true, force: true });
+  };
+
+  const knownTemporaryLeaseEntries = async (investigationId: string) => {
+    const currentRecovery = `${investigationId}.lock.recovery`;
+    const legacyPrefixes = [
+      `${investigationId}.lock.claim-`,
+      `${investigationId}.lock.release-`,
+      `${investigationId}.lock.yield-`,
+      `${investigationId}.lock.stale-`,
+      `${investigationId}.lock.recovery-failed-`,
+    ];
+    const matches: string[] = [];
+    let examined = 0;
+    let exhausted = true;
+    const directory = await opendir(lockRoot);
+    for await (const entry of directory) {
+      if (examined >= 512) {
+        exhausted = false;
+        break;
+      }
+      examined += 1;
+      if (
+        entry.name === currentRecovery ||
+        legacyPrefixes.some((prefix) => entry.name.startsWith(prefix))
+      ) {
+        matches.push(entry.name);
+        if (matches.length > 16) {
+          throw new DeliveryLockBusyError(
+            "Delivery lock recovery has excessive temporary state.",
+          );
+        }
+      }
+    }
+    if (!exhausted) {
+      throw new DeliveryLockBusyError(
+        "Delivery lock recovery scan reached its safety bound.",
+      );
+    }
+    return matches;
+  };
+
+  const reconcileTemporaryLeases = async (
+    investigationId: string,
+    lockDir: string,
+  ) => {
+    const entries = await knownTemporaryLeaseEntries(investigationId);
+    for (const entry of entries) {
+      const temporary = path.join(lockRoot, entry);
+      const observed = await inspectLeaseDirectory(temporary);
+      if (!observed) continue;
+      if (!observed.fresh) {
+        await removeExpiredLeaseDirectory(temporary);
+        continue;
+      }
+
+      const canonical = await inspectLeaseDirectory(lockDir);
+      if (!canonical) {
+        try {
+          await rename(temporary, lockDir);
+        } catch {
+          throw new DeliveryLockBusyError(
+            "Delivery lock recovery raced another owner.",
+          );
+        }
+      } else if (!canonical.fresh) {
+        await removeExpiredLeaseDirectory(lockDir);
+        try {
+          await rename(temporary, lockDir);
+        } catch {
+          throw new DeliveryLockBusyError(
+            "Delivery lock recovery raced another owner.",
+          );
+        }
+      }
+      throw new DeliveryLockBusyError(
+        "A live delivery lease is awaiting bounded recovery.",
+      );
+    }
+  };
+
+  const claimLock = async (lockDir: string, token: string) => {
+    await mkdir(lockDir);
+    const ownerPath = path.join(lockDir, "owner");
+    try {
+      await writeFile(ownerPath, token, {
         encoding: "utf8",
         mode: 0o600,
         flag: "wx",
       });
-      handle = await open(preparedOwner, "r+");
-      // The fully initialized lease becomes visible in one namespace change;
-      // contenders can never observe or delete a half-created owner record.
-      await rename(preparedDir, lockDir);
-      return handle;
+      return await open(ownerPath, "r+");
     } catch (error) {
-      await handle?.close().catch(() => {});
-      await rm(preparedDir, { recursive: true, force: true }).catch(() => {});
+      await rm(lockDir, { recursive: true, force: true }).catch(() => {});
       throw error;
     }
   };
 
   return {
     async load(investigationId) {
-      const state = await readRecord(
+      const value = await readRecord(
         investigationId,
         DELIVERY_STATE_FILE,
         MAX_DELIVERY_STATE_BYTES,
-        normalizeDeliveryState,
+        (raw) => raw,
       );
+      const state = value === null
+        ? null
+        : await normalizeAndMigrateDeliveryState(investigationId, value);
       return state?.investigationId === investigationId ? state : null;
     },
     async save(state) {
@@ -1029,13 +1378,14 @@ export function createFileDeliveryStateStore(
       if (!isInvestigationId(investigationId)) {
         throw new Error("Refusing a protected payload for an unsafe investigation id.");
       }
+      void kind;
       const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
       if (raw.length <= 1 || raw.length > MAX_DELIVERY_PAYLOAD_BYTES) {
         throw new Error("Protected delivery payload exceeds the size limit.");
       }
       const digest = sha256(raw);
       const reference = {
-        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${kind}-${digest}.json`,
+        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${digest}`,
         sha256: digest,
         sizeBytes: raw.length,
       } satisfies DeliveryArtifactReference;
@@ -1046,49 +1396,20 @@ export function createFileDeliveryStateStore(
       if (!payloadDirInfo.isDirectory() || payloadDirInfo.isSymbolicLink()) {
         throw new Error("Refusing an unsafe protected delivery directory.");
       }
-      const destination = path.join(dir, ...reference.path.split("/"));
+      const destination = path.join(payloadDir, digest);
       try {
         await writeFile(destination, raw, { mode: 0o600, flag: "wx" });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const existing = await readFile(destination);
-        if (sha256(existing) !== digest || existing.length !== raw.length) {
-          throw new Error("Existing protected delivery payload failed integrity verification.");
-        }
+      }
+      const existing = await openVerifiedPayload(investigationId, reference);
+      if (!existing.equals(raw)) {
+        throw new Error("Existing protected delivery payload failed integrity verification.");
       }
       return reference;
     },
     async loadPayload(investigationId, reference) {
-      const safeReference = sanitizeArtifactReference(reference);
-      if (!safeReference) {
-        throw new Error("Protected delivery artifact reference is unsafe.");
-      }
-      const dir = dirFor(investigationId);
-      const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
-      const [dirInfo, payloadDirInfo] = await Promise.all([
-        lstat(dir),
-        lstat(payloadDir),
-      ]);
-      if (
-        !dirInfo.isDirectory() ||
-        dirInfo.isSymbolicLink() ||
-        !payloadDirInfo.isDirectory() ||
-        payloadDirInfo.isSymbolicLink()
-      ) {
-        throw new Error("Protected delivery artifact directory is unsafe.");
-      }
-      const target = path.resolve(dir, ...safeReference.path.split("/"));
-      if (!target.startsWith(path.resolve(dir) + path.sep)) {
-        throw new Error("Protected delivery artifact escaped its investigation directory.");
-      }
-      const info = await lstat(target);
-      if (!info.isFile() || info.isSymbolicLink() || info.size !== safeReference.sizeBytes) {
-        throw new Error("Protected delivery artifact is unsafe or changed.");
-      }
-      const raw = await readFile(target);
-      if (sha256(raw) !== safeReference.sha256) {
-        throw new Error("Protected delivery artifact failed integrity verification.");
-      }
+      const raw = await openVerifiedPayload(investigationId, reference);
       return JSON.parse(raw.toString("utf8")) as unknown;
     },
     async withLock(investigationId, operation) {
@@ -1098,9 +1419,12 @@ export function createFileDeliveryStateStore(
       await ensureLockRoot();
       const lockDir = path.join(lockRoot, `${investigationId}.lock`);
       const ownerFile = path.join(lockDir, "owner");
+      const recoveryDir = `${lockDir}.recovery`;
       const lockOwner = randomUUID();
-      let ownerHandle;
 
+      await reconcileTemporaryLeases(investigationId, lockDir);
+
+      let ownerHandle;
       try {
         ownerHandle = await claimLock(lockDir, lockOwner);
       } catch (error) {
@@ -1110,24 +1434,28 @@ export function createFileDeliveryStateStore(
         ) {
           throw error;
         }
-
-        const observedOwner = await stat(ownerFile).catch(() => null);
-        if (
-          !observedOwner ||
-          now() - observedOwner.mtimeMs <= lockTtlMs
-        ) {
+        const observed = await inspectLeaseDirectory(lockDir);
+        if (observed?.fresh) {
           throw new DeliveryLockBusyError(
             "Another delivery attempt is already reconciling this investigation.",
           );
         }
-        const staleDir = `${lockDir}.stale-${randomUUID()}`;
         try {
-          await rename(lockDir, staleDir);
+          await rename(lockDir, recoveryDir);
+          const moved = await inspectLeaseDirectory(recoveryDir);
+          if (moved?.fresh) {
+            await rename(recoveryDir, lockDir).catch(() => {});
+            throw new DeliveryLockBusyError(
+              "The previous delivery owner renewed during recovery.",
+            );
+          }
+          await removeExpiredLeaseDirectory(recoveryDir);
           ownerHandle = await claimLock(lockDir, lockOwner);
-        } catch {
+        } catch (recoveryError) {
           await ownerHandle?.close().catch(() => {});
+          if (recoveryError instanceof DeliveryLockBusyError) throw recoveryError;
           throw new DeliveryLockBusyError(
-            "Another delivery attempt acquired the reconciliation lock.",
+            "Another delivery attempt acquired or is recovering the lock.",
           );
         }
       }
@@ -1135,74 +1463,35 @@ export function createFileDeliveryStateStore(
       if (!ownerHandle) throw new DeliveryLockBusyError("Delivery lock unavailable.");
       const acquiredHandle = ownerHandle;
 
-      // Remove the fixed lock path only after proving that it still resolves
-      // to this lease's inode and token. The post-rename proof prevents a
-      // path-replacement race from deleting a newer owner's generation.
-      const removeOwnedPath = async (label: string): Promise<boolean> => {
-        const generationDir = `${lockDir}.${label}-${lockOwner}`;
+      const provesOwnershipAt = async (ownerPath: string): Promise<boolean> => {
         try {
-          const [currentInfo, handleInfo, currentOwner] = await Promise.all([
-            lstat(ownerFile),
+          const [pathInfo, handleInfo, token] = await Promise.all([
+            lstat(ownerPath),
             acquiredHandle.stat(),
-            readFile(ownerFile, "utf8"),
+            readFile(ownerPath, "utf8"),
           ]);
-          if (
-            currentInfo.dev !== handleInfo.dev ||
-            currentInfo.ino !== handleInfo.ino ||
-            currentOwner !== lockOwner
-          ) {
-            return false;
-          }
-          await rename(lockDir, generationDir);
-          const [movedInfo, movedOwner] = await Promise.all([
-            lstat(path.join(generationDir, "owner")),
-            readFile(path.join(generationDir, "owner"), "utf8"),
-          ]);
-          if (
-            movedInfo.dev === handleInfo.dev &&
-            movedInfo.ino === handleInfo.ino &&
-            movedOwner === lockOwner
-          ) {
-            await rm(generationDir, { recursive: true, force: true });
-            return true;
-          }
-          await rename(generationDir, lockDir).catch(() => {});
+          return (
+            pathInfo.dev === handleInfo.dev &&
+            pathInfo.ino === handleInfo.ino &&
+            token === lockOwner
+          );
         } catch {
-          // Missing or replaced lock: never delete an unproven owner.
+          return false;
         }
-        return false;
       };
 
-      // A contender can win the narrow path-vacancy race after a stale
-      // generation is renamed. It must reconcile the visible stale generation
-      // before doing work: a freshly renewed old owner is restored and fences
-      // this contender; only a truly expired generation is removed.
+      // A claimant can briefly win the canonical name while another process
+      // is checking the fixed recovery directory. It yields before running
+      // user code; no extra yield generation is created.
       try {
-        const stalePrefix = `${investigationId}.lock.stale-`;
-        const staleEntries = (await readdir(lockRoot)).filter((entry) =>
-          entry.startsWith(stalePrefix),
-        );
-        if (staleEntries.length > 8) {
-          throw new DeliveryLockBusyError("Delivery lock recovery is ambiguous.");
-        }
-        for (const entry of staleEntries) {
-          const staleDir = path.join(lockRoot, entry);
-          const staleOwner = await stat(path.join(staleDir, "owner")).catch(
-            () => null,
-          );
-          if (staleOwner && now() - staleOwner.mtimeMs <= lockTtlMs) {
-            if (await removeOwnedPath("yield")) {
-              await rename(staleDir, lockDir).catch(() => {});
-            }
-            throw new DeliveryLockBusyError(
-              "The previous delivery owner renewed during stale recovery.",
-            );
-          }
-          await rm(staleDir, { recursive: true, force: true });
-        }
+        await reconcileTemporaryLeases(investigationId, lockDir);
       } catch (error) {
-        await removeOwnedPath("recovery-failed");
+        if (await provesOwnershipAt(ownerFile)) {
+          await unlink(ownerFile).catch(() => {});
+          await rmdir(lockDir).catch(() => {});
+        }
         await acquiredHandle.close().catch(() => {});
+        await reconcileTemporaryLeases(investigationId, lockDir).catch(() => {});
         if (error instanceof DeliveryLockBusyError) throw error;
         throw new DeliveryLockBusyError("Delivery lock recovery is ambiguous.");
       }
@@ -1210,7 +1499,6 @@ export function createFileDeliveryStateStore(
       let ownershipLost: Error | null = null;
       const assertOwned = async () => {
         if (ownershipLost) throw ownershipLost;
-        const handleInfo = await acquiredHandle.stat();
         const buffer = Buffer.alloc(Buffer.byteLength(lockOwner, "utf8"));
         const { bytesRead } = await acquiredHandle.read(
           buffer,
@@ -1222,16 +1510,13 @@ export function createFileDeliveryStateStore(
           ownershipLost = new DeliveryLockLostError("Delivery lock ownership was lost.");
           throw ownershipLost;
         }
+        if (!(await provesOwnershipAt(ownerFile))) {
+          ownershipLost = new DeliveryLockLostError("Delivery lock ownership was lost.");
+          throw ownershipLost;
+        }
         const instant = new Date(now());
         await acquiredHandle.utimes(instant, instant);
-        const pathInfo = await lstat(ownerFile).catch(() => null);
-        const currentOwner = await readFile(ownerFile, "utf8").catch(() => null);
-        if (
-          !pathInfo ||
-          pathInfo.dev !== handleInfo.dev ||
-          pathInfo.ino !== handleInfo.ino ||
-          currentOwner !== lockOwner
-        ) {
+        if (!(await provesOwnershipAt(ownerFile))) {
           ownershipLost = new DeliveryLockLostError("Delivery lock ownership was lost.");
           throw ownershipLost;
         }
@@ -1263,7 +1548,19 @@ export function createFileDeliveryStateStore(
       } finally {
         if (heartbeat) clearInterval(heartbeat);
         await pendingHeartbeat.catch(() => {});
-        await removeOwnedPath("release");
+        try {
+          await rename(lockDir, recoveryDir);
+          const movedOwner = path.join(recoveryDir, "owner");
+          if (await provesOwnershipAt(movedOwner)) {
+            await rm(recoveryDir, { recursive: true, force: true });
+          } else {
+            await rename(recoveryDir, lockDir).catch(() => {});
+          }
+        } catch {
+          // A crash or competing recovery may leave the canonical or fixed
+          // recovery directory behind. Both expire through the same bounded
+          // path on the next attempt; never remove an unproven owner here.
+        }
         await acquiredHandle.close().catch(() => {});
       }
     },
@@ -1301,10 +1598,11 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
     },
     async persistPayload(investigationId, kind, payload) {
       if (!isInvestigationId(investigationId)) throw new Error("Unsafe investigation id.");
+      void kind;
       const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
       const digest = sha256(raw);
       const reference = {
-        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${kind}-${digest}.json`,
+        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${digest}`,
         sha256: digest,
         sizeBytes: raw.length,
       } satisfies DeliveryArtifactReference;
@@ -1366,6 +1664,95 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
 // detect an already-posted comment on GitHub instead of posting a duplicate.
 export function terminalCommentMarker(investigationId: string): string {
   return `<!-- sherlock-terminal-comment:${investigationId} -->`;
+}
+
+export function deliveryCommentMarker(investigationId: string): string {
+  return `<!-- sherlock-delivery-comment:${investigationId} -->`;
+}
+
+export type TerminalCommentReconciliation = {
+  terminalCommentId: number | null;
+  reusableCommentId: number | null;
+};
+
+export async function reconcileTerminalCommentPaginated(input: {
+  terminalMarker: string;
+  reusableMarker: string;
+  appId: number;
+  listPage: (
+    page: number,
+    perPage: number,
+  ) => Promise<
+    Array<{
+      id?: number;
+      body?: string | null;
+      performed_via_github_app?: { id?: number } | null;
+    }>
+  >;
+  assertOwnership: () => Promise<void>;
+  maxPages?: number;
+}): Promise<TerminalCommentReconciliation> {
+  if (!Number.isSafeInteger(input.appId) || input.appId <= 0) {
+    throw new Error("GitHub App identity is unavailable for comment reconciliation.");
+  }
+  const perPage = 100;
+  const maxPages = input.maxPages ?? 20;
+  const terminalIds = new Set<number>();
+  const reusableIds = new Set<number>();
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    await input.assertOwnership();
+    const comments = await input.listPage(page, perPage);
+    if (
+      !Array.isArray(comments) ||
+      comments.length > perPage ||
+      comments.some(
+        (comment) =>
+          !comment ||
+          (comment.body !== null &&
+            comment.body !== undefined &&
+            typeof comment.body !== "string") ||
+          (comment.id !== undefined &&
+            (!Number.isSafeInteger(comment.id) || comment.id <= 0)) ||
+          (comment.performed_via_github_app?.id !== undefined &&
+            (!Number.isSafeInteger(comment.performed_via_github_app.id) ||
+              comment.performed_via_github_app.id <= 0)),
+      )
+    ) {
+      throw Object.assign(new Error("GitHub comment reconciliation was ambiguous."), {
+        status: 502,
+      });
+    }
+
+    for (const comment of comments) {
+      const owned = comment.performed_via_github_app?.id === input.appId;
+      if (!owned || typeof comment.body !== "string" || comment.id === undefined) {
+        continue;
+      }
+      if (comment.body.includes(input.terminalMarker)) {
+        terminalIds.add(comment.id);
+      }
+      if (comment.body.includes(input.reusableMarker)) {
+        reusableIds.add(comment.id);
+      }
+    }
+
+    if (terminalIds.size > 1 || reusableIds.size > 1) {
+      throw Object.assign(new Error("GitHub comment reconciliation was ambiguous."), {
+        status: 503,
+      });
+    }
+    if (comments.length < perPage) {
+      return {
+        terminalCommentId: [...terminalIds][0] ?? null,
+        reusableCommentId: [...reusableIds][0] ?? null,
+      };
+    }
+  }
+  throw Object.assign(
+    new Error("GitHub comment history exceeded the bounded reconciliation scan."),
+    { status: 503 },
+  );
 }
 
 export async function findTerminalCommentPaginated(input: {
@@ -1449,7 +1836,11 @@ export function buildTerminalComment(
       ? `${formatResultComment(summary)}\n\n---\n\n${sections.join("\n\n---\n\n")}`
       : formatResultComment(summary);
 
-  return `${body}\n\n${terminalCommentMarker(state.investigationId)}`;
+  return [
+    body,
+    terminalCommentMarker(state.investigationId),
+    deliveryCommentMarker(state.investigationId),
+  ].join("\n\n");
 }
 
 function summaryPullRequestStatus(state: DeliveryState): string {
@@ -1524,6 +1915,7 @@ export type DeliveryGitHubClient = {
     branch: string;
     baseCommitSha: string;
     message: string;
+    authorDate: string;
     files: DeliveryFile[];
     expectedTreeSha: string;
     assertOwnership: () => Promise<void>;
@@ -1578,60 +1970,51 @@ export function createDeliveryGitHubRestClient(options: {
     return (await response.json()) as T;
   };
 
-  return {
-    getBranch: async (branch) => {
-      const response = await fetch(
-        `${repoUrl}/git/ref/heads/${encodeURIComponent(branch)}`,
-        {
-          headers,
-        },
+  const getBranch: DeliveryGitHubClient["getBranch"] = async (branch) => {
+    const response = await fetch(
+      `${repoUrl}/git/ref/heads/${encodeURIComponent(branch)}`,
+      { headers },
+    );
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      throw Object.assign(
+        new Error(
+          `GitHub branch lookup failed: ${response.status} ${response.statusText}`,
+        ),
+        { status: response.status },
       );
+    }
+    const data = (await response.json()) as { object?: { sha?: string } };
+    if (!data.object?.sha || !GIT_SHA_PATTERN.test(data.object.sha)) {
+      throw Object.assign(new Error("GitHub branch lookup was ambiguous."), {
+        status: 502,
+      });
+    }
+    const commit = await request<{
+      tree?: { sha?: string };
+      parents?: { sha?: string }[];
+    }>("GET", `${repoUrl}/git/commits/${data.object.sha}`);
+    if (
+      !commit.tree?.sha ||
+      !GIT_SHA_PATTERN.test(commit.tree.sha) ||
+      !Array.isArray(commit.parents) ||
+      commit.parents.some(
+        (parent) => !parent?.sha || !GIT_SHA_PATTERN.test(parent.sha),
+      )
+    ) {
+      throw Object.assign(new Error("GitHub branch commit has no tree identity."), {
+        status: 502,
+      });
+    }
+    return {
+      sha: data.object.sha,
+      treeSha: commit.tree.sha,
+      parentShas: commit.parents.map((parent) => parent.sha!),
+    };
+  };
 
-      if (response.status === 404) {
-        return null;
-      }
-
-      if (!response.ok) {
-        throw Object.assign(
-          new Error(
-            `GitHub branch lookup failed: ${response.status} ${response.statusText}`,
-          ),
-          { status: response.status },
-        );
-      }
-
-      const data = (await response.json()) as { object?: { sha?: string } };
-
-      if (!data.object?.sha || !GIT_SHA_PATTERN.test(data.object.sha)) {
-        throw Object.assign(new Error("GitHub branch lookup was ambiguous."), {
-          status: 502,
-        });
-      }
-
-      const commit = await request<{
-        tree?: { sha?: string };
-        parents?: { sha?: string }[];
-      }>("GET", `${repoUrl}/git/commits/${data.object.sha}`);
-
-      if (
-        !commit.tree?.sha ||
-        !GIT_SHA_PATTERN.test(commit.tree.sha) ||
-        !Array.isArray(commit.parents) ||
-        commit.parents.some(
-          (parent) => !parent?.sha || !GIT_SHA_PATTERN.test(parent.sha),
-        )
-      ) {
-        throw Object.assign(new Error("GitHub branch commit has no tree identity."), {
-          status: 502,
-        });
-      }
-
-      return {
-        sha: data.object.sha,
-        treeSha: commit.tree.sha,
-        parentShas: commit.parents.map((parent) => parent.sha!),
-      };
-    },
+  return {
+    getBranch,
     findPullRequests: async ({ head, base, assertOwnership }) => {
       const matches: DeliveryPullRequest[] = [];
       let conflictingBase = false;
@@ -1704,10 +2087,14 @@ export function createDeliveryGitHubRestClient(options: {
       branch,
       baseCommitSha,
       message,
+      authorDate,
       files,
       expectedTreeSha,
       assertOwnership,
     }) => {
+      if (!Number.isFinite(Date.parse(authorDate))) {
+        throw new Error("Delivery commit has an invalid deterministic date.");
+      }
       const baseCommit = await request<{ tree?: { sha?: string } }>(
         "GET",
         `${repoUrl}/git/commits/${baseCommitSha}`,
@@ -1781,7 +2168,12 @@ export function createDeliveryGitHubRestClient(options: {
           author: {
             name: SHERLOCK_AUTHOR_NAME,
             email: SHERLOCK_AUTHOR_EMAIL,
-            date: new Date().toISOString(),
+            date: authorDate,
+          },
+          committer: {
+            name: SHERLOCK_AUTHOR_NAME,
+            email: SHERLOCK_AUTHOR_EMAIL,
+            date: authorDate,
           },
         },
         assertOwnership,
@@ -1792,10 +2184,40 @@ export function createDeliveryGitHubRestClient(options: {
         });
       }
 
-      await request("POST", `${repoUrl}/git/refs`, {
-        ref: `refs/heads/${branch}`,
-        sha: commit.sha,
-      }, assertOwnership);
+      const matchesExpectedBranch = (
+        remote: Awaited<ReturnType<DeliveryGitHubClient["getBranch"]>>,
+      ) =>
+        remote !== null &&
+        remote.treeSha === expectedTreeSha &&
+        remote.parentShas.length === 1 &&
+        remote.parentShas[0] === baseCommitSha;
+      await assertOwnership();
+      const beforeRefCreate = await getBranch(branch);
+      if (beforeRefCreate) {
+        if (!matchesExpectedBranch(beforeRefCreate)) {
+          throw new Error(
+            "The deterministic delivery branch exists with different content.",
+          );
+        }
+        return { commitSha: beforeRefCreate.sha, treeSha: beforeRefCreate.treeSha };
+      }
+
+      try {
+        await request("POST", `${repoUrl}/git/refs`, {
+          ref: `refs/heads/${branch}`,
+          sha: commit.sha,
+        }, assertOwnership);
+      } catch (error) {
+        await assertOwnership();
+        const afterRefCreate = await getBranch(branch);
+        if (matchesExpectedBranch(afterRefCreate)) {
+          return {
+            commitSha: afterRefCreate!.sha,
+            treeSha: afterRefCreate!.treeSha,
+          };
+        }
+        throw error;
+      }
 
       return { commitSha: commit.sha, treeSha: tree.sha };
     },
@@ -1860,15 +2282,25 @@ export type DeliveryExecutorDeps = {
     body: string;
     assertOwnership: () => Promise<void>;
   }) => Promise<void>;
-  // True when the issue already carries a comment containing the marker.
+  updateIssueComment?: (input: {
+    installationId: number;
+    owner: string;
+    repo: string;
+    commentId: number;
+    body: string;
+    assertOwnership: () => Promise<void>;
+  }) => Promise<void>;
+  // Production returns owned comment identities. Boolean remains accepted for
+  // narrow test/in-memory adapters that do not model GitHub authorship.
   findTerminalComment: (input: {
     installationId: number;
     owner: string;
     repo: string;
     issueNumber: number;
     marker: string;
+    reusableMarker: string;
     assertOwnership: () => Promise<void>;
-  }) => Promise<boolean>;
+  }) => Promise<boolean | TerminalCommentReconciliation>;
   // Retry classifier injected by the queue layer (kept out of this module so
   // services never depend on queue code).
   isRetryableError: (error: unknown) => boolean;
@@ -1881,7 +2313,7 @@ export type DeliveryRunResult = {
 };
 
 // One idempotent delivery attempt. Ordering matters: the pull-request state
-// is reconciled FIRST so the terminal comment (posted last, exactly once)
+// is reconciled FIRST so the terminal comment (reconciled last)
 // describes the final delivery truth. Retryable failures always leave the
 // durable state pending, including on the queue's final configured attempt.
 export async function runDeliveryFromState(
@@ -2044,20 +2476,31 @@ async function runDeliveryUnlocked(
     }
   }
 
-  // --- Terminal issue comment (exactly once, always last) ------------------
+  // --- Terminal issue comment (owned reconciliation, always last) ----------
   if (state.terminalComment.status !== "posted") {
     try {
       const marker = terminalCommentMarker(state.investigationId);
-      const alreadyPosted = await deps.findTerminalComment({
-        installationId: state.installationId,
-        owner: state.repoOwner,
-        repo: state.repoName,
-        issueNumber: state.issueNumber,
-        marker,
-        assertOwnership: lease.assertOwned,
-      });
+      const reusableMarker = deliveryCommentMarker(state.investigationId);
+      const reconcileComment = async (): Promise<TerminalCommentReconciliation> => {
+        const result = await deps.findTerminalComment({
+          installationId: state.installationId,
+          owner: state.repoOwner,
+          repo: state.repoName,
+          issueNumber: state.issueNumber,
+          marker,
+          reusableMarker,
+          assertOwnership: lease.assertOwned,
+        });
+        return typeof result === "boolean"
+          ? {
+              terminalCommentId: result ? -1 : null,
+              reusableCommentId: null,
+            }
+          : result;
+      };
 
-      if (alreadyPosted) {
+      let reconciliation = await reconcileComment();
+      if (reconciliation.terminalCommentId !== null) {
         log(
           `[${state.investigationId}] Terminal comment already exists on the issue; not posting a duplicate.`,
         );
@@ -2066,21 +2509,59 @@ async function runDeliveryUnlocked(
           deps.deliveryStore,
           state,
         );
-        await lease.assertOwned();
-        await deps.postIssueComment({
-          installationId: state.installationId,
-          owner: state.repoOwner,
-          repo: state.repoName,
-          issueNumber: state.issueNumber,
-          body: buildTerminalComment(state, terminalPayload),
-          assertOwnership: lease.assertOwned,
-        });
+        const body = buildTerminalComment(state, terminalPayload);
+
+        // Reconcile again immediately before the only non-idempotent comment
+        // operation. A local lease cannot make this check atomic with GitHub.
+        reconciliation = await reconcileComment();
+        if (reconciliation.terminalCommentId === null) {
+          if (
+            reconciliation.reusableCommentId !== null &&
+            deps.updateIssueComment
+          ) {
+            await deps.updateIssueComment({
+              installationId: state.installationId,
+              owner: state.repoOwner,
+              repo: state.repoName,
+              commentId: reconciliation.reusableCommentId,
+              body,
+              assertOwnership: lease.assertOwned,
+            });
+          } else {
+            if (state.terminalComment.createAttemptedAt) {
+              throw new DeliveryRetryableError(
+                "Terminal comment creation acknowledgement remains ambiguous; reconciliation will continue without another create.",
+              );
+            }
+            state.terminalComment.createAttemptedAt = new Date().toISOString();
+            await saveState();
+            try {
+              await deps.postIssueComment({
+                installationId: state.installationId,
+                owner: state.repoOwner,
+                repo: state.repoName,
+                issueNumber: state.issueNumber,
+                body,
+                assertOwnership: lease.assertOwned,
+              });
+            } catch (error) {
+              // If GitHub accepted the create but its acknowledgement was
+              // lost, a complete owned-marker scan converts it to success.
+              // Otherwise the durable intent prevents a blind second create.
+              const after = await reconcileComment().catch(() => null);
+              if (after?.terminalCommentId === null || after === null) {
+                throw error;
+              }
+            }
+          }
+        }
       }
 
       state.terminalComment = {
         status: "posted",
         postedAt: new Date().toISOString(),
         reason: null,
+        createAttemptedAt: state.terminalComment.createAttemptedAt ?? null,
       };
       await saveState();
       await recordState({ type: "terminal_comment", status: "posted" });
@@ -2088,6 +2569,7 @@ async function runDeliveryUnlocked(
       if (error instanceof DeliveryLockLostError) {
         throw new DeliveryRetryableError(retryableDeliveryMessage(error));
       }
+      if (error instanceof DeliveryRetryableError) throw error;
       if (deps.isRetryableError(error)) {
         throw new DeliveryRetryableError(retryableDeliveryMessage(error));
       }
@@ -2096,6 +2578,7 @@ async function runDeliveryUnlocked(
         status: "failed",
         postedAt: null,
         reason: TERMINAL_COMMENT_FAILED_REASON,
+        createAttemptedAt: state.terminalComment.createAttemptedAt ?? null,
       };
       log(
         `[${state.investigationId}] Terminal comment delivery failed permanently: ${state.terminalComment.reason}`,
@@ -2174,6 +2657,7 @@ async function reconcilePullRequest(
       branch,
       baseCommitSha: plan.sourceCommit,
       message: payload.commitMessage,
+      authorDate: state.createdAt,
       files: payload.files,
       expectedTreeSha: plan.expectedTreeSha,
       assertOwnership: lease.assertOwned,
@@ -2191,48 +2675,64 @@ async function reconcilePullRequest(
     throw new Error("No protected pull-request retry metadata is available.");
   }
   const head = `${state.repoOwner}:${branch}`;
-  const reconciliation = await github.findPullRequests({
-    head,
-    base: plan.baseBranch,
-    assertOwnership: lease.assertOwned,
-  });
-
-  if (reconciliation.matches.length > 1) {
-    throw Object.assign(
-      new Error("Multiple matching Sherlock pull requests make delivery ambiguous."),
-      { status: 503 },
-    );
-  }
-  const existing = reconciliation.matches[0];
-  if (existing) {
-    state.pullRequest.number = existing.number;
-    state.pullRequest.url = existing.url;
-    state.pullRequest.reason = null;
-    if (existing.merged) {
-      state.pullRequest.status = "merged";
-    } else if (existing.state === "open") {
-      state.pullRequest.status = "reused";
-    } else {
-      state.pullRequest.status = "blocked";
-      state.pullRequest.reason = PULL_REQUEST_BLOCKED_REASON;
+  const applyReconciliation = (
+    reconciliation: Awaited<ReturnType<DeliveryGitHubClient["findPullRequests"]>>,
+  ) => {
+    if (reconciliation.matches.length > 1) {
+      throw Object.assign(
+        new Error("Multiple matching Sherlock pull requests make delivery ambiguous."),
+        { status: 503 },
+      );
     }
-    return;
-  }
+    const existing = reconciliation.matches[0];
+    if (existing) {
+      state.pullRequest.number = existing.number;
+      state.pullRequest.url = existing.url;
+      state.pullRequest.reason = null;
+      if (existing.merged) {
+        state.pullRequest.status = "merged";
+      } else if (existing.state === "open") {
+        state.pullRequest.status = "reused";
+      } else {
+        state.pullRequest.status = "blocked";
+        state.pullRequest.reason = PULL_REQUEST_BLOCKED_REASON;
+      }
+      return true;
+    }
+    if (reconciliation.conflictingBase) {
+      throw new Error(
+        "A pull request for the Sherlock branch targets a different base; refusing to create or reuse another pull request.",
+      );
+    }
+    return false;
+  };
+  const findPullRequests = () =>
+    github.findPullRequests({
+      head,
+      base: plan.baseBranch,
+      assertOwnership: lease.assertOwned,
+    });
 
-  if (reconciliation.conflictingBase) {
-    throw new Error(
-      "A pull request for the Sherlock branch targets a different base; refusing to create or reuse another pull request.",
-    );
-  }
+  if (applyReconciliation(await findPullRequests())) return;
 
   const payload = await loadPullRequestRetryPayload(store, state, plan);
-  const created = await github.createPullRequest({
-    title: payload.title,
-    head: branch,
-    base: plan.baseBranch,
-    body: payload.body,
-    assertOwnership: lease.assertOwned,
-  });
+  // The protected payload read can take time, so reconcile once more directly
+  // before the non-idempotent create request.
+  if (applyReconciliation(await findPullRequests())) return;
+
+  let created;
+  try {
+    created = await github.createPullRequest({
+      title: payload.title,
+      head: branch,
+      base: plan.baseBranch,
+      body: payload.body,
+      assertOwnership: lease.assertOwned,
+    });
+  } catch (error) {
+    if (applyReconciliation(await findPullRequests())) return;
+    throw error;
+  }
 
   state.pullRequest.status = "created";
   state.pullRequest.number = created.number;

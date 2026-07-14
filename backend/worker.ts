@@ -39,7 +39,7 @@ import {
 import {
   createDeliveryGitHubRestClient,
   createFileDeliveryStateStore,
-  findTerminalCommentPaginated,
+  reconcileTerminalCommentPaginated,
 } from "./services/delivery.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
@@ -108,11 +108,14 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
       repo,
       issueNumber,
       marker,
+      reusableMarker,
       assertOwnership,
     }) => {
       const octokit = await getInstallationOctokit(installationId);
-      return findTerminalCommentPaginated({
-        marker,
+      return reconcileTerminalCommentPaginated({
+        terminalMarker: marker,
+        reusableMarker,
+        appId: Number(process.env.APP_ID),
         assertOwnership,
         listPage: async (page, perPage) => {
           const { data } = await octokit.rest.issues.listComments({
@@ -163,6 +166,23 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
       owner,
       repo,
       issue_number: issueNumber,
+      body,
+    });
+  },
+  updateIssueComment: async ({
+    installationId,
+    owner,
+    repo,
+    commentId,
+    body,
+    assertOwnership,
+  }) => {
+    const octokit = await getInstallationOctokit(installationId);
+    await assertOwnership();
+    await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: commentId,
       body,
     });
   },

@@ -5,8 +5,9 @@ import {
   buildDeliveryState,
   createDeliveryGitHubRestClient,
   createInMemoryDeliveryStateStore,
-  DeliveryRetryableError,
+  deliveryCommentMarker,
   findTerminalCommentPaginated,
+  reconcileTerminalCommentPaginated,
   runDeliveryFromState,
   terminalCommentMarker,
   type DeliveryExecutorDeps,
@@ -159,6 +160,58 @@ describe("production GitHub delivery adapter", () => {
     });
   });
 
+  test("acknowledgement loss after deterministic ref creation reconciles the branch", async () => {
+    let branchCreated = false;
+    let refCreates = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/git/ref/heads/")) {
+        return branchCreated
+          ? Response.json({ object: { sha: BRANCH_COMMIT } })
+          : new Response(null, { status: 404 });
+      }
+      if (url.endsWith(`/git/commits/${SOURCE}`) && init?.method === "GET") {
+        return Response.json({ tree: { sha: "ba5eba11" } });
+      }
+      if (url.endsWith(`/git/commits/${BRANCH_COMMIT}`) && init?.method === "GET") {
+        return Response.json({
+          tree: { sha: TREE },
+          parents: [{ sha: SOURCE }],
+        });
+      }
+      if (url.endsWith("/git/trees") && init?.method === "POST") {
+        return Response.json({ sha: TREE });
+      }
+      if (url.endsWith("/git/commits") && init?.method === "POST") {
+        return Response.json({ sha: BRANCH_COMMIT });
+      }
+      if (url.endsWith("/git/refs") && init?.method === "POST") {
+        branchCreated = true;
+        refCreates += 1;
+        return new Response(null, { status: 502, statusText: "Bad Gateway" });
+      }
+      throw new Error(`unexpected request ${init?.method ?? "GET"} ${url}`);
+    }));
+    const client = createDeliveryGitHubRestClient({
+      token: "fresh",
+      owner: "acme",
+      repo: "app",
+    });
+
+    await expect(
+      client.createBranchWithCommit({
+        branch: BRANCH,
+        baseCommitSha: SOURCE,
+        message: "fix: deterministic branch",
+        authorDate: new Date(0).toISOString(),
+        files: [{ path: "obsolete.ts", contents: null, mode: "100644" }],
+        expectedTreeSha: TREE,
+        assertOwnership: async () => {},
+      }),
+    ).resolves.toEqual({ commitSha: BRANCH_COMMIT, treeSha: TREE });
+    expect(refCreates).toBe(1);
+  });
+
   test("a branch-name collision with the wrong tree fails without PR side effects", async () => {
     const store = createInMemoryDeliveryStateStore();
     const state = await pendingState(store);
@@ -299,13 +352,7 @@ describe("production GitHub delivery adapter", () => {
     const comments: string[] = [];
     const deps = executor(store, client, comments);
 
-    await expect(
-      runDeliveryFromState(state, deps, { isFinalAttempt: false }),
-    ).rejects.toBeInstanceOf(DeliveryRetryableError);
-    const pending = await store.load(INV);
-    expect(pending?.pullRequest.status).toBe("pending");
-
-    const recovered = await runDeliveryFromState(pending!, deps, {
+    const recovered = await runDeliveryFromState(state, deps, {
       isFinalAttempt: false,
     });
     expect(recovered.state.pullRequest).toMatchObject({
@@ -357,6 +404,114 @@ describe("production GitHub delivery adapter", () => {
 });
 
 describe("production terminal-comment pagination", () => {
+  test("owned progress comments are reusable and copied markers are ignored", async () => {
+    const result = await reconcileTerminalCommentPaginated({
+      terminalMarker: terminalCommentMarker(INV),
+      reusableMarker: deliveryCommentMarker(INV),
+      appId: 123,
+      assertOwnership: async () => {},
+      listPage: async () => [
+        {
+          id: 1,
+          body: terminalCommentMarker(INV),
+          performed_via_github_app: { id: 999 },
+        },
+        {
+          id: 2,
+          body: deliveryCommentMarker(INV),
+          performed_via_github_app: { id: 123 },
+        },
+      ],
+    });
+    expect(result).toEqual({ terminalCommentId: null, reusableCommentId: 2 });
+  });
+
+  test("owned comment reconciliation fails closed when its bounded scan is incomplete", async () => {
+    await expect(
+      reconcileTerminalCommentPaginated({
+        terminalMarker: terminalCommentMarker(INV),
+        reusableMarker: deliveryCommentMarker(INV),
+        appId: 123,
+        maxPages: 1,
+        assertOwnership: async () => {},
+        listPage: async () =>
+          Array.from({ length: 100 }, (_, index) => ({
+            id: index + 1,
+            body: "older comment",
+            performed_via_github_app: null,
+          })),
+      }),
+    ).rejects.toMatchObject({ status: 503 });
+  });
+
+  test("an acknowledgement-lost comment create is reconciled in the same attempt", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const state = await pendingState(store);
+    state.pullRequest.status = "created";
+    state.pullRequest.branchPushed = true;
+    state.pullRequest.number = 7;
+    state.pullRequest.url = "https://github.com/acme/app/pull/7";
+    await store.save(state);
+    let remoteComment = false;
+    let creates = 0;
+    const deps = executor(
+      store,
+      createDeliveryGitHubRestClient({ token: "unused", owner: "acme", repo: "app" }),
+      [],
+    );
+    deps.findTerminalComment = async () => ({
+      terminalCommentId: remoteComment ? 91 : null,
+      reusableCommentId: null,
+    });
+    deps.postIssueComment = async () => {
+      creates += 1;
+      remoteComment = true;
+      throw Object.assign(new Error("lost acknowledgement"), { status: 502 });
+    };
+
+    const result = await runDeliveryFromState(state, deps, {
+      isFinalAttempt: false,
+    });
+    expect(result.complete).toBe(true);
+    expect(creates).toBe(1);
+  });
+
+  test("terminal delivery updates one owned progress comment instead of creating another", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const state = await pendingState(store);
+    state.pullRequest.status = "created";
+    state.pullRequest.branchPushed = true;
+    state.pullRequest.number = 7;
+    state.pullRequest.url = "https://github.com/acme/app/pull/7";
+    await store.save(state);
+    let updates = 0;
+    let creates = 0;
+    const deps = executor(
+      store,
+      createDeliveryGitHubRestClient({ token: "unused", owner: "acme", repo: "app" }),
+      [],
+    );
+    deps.findTerminalComment = async () => ({
+      terminalCommentId: null,
+      reusableCommentId: 44,
+    });
+    deps.updateIssueComment = async ({ commentId, body }) => {
+      expect(commentId).toBe(44);
+      expect(body).toContain(terminalCommentMarker(INV));
+      updates += 1;
+    };
+    deps.postIssueComment = async () => {
+      creates += 1;
+    };
+
+    const result = await runDeliveryFromState(state, deps, {
+      isFinalAttempt: false,
+    });
+    expect(result.complete).toBe(true);
+    expect(updates).toBe(1);
+    expect(creates).toBe(0);
+  });
+
   test("a marker beyond 300 comments is found without timestamp filtering", async () => {
     const marker = terminalCommentMarker(INV);
     const pages: number[] = [];

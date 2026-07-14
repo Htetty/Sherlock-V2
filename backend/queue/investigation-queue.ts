@@ -4,6 +4,7 @@
 // credentials must never be stored in a job.
 
 import { Queue } from "bullmq";
+import { createHash, randomUUID } from "node:crypto";
 import { Redis } from "ioredis";
 
 export const INVESTIGATION_QUEUE_NAME = "sherlock-investigations";
@@ -34,6 +35,13 @@ export const INVESTIGATION_JOB_RETENTION = {
 export const WEBHOOK_COMMAND_CLAIM_PREFIX = "sherlock:webhook-command:";
 export const WEBHOOK_COMMAND_CLAIM_TTL_SECONDS =
   INVESTIGATION_JOB_RETENTION.removeOnComplete.age;
+const WEBHOOK_COMMAND_CLAIM_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 1 or redis.call('EXISTS', KEYS[2]) == 1 then
+  return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
+`;
 
 export type InvestigationJobPayload = {
   investigationId: string;
@@ -76,9 +84,15 @@ export type DeliveryJobPayload = {
 export const DELIVERY_JOB_ATTEMPTS = 6;
 export const DELIVERY_RETRY_BACKOFF_MS = 30_000;
 
-// Deterministic delivery job id: at most one delivery job per investigation
-// (BullMQ deduplicates by id while the job is retained).
+// Deterministic opaque delivery job id: at most one delivery job per
+// investigation (BullMQ deduplicates by id while the job is retained).
 export function buildDeliveryJobId(investigationId: string): string {
+  return `deliver_${opaqueQueueIdentity([investigationId])}`;
+}
+
+// Read-only compatibility identity for delivery jobs already retained by
+// ea99a10. New jobs never use or log this semantic form.
+export function buildLegacyDeliveryJobId(investigationId: string): string {
   return `deliver_${investigationId}`;
 }
 
@@ -103,11 +117,28 @@ export function deriveTenantIdFromInstallation(installationId: number): string {
   return `tenant-gh-${installationId}`;
 }
 
-// Deterministic BullMQ job id: repeated webhook delivery of the same comment
-// maps to the same id (BullMQ deduplicates), while a new /sherlock
-// investigate comment has a new comment id and therefore a new job.
-// BullMQ custom job ids must not contain ":".
+// Deterministic opaque BullMQ job id: repeated webhook delivery of the same
+// comment maps to the same digest (BullMQ deduplicates), while a new /sherlock
+// investigate comment hashes to a distinct id. BullMQ custom ids cannot
+// contain ":"; the digest also keeps tenant/repository/issue/comment identity
+// out of queue listings and logs.
 export function buildInvestigationJobId(input: {
+  tenantId: string;
+  repositoryOwner: string;
+  repositoryName: string;
+  issueNumber: number;
+  triggeringCommentId: number;
+}): string {
+  return `${INVESTIGATION_JOB_NAME}_${opaqueQueueIdentity([
+    input.tenantId,
+    input.repositoryOwner,
+    input.repositoryName,
+    String(input.issueNumber),
+    String(input.triggeringCommentId),
+  ])}`;
+}
+
+function buildLegacyInvestigationJobId(input: {
   tenantId: string;
   repositoryOwner: string;
   repositoryName: string;
@@ -122,6 +153,12 @@ export function buildInvestigationJobId(input: {
     `issue-${input.issueNumber}`,
     `comment-${input.triggeringCommentId}`,
   ].join("_");
+}
+
+function opaqueQueueIdentity(parts: string[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify(parts), "utf8")
+    .digest("hex");
 }
 
 // Everything the bot needs from the queue, injectable so webhook tests run
@@ -161,20 +198,18 @@ export function createInvestigationQueueAdapter(
     add: async (payload, options) => {
       const jobId = buildInvestigationJobId(payload);
       const claimKey = `${WEBHOOK_COMMAND_CLAIM_PREFIX}${jobId}`;
-      const claimValue = JSON.stringify({
-        investigationId: payload.investigationId,
-        jobId,
-        createdAt: new Date().toISOString(),
-      });
-      const claimed = await connection.set(
+      const legacyClaimKey = `${WEBHOOK_COMMAND_CLAIM_PREFIX}${buildLegacyInvestigationJobId(payload)}`;
+      const claimValue = randomUUID();
+      const claimed = Number(await connection.eval(
+        WEBHOOK_COMMAND_CLAIM_SCRIPT,
+        2,
         claimKey,
+        legacyClaimKey,
         claimValue,
-        "EX",
         WEBHOOK_COMMAND_CLAIM_TTL_SECONDS,
-        "NX",
-      );
+      ));
 
-      if (claimed !== "OK") {
+      if (claimed !== 1) {
         return { jobId, deduplicated: true, rateLimited: false };
       }
 

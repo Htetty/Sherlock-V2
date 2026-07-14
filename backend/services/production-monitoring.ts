@@ -404,6 +404,7 @@ export type QueueOperationalSummary = {
 };
 
 const MAX_QUEUE_AGE_IDS = 100;
+const OPAQUE_QUEUE_JOB_ID = /^(?:investigate|deliver)_[0-9a-f]{64}$/;
 
 export async function readQueueOperationalSummary(
   queue: Pick<Queue, "getJobCounts" | "toKey">,
@@ -501,6 +502,7 @@ async function safeJobTimestamps(
 ): Promise<number[]> {
   const values = await Promise.all(
     ids.map(async (id) => {
+      if (!OPAQUE_QUEUE_JOB_ID.test(id)) return Number.NaN;
       const [timestamp] = await redis.hmget(queue.toKey(id), "timestamp");
       return timestamp !== null && timestamp.trim() !== ""
         ? Number(timestamp)
