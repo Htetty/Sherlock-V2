@@ -99,14 +99,22 @@ export async function runProductionOpsCheck(
       `completed=${queue.completed}`,
       `failed=${queue.failed}`,
       `oldest_waiting=${formatAge(queue.oldestWaitingAgeMs)}`,
-      `oldest_delayed=${formatAge(queue.oldestDelayedAgeMs)}`,
+      `oldest_delayed_created=${formatAge(queue.oldestDelayedCreationAgeMs)}`,
+      `oldest_delayed_overdue=${formatAge(queue.oldestDelayedOverdueAgeMs)}`,
+      `age_complete=${queue.waitingAgeComplete !== false && queue.delayedCreationAgeComplete !== false && queue.delayedDueAgeComplete !== false}`,
     ].join(" ");
+    const ageIncomplete =
+      queue.waitingAgeComplete === false ||
+      queue.delayedCreationAgeComplete === false ||
+      queue.delayedDueAgeComplete === false;
+    const tooOld =
+      (queue.oldestWaitingAgeMs !== null &&
+        queue.oldestWaitingAgeMs > config.queueMaxWaitingAgeMs) ||
+      (queue.oldestDelayedOverdueAgeMs !== null &&
+        queue.oldestDelayedOverdueAgeMs > config.queueMaxWaitingAgeMs);
     add(
       "queue",
-      queue.oldestWaitingAgeMs !== null &&
-        queue.oldestWaitingAgeMs > config.queueMaxWaitingAgeMs
-        ? "warn"
-        : "pass",
+      ageIncomplete || tooOld ? "warn" : "pass",
       detail,
     );
   } catch {

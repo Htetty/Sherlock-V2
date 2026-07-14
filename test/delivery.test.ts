@@ -49,6 +49,8 @@ import type { InvestigationSummary } from "../backend/services/report.js";
 
 const INV = "inv_0TESTDELIV1";
 const FIX = "fix_0TESTFIX001";
+const SOURCE_COMMIT = "c0ffee123";
+const EXPECTED_TREE = "baddad123";
 
 // --- Fixtures ---------------------------------------------------------------
 
@@ -62,15 +64,36 @@ function verifiedSummary(): InvestigationSummary {
   };
 }
 
+const RETRY_PAYLOAD = {
+  version: 1 as const,
+  investigationId: INV,
+  title: "Sherlock: Return 401 for unknown users",
+  body: "## Summary\n\nVerified fix.",
+  commitMessage: `fix: return 401\n\nSherlock-Investigation: ${INV}\nSherlock-Fix-Attempt: ${FIX}`,
+  files: [{ path: "server.mjs", contents: "fixed\n", mode: "100644" as const }],
+};
+const fixturePayloadStore = createInMemoryDeliveryStateStore();
+const RETRY_PAYLOAD_REFERENCE = await fixturePayloadStore.persistPayload(
+  INV,
+  "retry",
+  RETRY_PAYLOAD,
+);
+
 function retryPlan(overrides: Partial<PullRequestRetryPlan> = {}): PullRequestRetryPlan {
   return {
-    branch: null,
-    title: "Sherlock: Return 401 for unknown users",
-    body: "## Summary\n\nVerified fix.",
-    commitMessage: `fix: return 401\n\nSherlock-Investigation: ${INV}\nSherlock-Fix-Attempt: ${FIX}`,
-    sourceCommit: "c0ffee123",
+    branch: "sherlock/fix-42-login-fix001",
+    sourceCommit: SOURCE_COMMIT,
     baseBranch: "main",
-    files: [{ path: "server.mjs", contents: "fixed\n", mode: "100644" }],
+    expectedTreeSha: EXPECTED_TREE,
+    files: [
+      {
+        path: "server.mjs",
+        mode: "100644",
+        contentSha256:
+          "0c3071418e6356e614898c84ed064ca95e88551bc0811b534bdf1952ecdae534",
+      },
+    ],
+    payload: RETRY_PAYLOAD_REFERENCE,
     ...overrides,
   };
 }
@@ -100,10 +123,10 @@ function pullRequestResult(
   };
 }
 
-function verifiedDeliveryState(input: {
+async function verifiedDeliveryState(input: {
   pullRequest: PullRequestResult | null;
   retryPlan?: PullRequestRetryPlan | null;
-}): DeliveryState {
+}, store: DeliveryStateStore = createInMemoryDeliveryStateStore()): Promise<DeliveryState> {
   return buildDeliveryState({
     investigationId: INV,
     tenantId: "tenant-gh-2",
@@ -120,7 +143,7 @@ function verifiedDeliveryState(input: {
     fixComment: "Sherlock verified a local fix.",
     pullRequest: input.pullRequest,
     retryPlan: input.retryPlan === undefined ? retryPlan() : input.retryPlan,
-  });
+  }, store);
 }
 
 function transientError(message = "GitHub is unavailable") {
@@ -129,7 +152,7 @@ function transientError(message = "GitHub is unavailable") {
 
 function mockGitHub(options: {
   branchExists?: boolean;
-  branchCommit?: { message: string; parentShas: string[] };
+  branchCommit?: { treeSha: string; parentShas: string[] };
   openPullRequest?: { number: number; url: string } | null;
   createPullRequestError?: unknown;
   createBranchError?: unknown;
@@ -137,7 +160,7 @@ function mockGitHub(options: {
   const calls = {
     getBranch: 0,
     createBranchWithCommit: 0,
-    findOpenPullRequest: 0,
+    findPullRequests: 0,
     createPullRequest: 0,
   };
   const client: DeliveryGitHubClient = {
@@ -146,7 +169,7 @@ function mockGitHub(options: {
       return options.branchExists
         ? {
             sha: "deadbeef",
-            message: options.branchCommit?.message ?? retryPlan().commitMessage,
+            treeSha: options.branchCommit?.treeSha ?? EXPECTED_TREE,
             parentShas: options.branchCommit?.parentShas ?? [retryPlan().sourceCommit],
           }
         : null;
@@ -154,11 +177,16 @@ function mockGitHub(options: {
     createBranchWithCommit: async () => {
       calls.createBranchWithCommit += 1;
       if (options.createBranchError) throw options.createBranchError;
-      return { commitSha: "fee1dead" };
+      return { commitSha: "fee1dead", treeSha: EXPECTED_TREE };
     },
-    findOpenPullRequest: async () => {
-      calls.findOpenPullRequest += 1;
-      return options.openPullRequest ?? null;
+    findPullRequests: async () => {
+      calls.findPullRequests += 1;
+      return {
+        matches: options.openPullRequest
+          ? [{ ...options.openPullRequest, state: "open" as const, merged: false }]
+          : [],
+        conflictingBase: false,
+      };
     },
     createPullRequest: async () => {
       calls.createPullRequest += 1;
@@ -208,7 +236,7 @@ function makeExecutorDeps(options: {
 
 describe("delivery executor", () => {
   test("branch push failure: retry recreates the branch through the API, then one PR and one comment", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     expect(state.pullRequest.status).toBe("pending");
@@ -231,7 +259,7 @@ describe("delivery executor", () => {
     // Inspected GitHub before creating anything, and created each exactly once.
     expect(github.calls.getBranch).toBe(1);
     expect(github.calls.createBranchWithCommit).toBe(1);
-    expect(github.calls.findOpenPullRequest).toBe(1);
+    expect(github.calls.findPullRequests).toBe(1);
     expect(github.calls.createPullRequest).toBe(1);
     // Exactly one terminal comment, truthful about the delivered PR.
     expect(comments).toHaveLength(1);
@@ -242,7 +270,7 @@ describe("delivery executor", () => {
 
   test("existing branch and open PR are reused; nothing is created twice", async () => {
     // Simulates a crash after push+PR creation but before any state persisted.
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     const github = mockGitHub({
@@ -264,13 +292,13 @@ describe("delivery executor", () => {
   });
 
   test("an existing branch is reused only when its commit matches this investigation and source", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     const github = mockGitHub({
       branchExists: true,
       branchCommit: {
-        message: "unrelated commit",
+        treeSha: "badcafe99",
         parentShas: [retryPlan().sourceCommit],
       },
     });
@@ -289,7 +317,7 @@ describe("delivery executor", () => {
   });
 
   test("two concurrent delivery attempts serialize the full reconcile and create one of each GitHub resource", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     const deliveryStore = createInMemoryDeliveryStateStore();
@@ -312,44 +340,57 @@ describe("delivery executor", () => {
     expect(fixture.comments).toHaveLength(1);
   });
 
-  test("credential-shaped source is never placed in persisted delivery state", () => {
+  test("credential-shaped source is never placed in persisted delivery state", async () => {
     const credential = "github_pat_EXAMPLECREDENTIAL123456";
-    const state = verifiedDeliveryState({
+    const store = createInMemoryDeliveryStateStore();
+    const payload = await store.persistPayload(INV, "retry", {
+      ...RETRY_PAYLOAD,
+      files: [
+        {
+          path: "server.mjs",
+          contents: `const token = \"${credential}\";\n`,
+          mode: "100644",
+        },
+      ],
+    });
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
       retryPlan: retryPlan({
         files: [
           {
             path: "server.mjs",
-            contents: `const token = \"${credential}\";\n`,
             mode: "100644",
+            contentSha256: "b".repeat(64),
           },
         ],
+        payload,
       }),
     });
 
-    expect(state.retryPlan).toBeNull();
-    expect(state.pullRequest.status).toBe("failed");
+    expect(state.retryPlan).not.toBeNull();
+    expect(state.pullRequest.status).toBe("pending");
     expect(JSON.stringify(state)).not.toContain(credential);
+    expect(JSON.stringify(state)).not.toContain("contents");
   });
 
   test("pull-request API failure: branch stays pushed, PR is created exactly once on retry", async () => {
     // In-pipeline result: push succeeded, PR creation failed.
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("pull_request_failed", {
         reason: "GitHub PR creation failed: 502",
       }),
     });
     expect(state.pullRequest.branchPushed).toBe(true);
 
-    const github = mockGitHub();
+    const github = mockGitHub({ branchExists: true });
     const { deps, comments } = makeExecutorDeps({ github: github.client });
 
     const { state: delivered } = await runDeliveryFromState(state, deps, {
       isFinalAttempt: false,
     });
 
-    // The already-pushed branch is never re-pushed or recreated.
-    expect(github.calls.getBranch).toBe(0);
+    // The already-pushed branch is verified, then never re-pushed or recreated.
+    expect(github.calls.getBranch).toBe(1);
     expect(github.calls.createBranchWithCommit).toBe(0);
     expect(github.calls.createPullRequest).toBe(1);
     expect(delivered.pullRequest.status).toBe("created");
@@ -357,7 +398,7 @@ describe("delivery executor", () => {
   });
 
   test("transient PR failure keeps state pending (with partial progress) and the comment is never posted early", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     const failing = mockGitHub({ createPullRequestError: transientError() });
@@ -398,11 +439,15 @@ describe("delivery executor", () => {
     expect(retry.comments).toHaveLength(1);
   });
 
-  test("final-attempt PR failure is recorded permanently and the comment truthfully reports it", async () => {
-    const state = verifiedDeliveryState({
+  test("a non-retryable PR failure is recorded permanently and the comment truthfully reports it", async () => {
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("pull_request_failed"),
     });
-    const github = mockGitHub({ createPullRequestError: transientError() });
+    const github = mockGitHub({
+      createPullRequestError: Object.assign(new Error("validation failed"), {
+        status: 422,
+      }),
+    });
     const { deps, comments, stateStore } = makeExecutorDeps({ github: github.client });
 
     const { state: delivered, complete } = await runDeliveryFromState(state, deps, {
@@ -424,8 +469,27 @@ describe("delivery executor", () => {
     expect(record?.pullRequestStatus).toBe("delivery_failed");
   });
 
+  test("a transient PR ambiguity remains pending even on the final configured attempt", async () => {
+    const deliveryStore = createInMemoryDeliveryStateStore();
+    const state = await verifiedDeliveryState(
+      { pullRequest: pullRequestResult("pull_request_failed") },
+      deliveryStore,
+    );
+    const github = mockGitHub({ createPullRequestError: transientError() });
+    const { deps, comments } = makeExecutorDeps({
+      github: github.client,
+      deliveryStore,
+    });
+
+    await expect(
+      runDeliveryFromState(state, deps, { isFinalAttempt: true }),
+    ).rejects.toBeInstanceOf(DeliveryRetryableError);
+    expect((await deliveryStore.load(INV))?.pullRequest.status).toBe("pending");
+    expect(comments).toHaveLength(0);
+  });
+
   test("transient comment failure retries and posts exactly one comment in the end", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("created", {
         pullRequestNumber: 9,
         pullRequestUrl: "https://github.com/acme/app/pull/9",
@@ -455,7 +519,7 @@ describe("delivery executor", () => {
   });
 
   test("an already-posted terminal comment (found by marker) is never duplicated", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("created", {
         pullRequestNumber: 9,
         pullRequestUrl: "https://github.com/acme/app/pull/9",
@@ -474,7 +538,7 @@ describe("delivery executor", () => {
   });
 
   test("a terminal delivery state makes further runs no-ops", async () => {
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("created", {
         pullRequestNumber: 9,
         pullRequestUrl: "https://github.com/acme/app/pull/9",
@@ -505,7 +569,7 @@ describe("delivery executor", () => {
         throw new Error("Supabase state-store write failed: db unreachable");
       },
     };
-    const state = verifiedDeliveryState({
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
     });
     const github = mockGitHub();
@@ -564,13 +628,13 @@ describe("workspace-less branch reconstruction", () => {
       requests.push({ url, init });
 
       if (url.endsWith("/git/commits/c0ffee123") && init?.method === "GET") {
-        return Response.json({ tree: { sha: "base-tree" } });
+        return Response.json({ tree: { sha: "ba5e7ee" } });
       }
       if (url.endsWith("/git/trees")) {
-        return Response.json({ sha: "new-tree" });
+        return Response.json({ sha: "deadcafe1" });
       }
       if (url.endsWith("/git/commits") && init?.method === "POST") {
-        return Response.json({ sha: "new-commit" });
+        return Response.json({ sha: "c011117" });
       }
       if (url.endsWith("/git/refs")) {
         return Response.json({ ref: "refs/heads/sherlock/fix-42-delete" });
@@ -588,8 +652,10 @@ describe("workspace-less branch reconstruction", () => {
       await client.createBranchWithCommit({
         branch: "sherlock/fix-42-delete",
         baseCommitSha: "c0ffee123",
-        message: retryPlan().commitMessage,
+        message: RETRY_PAYLOAD.commitMessage,
         files: [{ path: "obsolete.mjs", contents: null, mode: "100644" }],
+        expectedTreeSha: "deadcafe1",
+        assertOwnership: async () => {},
       });
 
       expect(requests.some(({ url }) => url.endsWith("/git/blobs"))).toBe(false);
@@ -805,7 +871,7 @@ describe("worker delivery decoupling", () => {
     // Simulates a stalled/crashed worker: delivery state persisted, job retried.
     const fixture = makeWorkerDeps({});
     await fixture.deliveryStore.save(
-      verifiedDeliveryState({
+      await verifiedDeliveryState({
         pullRequest: pullRequestResult("created", {
           pullRequestNumber: 7,
           pullRequestUrl: "https://github.com/acme/app/pull/7",
@@ -897,8 +963,24 @@ describe("worker delivery decoupling", () => {
       async save() {
         throw new Error("delivery volume is read-only");
       },
+      async loadTerminalFailure() {
+        return null;
+      },
+      async saveTerminalFailure() {
+        throw new Error("delivery volume is read-only");
+      },
+      async persistPayload() {
+        throw new Error("delivery volume is read-only");
+      },
+      async loadPayload() {
+        throw new Error("delivery volume is read-only");
+      },
       async withLock(_investigationId, operation) {
-        return operation();
+        return operation({
+          token: "test",
+          renew: async () => {},
+          assertOwned: async () => {},
+        });
       },
     };
     const fixture = makeWorkerDeps({
@@ -921,7 +1003,7 @@ describe("worker delivery decoupling", () => {
   test("the delivery processor runs with no pipeline, Anthropic, reproduction, fixer, sandbox, or validation adapter", async () => {
     const store = createInMemoryDeliveryStateStore();
     await store.save(
-      verifiedDeliveryState({
+      await verifiedDeliveryState({
         pullRequest: pullRequestResult("created", {
           pullRequestNumber: 7,
           pullRequestUrl: "https://github.com/acme/app/pull/7",
@@ -964,13 +1046,13 @@ describe("worker delivery decoupling", () => {
     try {
       const firstWorkerStore = createFileDeliveryStateStore(root);
       await firstWorkerStore.save(
-        verifiedDeliveryState({
+        await verifiedDeliveryState({
           pullRequest: pullRequestResult("created", {
             pullRequestNumber: 7,
             pullRequestUrl: "https://github.com/acme/app/pull/7",
             reason: null,
           }),
-        }),
+        }, firstWorkerStore),
       );
 
       const persisted = await readFile(
@@ -1027,8 +1109,8 @@ describe("worker delivery decoupling", () => {
 // --- Terminal comment truthfulness -------------------------------------------
 
 describe("terminal comment truthfulness", () => {
-  test("fully delivered verified fix names the pull request", () => {
-    const state = verifiedDeliveryState({
+  test("fully delivered verified fix names the pull request", async () => {
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("created", {
         pullRequestNumber: 7,
         pullRequestUrl: "https://github.com/acme/app/pull/7",
@@ -1036,28 +1118,41 @@ describe("terminal comment truthfulness", () => {
       }),
     });
 
-    const comment = buildTerminalComment(state);
+    const comment = buildTerminalComment(state, {
+      version: 1,
+      investigationId: INV,
+      summary: verifiedSummary(),
+      analysisComment: null,
+      fixComment: "Sherlock verified a local fix.",
+    });
     expect(comment).toContain("verified a fix");
     expect(comment).toContain("Pull request: created");
     expect(comment).toContain("https://github.com/acme/app/pull/7");
     expect(comment).toContain(terminalCommentMarker(INV));
   });
 
-  test("fix verified but PR delivery failed says so and never claims a PR", () => {
-    const state = verifiedDeliveryState({
+  test("fix verified but PR delivery failed says so and never claims a PR", async () => {
+    const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
       retryPlan: null,
     });
     expect(state.pullRequest.status).toBe("failed");
 
-    const comment = buildTerminalComment(state);
+    const comment = buildTerminalComment(state, {
+      version: 1,
+      investigationId: INV,
+      summary: verifiedSummary(),
+      analysisComment: null,
+      fixComment: "Sherlock verified a local fix.",
+    });
     expect(comment).toContain("Pull request: delivery_failed");
     expect(comment).toContain("did not open a pull request");
     expect(comment).not.toContain("opened a pull request");
   });
 
-  test("reproduced without a verified fix has no pull-request section", () => {
-    const state = buildDeliveryState({
+  test("reproduced without a verified fix has no pull-request section", async () => {
+    const summary = { investigationId: INV, outcome: "reproduced" as const };
+    const state = await buildDeliveryState({
       investigationId: INV,
       tenantId: "tenant-gh-2",
       installationId: 2,
@@ -1066,23 +1161,34 @@ describe("terminal comment truthfulness", () => {
       issueNumber: 42,
       issueTitle: "Login returns 500",
       outcome: "reproduced",
-      summary: { investigationId: INV, outcome: "reproduced" },
+      summary,
       fixVerified: false,
       fixAttemptId: null,
       analysisComment: "Analysis:\nThe handler always returns 500.",
       fixComment: null,
       pullRequest: null,
       retryPlan: null,
-    });
+    }, createInMemoryDeliveryStateStore());
 
-    const comment = buildTerminalComment(state);
+    const comment = buildTerminalComment(state, {
+      version: 1,
+      investigationId: INV,
+      summary,
+      analysisComment: "Analysis:\nThe handler always returns 500.",
+      fixComment: null,
+    });
     expect(comment).toContain("Sherlock reproduced the reported failure.");
     expect(comment).toContain("Analysis:");
     expect(comment).not.toContain("Pull request:");
   });
 
-  test("a failed investigation reports the failure outcome", () => {
-    const state = buildDeliveryState({
+  test("a failed investigation reports the failure outcome", async () => {
+    const summary = {
+      investigationId: INV,
+      outcome: "execution_failed" as const,
+      error: "the reproduction runner crashed",
+    };
+    const state = await buildDeliveryState({
       investigationId: INV,
       tenantId: "tenant-gh-2",
       installationId: 2,
@@ -1091,20 +1197,22 @@ describe("terminal comment truthfulness", () => {
       issueNumber: 42,
       issueTitle: "Login returns 500",
       outcome: "execution_failed",
-      summary: {
-        investigationId: INV,
-        outcome: "execution_failed",
-        error: "the reproduction runner crashed",
-      },
+      summary,
       fixVerified: false,
       fixAttemptId: null,
       analysisComment: null,
       fixComment: null,
       pullRequest: null,
       retryPlan: null,
-    });
+    }, createInMemoryDeliveryStateStore());
 
-    const comment = buildTerminalComment(state);
+    const comment = buildTerminalComment(state, {
+      version: 1,
+      investigationId: INV,
+      summary,
+      analysisComment: null,
+      fixComment: null,
+    });
     expect(comment).toContain("execution problem");
     expect(comment).toContain("Outcome: execution_failed");
     expect(comment).not.toContain("Pull request:");

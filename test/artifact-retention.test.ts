@@ -21,12 +21,10 @@ import {
   type ArtifactRetentionConfig,
 } from "../backend/services/artifact-retention.js";
 import {
-  buildDeliveryState,
   createFileDeliveryStateStore,
   DELIVERY_STATE_FILE,
   type DeliveryState,
 } from "../backend/services/delivery.js";
-import type { PullRequestResult } from "../backend/services/pull-request.js";
 import type { InvestigationOutcome } from "../backend/services/report.js";
 
 const roots: string[] = [];
@@ -49,26 +47,6 @@ function nextInvestigationId() {
   return `inv_0RETENTION${String(idCounter).padStart(3, "0")}`;
 }
 
-function createdPullRequest(investigationId: string): PullRequestResult {
-  const at = new Date().toISOString();
-  return {
-    status: "created",
-    key: `acme/app#42:${investigationId}:fix_0RETENTION0001`,
-    owner: "acme",
-    repo: "app",
-    remote: "origin",
-    branch: `sherlock/fix-42-${investigationId.toLowerCase()}`,
-    baseBranch: "main",
-    commitSha: "deadbeef",
-    sourceCommit: "c0ffee123",
-    pullRequestNumber: 7,
-    pullRequestUrl: "https://github.com/acme/app/pull/7",
-    reason: null,
-    startedAt: at,
-    createdAt: at,
-  };
-}
-
 function terminalState(input: {
   investigationId: string;
   outcome?: InvestigationOutcome;
@@ -76,29 +54,49 @@ function terminalState(input: {
 }): DeliveryState {
   const outcome = input.outcome ?? "verified_fix";
   const verified = outcome === "verified_fix";
-  const state = buildDeliveryState({
+  const createdAt = new Date(0).toISOString();
+  return {
+    version: 2,
     investigationId: input.investigationId,
     tenantId: "tenant-gh-2",
     installationId: 2,
     repoOwner: "acme",
     repoName: "app",
     issueNumber: 42,
-    issueTitle: "Login failure",
-    outcome,
-    summary: { investigationId: input.investigationId, outcome },
+    executionOutcome: outcome,
     fixVerified: verified,
     fixAttemptId: verified ? "fix_0RETENTION0001" : null,
-    analysisComment: null,
-    fixComment: null,
-    pullRequest: verified ? createdPullRequest(input.investigationId) : null,
+    pullRequest: verified
+      ? {
+          status: "created",
+          branchPushed: true,
+          branch: `sherlock/fix-42-${input.investigationId.toLowerCase()}`,
+          number: 7,
+          url: "https://github.com/acme/app/pull/7",
+          reason: null,
+        }
+      : {
+          status: "not_applicable",
+          branchPushed: false,
+          branch: null,
+          number: null,
+          url: null,
+          reason: null,
+        },
     retryPlan: null,
-  });
-  state.terminalComment = {
-    status: "posted",
-    postedAt: input.deliveredAt ?? new Date(0).toISOString(),
-    reason: null,
+    terminalPayload: {
+      path: `protected-delivery/terminal-${"a".repeat(64)}.json`,
+      sha256: "a".repeat(64),
+      sizeBytes: 10,
+    },
+    terminalComment: {
+      status: "posted",
+      postedAt: input.deliveredAt ?? createdAt,
+      reason: null,
+    },
+    createdAt,
+    updatedAt: createdAt,
   };
-  return state;
 }
 
 function config(
@@ -244,7 +242,7 @@ describe("terminal delivery gates", () => {
     expect(await exists(path.join(root, investigationId))).toBe(true);
   });
 
-  test("terminal comments reporting failed fix delivery retain artifacts", async () => {
+  test("terminal failed fix delivery uses the failed-artifact TTL", async () => {
     const root = await temporaryRoot();
     const investigationId = nextInvestigationId();
     const state = terminalState({ investigationId });
@@ -254,17 +252,48 @@ describe("terminal delivery gates", () => {
     state.pullRequest.url = null;
     state.pullRequest.reason = "delivery failed";
     const store = await persistState(root, state);
+    const before = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: config({ failedRetentionMs: 1_000 }),
+      now: () => 999,
+      log: () => {},
+    });
+
+    expect((await before.cleanupInvestigation(investigationId)).status).toBe(
+      "not_expired",
+    );
+    const after = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: config({ failedRetentionMs: 1_000 }),
+      now: () => 1_000,
+      log: () => {},
+    });
+    expect((await after.cleanupInvestigation(investigationId)).status).toBe(
+      "deleted",
+    );
+  });
+
+  test("a permanently failed terminal comment uses the failed-artifact TTL", async () => {
+    const root = await temporaryRoot();
+    const investigationId = nextInvestigationId();
+    const state = terminalState({ investigationId });
+    state.terminalComment = { status: "failed", postedAt: null, reason: null };
+    const store = await persistState(root, state);
     const cleanup = createArtifactCleanupService({
       rootDir: root,
       deliveryStore: store,
       protection: createNoopArtifactCleanupProtection(),
-      config: config(),
-      now: () => Number.MAX_SAFE_INTEGER,
+      config: config({ failedRetentionMs: 1_000 }),
+      now: () => 1_000,
       log: () => {},
     });
 
     expect((await cleanup.cleanupInvestigation(investigationId)).status).toBe(
-      "not_terminal",
+      "deleted",
     );
   });
 });
@@ -346,6 +375,7 @@ describe("queue and concurrency protection", () => {
     const delayedId = nextInvestigationId();
     const waitingId = nextInvestigationId();
     const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
       getJobCounts: vi.fn(async () => ({ delayed: 1, waiting: 1 })),
       getJobs: vi.fn(async () => [
         { data: { investigationId: delayedId } },
@@ -355,8 +385,9 @@ describe("queue and concurrency protection", () => {
     } as unknown as Pick<Queue, "getJobCounts" | "getJobs" | "getJob">;
     const protection = createRedisArtifactCleanupProtection({
       queue,
-      redis: { eval: vi.fn(async () => 0) },
-      maxQueueJobs: 10,
+      redis: {
+        eval: vi.fn(async (script: string) => (script.includes("EXISTS") ? 1 : 0)),
+      },
     });
     const snapshot = await protection.snapshot();
 
@@ -377,19 +408,26 @@ describe("queue and concurrency protection", () => {
         : undefined,
     );
     const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
       getJobCounts: vi.fn(async () => ({})),
       getJobs: vi.fn(async () => []),
       getJob,
     } as unknown as Pick<Queue, "getJobCounts" | "getJobs" | "getJob">;
     const redis = {
-      eval: vi.fn(async (...args: unknown[]) =>
-        args.includes(`tenant-gh-2`) ? 1 : 1,
-      ),
+      eval: vi.fn(async (script: string, _keys: number, ...args: unknown[]) => {
+        if (script.includes("EXISTS")) {
+          return args.some((value) =>
+            String(value).endsWith(`deliver_${deliveryId}`),
+          )
+            ? 1
+            : 0;
+        }
+        return args.includes(leaseId) ? 1 : 0;
+      }),
     };
     const protection = createRedisArtifactCleanupProtection({
       queue,
       redis,
-      maxQueueJobs: 10,
     });
     const snapshot = await protection.snapshot();
 
@@ -401,22 +439,31 @@ describe("queue and concurrency protection", () => {
     ).toBe(true);
   });
 
-  test("oversized pending queue state makes the whole snapshot fail closed", async () => {
+  test("large unrelated queue state still inspects only one safe delivery id", async () => {
+    const evalRedis = vi.fn(async () => 0);
     const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
       getJobCounts: vi.fn(async () => ({ active: 11 })),
       getJobs: vi.fn(async () => []),
       getJob: vi.fn(async () => undefined),
     } as unknown as Pick<Queue, "getJobCounts" | "getJobs" | "getJob">;
     const protection = createRedisArtifactCleanupProtection({
       queue,
-      redis: { eval: vi.fn(async () => 0) },
-      maxQueueJobs: 10,
+      redis: { eval: evalRedis },
     });
 
-    await expect(protection.snapshot()).rejects.toThrow(
-      "bounded cleanup scan",
-    );
+    const snapshot = await protection.snapshot();
+    await expect(
+      snapshot.isProtected(
+        terminalState({ investigationId: nextInvestigationId() }),
+      ),
+    ).resolves.toBe(false);
     expect(queue.getJobs).not.toHaveBeenCalled();
+    const deliveryProbe = String(evalRedis.mock.calls[0]?.[0]);
+    expect(deliveryProbe).toContain("HMGET");
+    expect(deliveryProbe).not.toContain("HGETALL");
+    expect(deliveryProbe).not.toContain("LPOS");
+    expect(evalRedis.mock.calls[0]?.[1]).toBe(1);
   });
 });
 

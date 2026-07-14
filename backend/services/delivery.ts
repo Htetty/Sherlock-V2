@@ -14,41 +14,49 @@
 // Idempotency contract (per investigation):
 //   - at most one Sherlock branch: the recorded/derived branch name is looked
 //     up on GitHub before any create;
-//   - at most one pull request: an open PR for the head branch is reused;
+//   - at most one pull request: all PR states are reconciled for the exact
+//     repository, head, and base before any create;
 //   - at most one terminal issue comment: every terminal comment embeds an
 //     HTML marker, and the issue's comments are checked for that marker
 //     before posting.
 //
-// No secrets: the state file contains ids, statuses, already-redacted comment
-// text, and post-patch source file contents (the same material the artifact
-// store already persists). Installation tokens are minted per attempt and are
-// never written to Redis or durable state.
+// No credentials or customer text are stored in delivery-state.json. PR text,
+// terminal-comment material, and post-patch source bytes live in separate
+// mode-0600, content-addressed raw artifacts. The JSON state contains only
+// bounded identities, hashes, relative references, and delivery statuses.
 
-import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
+  open,
   mkdir,
+  mkdtemp,
+  readdir,
   lstat,
   readFile,
   rename,
-  rmdir,
+  rm,
   stat,
   unlink,
-  utimes,
   writeFile,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { getArtifactsRoot, isInvestigationId } from "./artifacts.js";
+import { promisify } from "node:util";
+import {
+  getArtifactsRoot,
+  isFixAttemptId,
+  isInvestigationId,
+} from "./artifacts.js";
 import {
   buildCommitMessage,
   buildFixBranchName,
   buildPullRequestBody,
   buildPullRequestTitle,
   checkPullRequestPreconditions,
-  createGitHubRestClient,
   isForbiddenPullRequestPath,
   SHERLOCK_AUTHOR_EMAIL,
   SHERLOCK_AUTHOR_NAME,
-  type GitHubClient,
   type PullRequestInput,
   type PullRequestResult,
 } from "./pull-request.js";
@@ -80,6 +88,8 @@ export type DeliveryPullRequestStatus =
   | "pending"
   | "created"
   | "reused"
+  | "merged"
+  | "blocked"
   | "failed";
 
 export type DeliveryCommentStatus = "pending" | "posted" | "failed";
@@ -92,38 +102,62 @@ export type DeliveryFile = {
   mode: "100644" | "100755";
 };
 
-// Everything needed to recreate the fix branch and pull request through the
-// GitHub API when the local workspace (and its git commit) no longer exists.
-// Captured from the verified workspace before it is cleaned up; all text
-// fields are already redacted by the pull-request builders.
-export type PullRequestRetryPlan = {
-  branch: string | null;
+export type DeliveryFileIdentity = {
+  path: string;
+  mode: "100644" | "100755";
+  contentSha256: string | null;
+};
+
+export type DeliveryArtifactReference = {
+  path: string;
+  sha256: string;
+  sizeBytes: number;
+};
+
+export type PullRequestRetryPayload = {
+  version: 1;
+  investigationId: string;
   title: string;
   body: string;
   commitMessage: string;
-  sourceCommit: string;
-  baseBranch: string;
   files: DeliveryFile[];
 };
 
-export type DeliveryState = {
+export type TerminalCommentPayload = {
   version: 1;
+  investigationId: string;
+  summary: InvestigationSummary;
+  analysisComment: string | null;
+  fixComment: string | null;
+};
+
+// Everything needed to recreate the fix branch and pull request through the
+// GitHub API when the local workspace (and its git commit) no longer exists.
+// Captured from the verified workspace before it is cleaned up; text and
+// source bytes live only in the protected raw payload referenced here.
+export type PullRequestRetryPlan = {
+  branch: string;
+  sourceCommit: string;
+  baseBranch: string;
+  expectedTreeSha: string;
+  files: DeliveryFileIdentity[];
+  payload: DeliveryArtifactReference;
+};
+
+export type DeliveryState = {
+  version: 2;
   investigationId: string;
   tenantId: string;
   installationId: number;
   repoOwner: string;
   repoName: string;
   issueNumber: number;
-  issueTitle: string;
   // Terminal execution outcome of the pipeline (verified_fix, reproduced,
   // not_reproduced, plan_failed, environment_failed, execution_failed).
   executionOutcome: string;
   // Patch verification outcome, independent of any GitHub delivery.
   fixVerified: boolean;
   fixAttemptId: string | null;
-  summary: InvestigationSummary;
-  analysisComment: string | null;
-  fixComment: string | null;
   pullRequest: {
     status: DeliveryPullRequestStatus;
     // Branch push status: true once the fix branch exists on GitHub.
@@ -134,6 +168,7 @@ export type DeliveryState = {
     reason: string | null;
   };
   retryPlan: PullRequestRetryPlan | null;
+  terminalPayload: DeliveryArtifactReference;
   terminalComment: {
     status: DeliveryCommentStatus;
     postedAt: string | null;
@@ -143,13 +178,57 @@ export type DeliveryState = {
   updatedAt: string;
 };
 
+export type TerminalFailureCategory =
+  | "repository"
+  | "infrastructure"
+  | "preflight"
+  | "worker";
+
+export type TerminalFailureRecord = {
+  version: 1;
+  investigationId: string;
+  tenantId: string;
+  repoOwner: string;
+  repoName: string;
+  category: TerminalFailureCategory;
+  stage: string;
+  terminalAt: string;
+  retentionEligibleAt: string;
+};
+
 const MAX_DELIVERY_ERROR_CHARS = 2_000;
 const MAX_DELIVERY_TEXT_CHARS = 20_000;
-const MAX_DELIVERY_TITLE_CHARS = 500;
 const MAX_RETRY_PLAN_FILES = 50;
-const MAX_DELIVERY_STATE_BYTES = 3 * 1024 * 1024;
-const DELIVERY_LOCK_STALE_MS = 10 * 60_000;
-const DELIVERY_LOCK_HEARTBEAT_MS = 30_000;
+const MAX_DELIVERY_STATE_BYTES = 128 * 1024;
+const MAX_DELIVERY_PAYLOAD_BYTES = 3 * 1024 * 1024;
+export const DELIVERY_LOCK_TTL_MS = 20_000;
+export const DELIVERY_LOCK_HEARTBEAT_MS = 5_000;
+const execFileAsync = promisify(execFile);
+const DELIVERY_OUTCOMES = new Set([
+  "reproduced",
+  "not_reproduced",
+  "plan_failed",
+  "environment_failed",
+  "execution_failed",
+  "verified_fix",
+]);
+const DELIVERY_STAGES = new Set([
+  "queued",
+  "running",
+  "reproducing",
+  "fixing",
+  "verifying",
+  "preparing_delivery",
+  "delivering",
+  "completed",
+  "failed",
+]);
+const PULL_REQUEST_FAILED_REASON =
+  "GitHub pull-request delivery failed permanently.";
+const PULL_REQUEST_BLOCKED_REASON =
+  "The matching pull request is closed without being merged; Sherlock will not create a replacement.";
+const TERMINAL_COMMENT_FAILED_REASON =
+  "GitHub terminal-comment delivery failed permanently.";
 
 export function isDeliveryComplete(state: DeliveryState): boolean {
   return (
@@ -172,7 +251,8 @@ export function isFixFullyDelivered(state: DeliveryState): boolean {
     state.fixVerified &&
     state.pullRequest.branchPushed &&
     (state.pullRequest.status === "created" ||
-      state.pullRequest.status === "reused") &&
+      state.pullRequest.status === "reused" ||
+      state.pullRequest.status === "merged") &&
     state.terminalComment.status === "posted"
   );
 }
@@ -199,77 +279,56 @@ export type DeliveryStateInput = {
   retryPlan: PullRequestRetryPlan | null;
 };
 
-export function buildDeliveryState(input: DeliveryStateInput): DeliveryState {
+export async function buildDeliveryState(
+  input: DeliveryStateInput,
+  store: DeliveryStateStore,
+): Promise<DeliveryState> {
+  validateRepositoryIdentity(input.repoOwner, input.repoName);
+  if (
+    !isInvestigationId(input.investigationId) ||
+    !Number.isSafeInteger(input.installationId) ||
+    input.installationId <= 0 ||
+    input.tenantId !== `tenant-gh-${input.installationId}` ||
+    !Number.isSafeInteger(input.issueNumber) ||
+    input.issueNumber <= 0 ||
+    !DELIVERY_OUTCOMES.has(input.outcome) ||
+    (input.fixAttemptId !== null && !isFixAttemptId(input.fixAttemptId))
+  ) {
+    throw new Error("Delivery input contains invalid metadata.");
+  }
   const at = new Date().toISOString();
   const retryPlan = sanitizeRetryPlan(input.retryPlan);
   const pullRequest = mapPipelinePullRequest({ ...input, retryPlan });
+  const terminalPayload = await store.persistPayload(
+    input.investigationId,
+    "terminal",
+    {
+      version: 1,
+      investigationId: input.investigationId,
+      summary: input.summary,
+      analysisComment: input.analysisComment,
+      fixComment: input.fixComment,
+    } satisfies TerminalCommentPayload,
+  );
 
   return {
-    version: 1,
+    version: 2,
     investigationId: input.investigationId,
-    tenantId: boundedSafeText(input.tenantId, 200),
+    tenantId: input.tenantId,
     installationId: input.installationId,
-    repoOwner: boundedSafeText(input.repoOwner, 100),
-    repoName: boundedSafeText(input.repoName, 100),
+    repoOwner: input.repoOwner,
+    repoName: input.repoName,
     issueNumber: input.issueNumber,
-    issueTitle: boundedSafeText(input.issueTitle, MAX_DELIVERY_TITLE_CHARS),
-    executionOutcome: boundedSafeText(input.outcome, 100),
+    executionOutcome: input.outcome,
     fixVerified: input.fixVerified,
-    fixAttemptId: input.fixAttemptId
-      ? boundedSafeText(input.fixAttemptId, 200)
-      : null,
-    summary: sanitizeSummary(input.summary),
-    analysisComment: input.analysisComment
-      ? boundedSafeText(input.analysisComment, MAX_DELIVERY_TEXT_CHARS)
-      : null,
-    fixComment: input.fixComment
-      ? boundedSafeText(input.fixComment, MAX_DELIVERY_TEXT_CHARS)
-      : null,
+    fixAttemptId: input.fixAttemptId,
     pullRequest,
     // The retry plan is only needed while PR delivery is unfinished.
     retryPlan: pullRequest.status === "pending" ? retryPlan : null,
+    terminalPayload,
     terminalComment: { status: "pending", postedAt: null, reason: null },
     createdAt: at,
     updatedAt: at,
-  };
-}
-
-function sanitizeSummary(summary: InvestigationSummary): InvestigationSummary {
-  return {
-    investigationId: boundedSafeText(summary.investigationId, 200),
-    outcome: summary.outcome,
-    ...(summary.observed != null
-      ? { observed: boundedSafeText(summary.observed, 2_000) }
-      : {}),
-    ...(summary.expected != null
-      ? { expected: boundedSafeText(summary.expected, 2_000) }
-      : {}),
-    ...(summary.stage != null
-      ? { stage: boundedSafeText(summary.stage, 200) }
-      : {}),
-    ...(summary.error != null
-      ? { error: boundedSafeText(summary.error, MAX_DELIVERY_ERROR_CHARS) }
-      : {}),
-    ...(summary.planErrors
-      ? {
-          planErrors: summary.planErrors
-            .slice(0, 10)
-            .map((error) => boundedSafeText(error, 1_000)),
-        }
-      : {}),
-    ...(summary.reproductionMode != null
-      ? { reproductionMode: boundedSafeText(summary.reproductionMode, 100) }
-      : {}),
-    ...(summary.originalOutcome != null
-      ? { originalOutcome: boundedSafeText(summary.originalOutcome, 100) }
-      : {}),
-    ...(summary.verification != null
-      ? { verification: boundedSafeText(summary.verification, 100) }
-      : {}),
-    ...(summary.pullRequestStatus != null
-      ? { pullRequestStatus: boundedSafeText(summary.pullRequestStatus, 100) }
-      : {}),
-    ...(summary.evidence ? { evidence: { ...summary.evidence } } : {}),
   };
 }
 
@@ -298,20 +357,6 @@ function safeDeliveryFilePath(filePath: string): boolean {
   );
 }
 
-// Delivery state may contain verified source text so a branch can be rebuilt
-// after the workspace is gone. Refuse a retry plan if that text itself looks
-// like credential material; never redact source bytes and accidentally push a
-// patch different from the one that passed verification.
-function containsCredentialMaterial(contents: string): boolean {
-  return [
-    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-    /\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/i,
-    /\b(?:api[_-]?key|token|secret|password|passwd|credential|authorization|webhook[_-]?secret)\b\s*[:=]\s*["'`][^"'`\r\n]{4,}["'`]/i,
-    /\b(?:sk-|ghp_|gho_|ghs_|github_pat_|xox[a-z]-)[A-Za-z0-9_-]{8,}/,
-    /\b[a-z][a-z0-9+.-]*:\/\/[^:/\s@]+:[^@\s]+@/i,
-  ].some((pattern) => pattern.test(contents));
-}
-
 function safeBranchName(branch: string | null): string | null {
   if (!branch) return null;
   if (
@@ -329,6 +374,40 @@ function safeBranchName(branch: string | null): string | null {
   return branch;
 }
 
+function canonicalPullRequestUrl(
+  owner: string,
+  repo: string,
+  number: number | null,
+): string | null {
+  return number !== null && Number.isSafeInteger(number) && number > 0
+    ? `https://github.com/${owner}/${repo}/pull/${number}`
+    : null;
+}
+
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const GIT_SHA_PATTERN = /^[0-9a-f]{7,64}$/i;
+const DELIVERY_PAYLOAD_DIRECTORY = "protected-delivery";
+
+function sanitizeArtifactReference(
+  reference: DeliveryArtifactReference,
+): DeliveryArtifactReference | null {
+  if (
+    !reference ||
+    typeof reference.path !== "string" ||
+    path.posix.normalize(reference.path) !== reference.path ||
+    !reference.path.startsWith(`${DELIVERY_PAYLOAD_DIRECTORY}/`) ||
+    path.posix.isAbsolute(reference.path) ||
+    reference.path.includes("\0") ||
+    !SHA256_PATTERN.test(reference.sha256) ||
+    !Number.isSafeInteger(reference.sizeBytes) ||
+    reference.sizeBytes <= 0 ||
+    reference.sizeBytes > MAX_DELIVERY_PAYLOAD_BYTES
+  ) {
+    return null;
+  }
+  return { ...reference };
+}
+
 function sanitizeRetryPlan(
   plan: PullRequestRetryPlan | null,
 ): PullRequestRetryPlan | null {
@@ -337,8 +416,7 @@ function sanitizeRetryPlan(
   }
 
   const seen = new Set<string>();
-  let totalBytes = 0;
-  const files: DeliveryFile[] = [];
+  const files: DeliveryFileIdentity[] = [];
 
   for (const file of plan.files) {
     if (
@@ -350,44 +428,42 @@ function sanitizeRetryPlan(
     }
     seen.add(file.path);
 
-    if (file.contents !== null) {
-      const bytes = Buffer.byteLength(file.contents, "utf8");
-      if (
-        bytes > MAX_RETRY_PLAN_FILE_BYTES ||
-        containsCredentialMaterial(file.contents)
-      ) {
-        return null;
-      }
-      totalBytes += bytes;
-    }
-
-    if (totalBytes > MAX_RETRY_PLAN_TOTAL_BYTES) {
+    if (
+      file.contentSha256 !== null &&
+      !SHA256_PATTERN.test(file.contentSha256)
+    ) {
       return null;
     }
 
-    files.push({ path: file.path, contents: file.contents, mode: file.mode });
+    files.push({
+      path: file.path,
+      mode: file.mode,
+      contentSha256: file.contentSha256,
+    });
   }
 
+  const payload = sanitizeArtifactReference(plan.payload);
   if (
-    !/^[0-9a-f]{7,64}$/i.test(plan.sourceCommit) ||
-    !safeBranchName(plan.baseBranch)
+    !GIT_SHA_PATTERN.test(plan.sourceCommit) ||
+    !GIT_SHA_PATTERN.test(plan.expectedTreeSha) ||
+    !safeBranchName(plan.baseBranch) ||
+    !payload
   ) {
     return null;
   }
 
   const branch = safeBranchName(plan.branch);
-  if (plan.branch !== null && !branch) {
+  if (!branch) {
     return null;
   }
 
   return {
     branch,
-    title: boundedSafeText(plan.title, 120),
-    body: boundedSafeText(plan.body, MAX_DELIVERY_TEXT_CHARS),
-    commitMessage: boundedSafeText(plan.commitMessage, 2_000),
     sourceCommit: plan.sourceCommit,
     baseBranch: plan.baseBranch,
+    expectedTreeSha: plan.expectedTreeSha,
     files,
+    payload,
   };
 }
 
@@ -416,19 +492,25 @@ function mapPipelinePullRequest(
           ...none,
           status: "failed",
           branchPushed: false,
-          reason: "The pull-request flow failed before producing a result.",
+          reason: PULL_REQUEST_FAILED_REASON,
         };
   }
 
   const common = {
     branch: safeBranchName(result.branch),
-    number: result.pullRequestNumber,
-    url: result.pullRequestUrl
-      ? boundedSafeText(result.pullRequestUrl, 2_000)
-      : null,
-    reason: result.reason
-      ? boundedSafeText(result.reason, MAX_DELIVERY_ERROR_CHARS)
-      : null,
+    number:
+      result.pullRequestNumber !== null &&
+      Number.isSafeInteger(result.pullRequestNumber) &&
+      result.pullRequestNumber > 0
+        ? result.pullRequestNumber
+        : null,
+    url: canonicalPullRequestUrl(
+      input.repoOwner,
+      input.repoName,
+      result.pullRequestNumber,
+    ),
+    // Pipeline exception text is deliberately not copied into durable state.
+    reason: null as string | null,
   };
 
   switch (result.status) {
@@ -444,10 +526,20 @@ function mapPipelinePullRequest(
     case "push_failed":
       return input.retryPlan
         ? { ...common, status: "pending", branchPushed: false }
-        : { ...common, status: "failed", branchPushed: false };
+        : {
+            ...common,
+            status: "failed",
+            branchPushed: false,
+            reason: PULL_REQUEST_FAILED_REASON,
+          };
     case "precondition_failed":
       // Verification preconditions failed; a PR must not be created at all.
-      return { ...common, status: "failed", branchPushed: false };
+      return {
+        ...common,
+        status: "failed",
+        branchPushed: false,
+        reason: PULL_REQUEST_FAILED_REASON,
+      };
   }
 }
 
@@ -462,6 +554,8 @@ const MAX_RETRY_PLAN_TOTAL_BYTES = 2 * 1024 * 1024;
 // guessing.
 export async function capturePullRequestRetryPlan(
   input: PullRequestInput,
+  payloadStore: Pick<DeliveryStateStore, "persistPayload"> =
+    createFileDeliveryStateStore(),
 ): Promise<PullRequestRetryPlan | null> {
   const preconditionError = await checkPullRequestPreconditions(input);
   if (preconditionError) {
@@ -517,9 +611,6 @@ export async function capturePullRequestRetryPlan(
     }
 
     const contents = await readFile(resolved, "utf8");
-    if (containsCredentialMaterial(contents)) {
-      return null;
-    }
 
     files.push({
       path: filePath,
@@ -532,17 +623,76 @@ export async function capturePullRequestRetryPlan(
     return null;
   }
 
+  const branch = buildFixBranchName({
+    issueNumber: input.issueNumber,
+    issueTitle: input.issueTitle,
+    fixAttemptId: input.fixAttempt.fixAttemptId,
+  });
+  const expectedTreeSha = await expectedTreeForWorkspace(
+    repoRoot,
+    input.fixAttempt.sourceCommit,
+    input.fixAttempt.changedFiles,
+  );
+  const payload = await payloadStore.persistPayload(
+    input.investigationId,
+    "retry",
+    {
+      version: 1,
+      investigationId: input.investigationId,
+      title: buildPullRequestTitle(input),
+      body: await buildPullRequestBody(input),
+      commitMessage: buildCommitMessage(input),
+      files,
+    } satisfies PullRequestRetryPayload,
+  );
+
   return sanitizeRetryPlan({
-    // Filled in after the in-pipeline PR flow chooses the real branch name;
-    // a retry without one derives the deterministic name instead.
-    branch: null,
-    title: buildPullRequestTitle(input),
-    body: await buildPullRequestBody(input),
-    commitMessage: buildCommitMessage(input),
+    branch,
     sourceCommit: input.fixAttempt.sourceCommit,
     baseBranch: input.baseBranch,
-    files,
+    expectedTreeSha,
+    files: files.map((file) => ({
+      path: file.path,
+      mode: file.mode,
+      contentSha256:
+        file.contents === null ? null : sha256(Buffer.from(file.contents, "utf8")),
+    })),
+    payload,
   });
+}
+
+async function expectedTreeForWorkspace(
+  repoRoot: string,
+  sourceCommit: string,
+  changedFiles: string[],
+): Promise<string> {
+  const temporary = await mkdtemp(path.join(tmpdir(), "sherlock-delivery-index-"));
+  const indexFile = path.join(temporary, "index");
+  const env = { ...process.env, GIT_INDEX_FILE: indexFile };
+  try {
+    await execFileAsync("git", ["read-tree", sourceCommit], {
+      cwd: repoRoot,
+      env,
+      timeout: 60_000,
+    });
+    await execFileAsync("git", ["add", "--all", "--", ...changedFiles], {
+      cwd: repoRoot,
+      env,
+      timeout: 60_000,
+    });
+    const { stdout } = await execFileAsync("git", ["write-tree"], {
+      cwd: repoRoot,
+      env,
+      timeout: 60_000,
+    });
+    const tree = stdout.trim();
+    if (!GIT_SHA_PATTERN.test(tree)) {
+      throw new Error("Git produced an invalid delivery tree identity.");
+    }
+    return tree;
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
 }
 
 // --- Durable state store -----------------------------------------------------
@@ -550,16 +700,43 @@ export async function capturePullRequestRetryPlan(
 export type DeliveryStateStore = {
   load(investigationId: string): Promise<DeliveryState | null>;
   save(state: DeliveryState): Promise<void>;
+  loadTerminalFailure(
+    investigationId: string,
+  ): Promise<TerminalFailureRecord | null>;
+  saveTerminalFailure(record: TerminalFailureRecord): Promise<void>;
+  persistPayload(
+    investigationId: string,
+    kind: "retry" | "terminal",
+    payload: unknown,
+  ): Promise<DeliveryArtifactReference>;
+  loadPayload(
+    investigationId: string,
+    reference: DeliveryArtifactReference,
+  ): Promise<unknown>;
   // Serializes the full reconcile/check/create/save sequence for one
   // investigation. This closes the check-then-create race between duplicate
   // or stalled BullMQ deliveries.
-  withLock<T>(investigationId: string, operation: () => Promise<T>): Promise<T>;
+  withLock<T>(
+    investigationId: string,
+    operation: (lease: DeliveryLockLease) => Promise<T>,
+  ): Promise<T>;
 };
 
 export const DELIVERY_STATE_FILE = "delivery-state.json";
+export const TERMINAL_FAILURE_FILE = "terminal-failure.json";
 
-class DeliveryLockBusyError extends Error {
+export type DeliveryLockLease = {
+  token: string;
+  renew(): Promise<void>;
+  assertOwned(): Promise<void>;
+};
+
+export class DeliveryLockBusyError extends Error {
   readonly code = "EDELIVERYLOCKED";
+}
+
+export class DeliveryLockLostError extends Error {
+  readonly code = "EDELIVERYLOCKLOST";
 }
 
 function normalizeDeliveryState(value: unknown): DeliveryState {
@@ -569,24 +746,31 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
 
   const state = structuredClone(value) as DeliveryState;
   if (
-    state.version !== 1 ||
+    state.version !== 2 ||
     !isInvestigationId(state.investigationId) ||
     typeof state.tenantId !== "string" ||
-    state.tenantId.length === 0 ||
-    state.tenantId.length > 200 ||
     !Number.isSafeInteger(state.installationId) ||
     state.installationId <= 0 ||
+    state.tenantId !== `tenant-gh-${state.installationId}` ||
     !Number.isSafeInteger(state.issueNumber) ||
     state.issueNumber <= 0 ||
-    typeof state.issueTitle !== "string" ||
     typeof state.executionOutcome !== "string" ||
+    !DELIVERY_OUTCOMES.has(state.executionOutcome) ||
     typeof state.fixVerified !== "boolean" ||
+    (state.fixAttemptId !== null && !isFixAttemptId(state.fixAttemptId)) ||
     typeof state.createdAt !== "string" ||
     !Number.isFinite(Date.parse(state.createdAt)) ||
     typeof state.updatedAt !== "string" ||
     !Number.isFinite(Date.parse(state.updatedAt)) ||
     !state.pullRequest ||
-    !state.terminalComment
+    (state.pullRequest.number !== null &&
+      (!Number.isSafeInteger(state.pullRequest.number) ||
+        state.pullRequest.number <= 0)) ||
+    !sanitizeArtifactReference(state.terminalPayload) ||
+    !state.terminalComment ||
+    (state.terminalComment.postedAt !== null &&
+      (typeof state.terminalComment.postedAt !== "string" ||
+        !Number.isFinite(Date.parse(state.terminalComment.postedAt))))
   ) {
     throw new Error("Delivery state has an invalid shape.");
   }
@@ -598,6 +782,8 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     "pending",
     "created",
     "reused",
+    "merged",
+    "blocked",
     "failed",
   ]);
   const commentStatuses = new Set<DeliveryCommentStatus>([
@@ -619,34 +805,26 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     throw new Error("Delivery state contains an unsafe branch name.");
   }
   state.pullRequest.branch = branch;
-  state.pullRequest.reason = state.pullRequest.reason
-    ? boundedSafeText(state.pullRequest.reason, MAX_DELIVERY_ERROR_CHARS)
-    : null;
-  state.terminalComment.reason = state.terminalComment.reason
-    ? boundedSafeText(state.terminalComment.reason, MAX_DELIVERY_ERROR_CHARS)
-    : null;
-  state.issueTitle = boundedSafeText(state.issueTitle, MAX_DELIVERY_TITLE_CHARS);
-  state.executionOutcome = boundedSafeText(state.executionOutcome, 100);
-  state.summary = sanitizeSummary(state.summary);
-  state.analysisComment = state.analysisComment
-    ? boundedSafeText(state.analysisComment, MAX_DELIVERY_TEXT_CHARS)
-    : null;
-  state.fixComment = state.fixComment
-    ? boundedSafeText(state.fixComment, MAX_DELIVERY_TEXT_CHARS)
-    : null;
+  state.pullRequest.url = canonicalPullRequestUrl(
+    state.repoOwner,
+    state.repoName,
+    state.pullRequest.number,
+  );
+  state.pullRequest.reason =
+    state.pullRequest.status === "blocked"
+      ? PULL_REQUEST_BLOCKED_REASON
+      : state.pullRequest.status === "failed"
+        ? PULL_REQUEST_FAILED_REASON
+        : null;
+  state.terminalComment.reason =
+    state.terminalComment.status === "failed"
+      ? TERMINAL_COMMENT_FAILED_REASON
+      : null;
+  state.terminalPayload = sanitizeArtifactReference(state.terminalPayload)!;
 
   if (state.retryPlan) {
     const plan = sanitizeRetryPlan(state.retryPlan);
-    if (
-      !plan ||
-      !plan.commitMessage.includes(
-        `Sherlock-Investigation: ${state.investigationId}`,
-      ) ||
-      (state.fixAttemptId !== null &&
-        !plan.commitMessage.includes(
-          `Sherlock-Fix-Attempt: ${state.fixAttemptId}`,
-        ))
-    ) {
+    if (!plan) {
       throw new Error("Delivery state contains an unsafe retry plan.");
     }
     state.retryPlan = plan;
@@ -660,13 +838,50 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
   return state;
 }
 
+function normalizeTerminalFailure(value: unknown): TerminalFailureRecord {
+  if (!value || typeof value !== "object") {
+    throw new Error("Terminal failure is not an object.");
+  }
+  const record = structuredClone(value) as TerminalFailureRecord;
+  const categories = new Set<TerminalFailureCategory>([
+    "repository",
+    "infrastructure",
+    "preflight",
+    "worker",
+  ]);
+  if (
+    record.version !== 1 ||
+    !isInvestigationId(record.investigationId) ||
+    typeof record.tenantId !== "string" ||
+    !/^tenant-gh-[1-9][0-9]*$/.test(record.tenantId) ||
+    !categories.has(record.category) ||
+    typeof record.stage !== "string" ||
+    !DELIVERY_STAGES.has(record.stage) ||
+    !Number.isFinite(Date.parse(record.terminalAt)) ||
+    !Number.isFinite(Date.parse(record.retentionEligibleAt))
+  ) {
+    throw new Error("Terminal failure has an invalid shape.");
+  }
+  validateRepositoryIdentity(record.repoOwner, record.repoName);
+  return record;
+}
+
 // One JSON file per investigation under the artifacts root, next to the other
 // per-investigation artifacts. Same durability class as the pull-request
 // result file the PR flow already relies on for retries.
 export function createFileDeliveryStateStore(
   rootDir: string = getArtifactsRoot(),
+  lockOptions: {
+    ttlMs?: number;
+    heartbeatMs?: number;
+    now?: () => number;
+  } = {},
 ): DeliveryStateStore {
   const resolvedRoot = path.resolve(rootDir);
+  const lockTtlMs = lockOptions.ttlMs ?? DELIVERY_LOCK_TTL_MS;
+  const lockHeartbeatMs =
+    lockOptions.heartbeatMs ?? DELIVERY_LOCK_HEARTBEAT_MS;
+  const now = lockOptions.now ?? Date.now;
   // Locks live outside investigation directories so retention cleanup can
   // remove artifacts/<id>/ while still holding the same lock delivery uses.
   // A lock inside the deletion target would disappear mid-critical-section
@@ -702,60 +917,179 @@ export function createFileDeliveryStateStore(
     }
   };
 
+  const readRecord = async <T>(
+    investigationId: string,
+    fileName: string,
+    maxBytes: number,
+    normalize: (value: unknown) => T,
+  ): Promise<T | null> => {
+    try {
+      const dir = dirFor(investigationId);
+      const dirInfo = await lstat(dir);
+      if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) {
+        throw new Error("Refusing a non-directory delivery-state location.");
+      }
+      const file = path.join(dir, fileName);
+      const info = await lstat(file);
+      if (!info.isFile() || info.isSymbolicLink() || info.size > maxBytes) {
+        throw new Error("Refusing an unsafe delivery record.");
+      }
+      const raw = await readFile(file, "utf8");
+      if (Buffer.byteLength(raw, "utf8") > maxBytes) {
+        throw new Error("Delivery record exceeds the size limit.");
+      }
+      return normalize(JSON.parse(raw));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  };
+
+  const writeRecord = async (
+    investigationId: string,
+    fileName: string,
+    value: unknown,
+  ) => {
+    const dir = await ensureDir(investigationId);
+    const destination = path.join(dir, fileName);
+    const temporary = path.join(dir, `.${fileName}.${randomUUID()}.tmp`);
+    try {
+      await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await rename(temporary, destination);
+    } finally {
+      await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
+  };
+
+  const claimLock = async (lockDir: string, token: string) => {
+    const preparedDir = `${lockDir}.claim-${token}`;
+    await mkdir(preparedDir);
+    const preparedOwner = path.join(preparedDir, "owner");
+    let handle;
+    try {
+      await writeFile(preparedOwner, token, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      handle = await open(preparedOwner, "r+");
+      // The fully initialized lease becomes visible in one namespace change;
+      // contenders can never observe or delete a half-created owner record.
+      await rename(preparedDir, lockDir);
+      return handle;
+    } catch (error) {
+      await handle?.close().catch(() => {});
+      await rm(preparedDir, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+  };
+
   return {
     async load(investigationId) {
-      try {
-        const dir = dirFor(investigationId);
-        const dirInfo = await lstat(dir);
-        if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) {
-          throw new Error("Refusing a non-directory delivery-state location.");
-        }
-        const stateFile = path.join(
-          dir,
-          DELIVERY_STATE_FILE,
-        );
-        const info = await lstat(stateFile);
-        if (!info.isFile() || info.isSymbolicLink()) {
-          throw new Error("Refusing a non-file delivery-state record.");
-        }
-        const raw = await readFile(
-          stateFile,
-          "utf8",
-        );
-        if (Buffer.byteLength(raw, "utf8") > MAX_DELIVERY_STATE_BYTES) {
-          throw new Error("Delivery state exceeds the size limit.");
-        }
-        const state = normalizeDeliveryState(JSON.parse(raw));
-
-        return state.investigationId === investigationId ? state : null;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-          return null;
-        }
-        throw error;
-      }
+      const state = await readRecord(
+        investigationId,
+        DELIVERY_STATE_FILE,
+        MAX_DELIVERY_STATE_BYTES,
+        normalizeDeliveryState,
+      );
+      return state?.investigationId === investigationId ? state : null;
     },
     async save(state) {
       const normalized = normalizeDeliveryState(state);
-      const dir = await ensureDir(normalized.investigationId);
-      const destination = path.join(dir, DELIVERY_STATE_FILE);
-      const temporary = path.join(
-        dir,
-        `.${DELIVERY_STATE_FILE}.${randomUUID()}.tmp`,
+      await writeRecord(
+        normalized.investigationId,
+        DELIVERY_STATE_FILE,
+        normalized,
       );
-
-      try {
-        await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, {
-          encoding: "utf8",
-          mode: 0o600,
-          flag: "wx",
-        });
-        await rename(temporary, destination);
-      } finally {
-        await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-        });
+    },
+    async loadTerminalFailure(investigationId) {
+      const failure = await readRecord(
+        investigationId,
+        TERMINAL_FAILURE_FILE,
+        16 * 1024,
+        normalizeTerminalFailure,
+      );
+      return failure?.investigationId === investigationId ? failure : null;
+    },
+    async saveTerminalFailure(record) {
+      const normalized = normalizeTerminalFailure(record);
+      await writeRecord(
+        normalized.investigationId,
+        TERMINAL_FAILURE_FILE,
+        normalized,
+      );
+    },
+    async persistPayload(investigationId, kind, payload) {
+      if (!isInvestigationId(investigationId)) {
+        throw new Error("Refusing a protected payload for an unsafe investigation id.");
       }
+      const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
+      if (raw.length <= 1 || raw.length > MAX_DELIVERY_PAYLOAD_BYTES) {
+        throw new Error("Protected delivery payload exceeds the size limit.");
+      }
+      const digest = sha256(raw);
+      const reference = {
+        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${kind}-${digest}.json`,
+        sha256: digest,
+        sizeBytes: raw.length,
+      } satisfies DeliveryArtifactReference;
+      const dir = await ensureDir(investigationId);
+      const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
+      await mkdir(payloadDir, { recursive: true, mode: 0o700 });
+      const payloadDirInfo = await lstat(payloadDir);
+      if (!payloadDirInfo.isDirectory() || payloadDirInfo.isSymbolicLink()) {
+        throw new Error("Refusing an unsafe protected delivery directory.");
+      }
+      const destination = path.join(dir, ...reference.path.split("/"));
+      try {
+        await writeFile(destination, raw, { mode: 0o600, flag: "wx" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const existing = await readFile(destination);
+        if (sha256(existing) !== digest || existing.length !== raw.length) {
+          throw new Error("Existing protected delivery payload failed integrity verification.");
+        }
+      }
+      return reference;
+    },
+    async loadPayload(investigationId, reference) {
+      const safeReference = sanitizeArtifactReference(reference);
+      if (!safeReference) {
+        throw new Error("Protected delivery artifact reference is unsafe.");
+      }
+      const dir = dirFor(investigationId);
+      const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
+      const [dirInfo, payloadDirInfo] = await Promise.all([
+        lstat(dir),
+        lstat(payloadDir),
+      ]);
+      if (
+        !dirInfo.isDirectory() ||
+        dirInfo.isSymbolicLink() ||
+        !payloadDirInfo.isDirectory() ||
+        payloadDirInfo.isSymbolicLink()
+      ) {
+        throw new Error("Protected delivery artifact directory is unsafe.");
+      }
+      const target = path.resolve(dir, ...safeReference.path.split("/"));
+      if (!target.startsWith(path.resolve(dir) + path.sep)) {
+        throw new Error("Protected delivery artifact escaped its investigation directory.");
+      }
+      const info = await lstat(target);
+      if (!info.isFile() || info.isSymbolicLink() || info.size !== safeReference.sizeBytes) {
+        throw new Error("Protected delivery artifact is unsafe or changed.");
+      }
+      const raw = await readFile(target);
+      if (sha256(raw) !== safeReference.sha256) {
+        throw new Error("Protected delivery artifact failed integrity verification.");
+      }
+      return JSON.parse(raw.toString("utf8")) as unknown;
     },
     async withLock(investigationId, operation) {
       if (!isInvestigationId(investigationId)) {
@@ -765,74 +1099,184 @@ export function createFileDeliveryStateStore(
       const lockDir = path.join(lockRoot, `${investigationId}.lock`);
       const ownerFile = path.join(lockDir, "owner");
       const lockOwner = randomUUID();
+      let ownerHandle;
 
       try {
-        await mkdir(lockDir);
+        ownerHandle = await claimLock(lockDir, lockOwner);
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        if (
+          (error as NodeJS.ErrnoException).code !== "EEXIST" &&
+          (error as NodeJS.ErrnoException).code !== "ENOTEMPTY"
+        ) {
           throw error;
         }
 
-        const lockInfo = await stat(lockDir).catch(() => null);
-        if (!lockInfo || Date.now() - lockInfo.mtimeMs <= DELIVERY_LOCK_STALE_MS) {
+        const observedOwner = await stat(ownerFile).catch(() => null);
+        if (
+          !observedOwner ||
+          now() - observedOwner.mtimeMs <= lockTtlMs
+        ) {
           throw new DeliveryLockBusyError(
             "Another delivery attempt is already reconciling this investigation.",
           );
         }
-
-        // Atomically move the stale lease out of the way. A concurrent
-        // contender can win this rename; in that case this attempt retries
-        // through the queue instead of deleting anyone else's live lock.
         const staleDir = `${lockDir}.stale-${randomUUID()}`;
         try {
           await rename(lockDir, staleDir);
-          await unlink(path.join(staleDir, "owner")).catch(() => {});
-          await rmdir(staleDir);
-          await mkdir(lockDir);
+          ownerHandle = await claimLock(lockDir, lockOwner);
         } catch {
+          await ownerHandle?.close().catch(() => {});
           throw new DeliveryLockBusyError(
             "Another delivery attempt acquired the reconciliation lock.",
           );
         }
       }
 
+      if (!ownerHandle) throw new DeliveryLockBusyError("Delivery lock unavailable.");
+      const acquiredHandle = ownerHandle;
+
+      // Remove the fixed lock path only after proving that it still resolves
+      // to this lease's inode and token. The post-rename proof prevents a
+      // path-replacement race from deleting a newer owner's generation.
+      const removeOwnedPath = async (label: string): Promise<boolean> => {
+        const generationDir = `${lockDir}.${label}-${lockOwner}`;
+        try {
+          const [currentInfo, handleInfo, currentOwner] = await Promise.all([
+            lstat(ownerFile),
+            acquiredHandle.stat(),
+            readFile(ownerFile, "utf8"),
+          ]);
+          if (
+            currentInfo.dev !== handleInfo.dev ||
+            currentInfo.ino !== handleInfo.ino ||
+            currentOwner !== lockOwner
+          ) {
+            return false;
+          }
+          await rename(lockDir, generationDir);
+          const [movedInfo, movedOwner] = await Promise.all([
+            lstat(path.join(generationDir, "owner")),
+            readFile(path.join(generationDir, "owner"), "utf8"),
+          ]);
+          if (
+            movedInfo.dev === handleInfo.dev &&
+            movedInfo.ino === handleInfo.ino &&
+            movedOwner === lockOwner
+          ) {
+            await rm(generationDir, { recursive: true, force: true });
+            return true;
+          }
+          await rename(generationDir, lockDir).catch(() => {});
+        } catch {
+          // Missing or replaced lock: never delete an unproven owner.
+        }
+        return false;
+      };
+
+      // A contender can win the narrow path-vacancy race after a stale
+      // generation is renamed. It must reconcile the visible stale generation
+      // before doing work: a freshly renewed old owner is restored and fences
+      // this contender; only a truly expired generation is removed.
       try {
-        await writeFile(ownerFile, lockOwner, {
-          encoding: "utf8",
-          mode: 0o600,
-          flag: "wx",
-        });
+        const stalePrefix = `${investigationId}.lock.stale-`;
+        const staleEntries = (await readdir(lockRoot)).filter((entry) =>
+          entry.startsWith(stalePrefix),
+        );
+        if (staleEntries.length > 8) {
+          throw new DeliveryLockBusyError("Delivery lock recovery is ambiguous.");
+        }
+        for (const entry of staleEntries) {
+          const staleDir = path.join(lockRoot, entry);
+          const staleOwner = await stat(path.join(staleDir, "owner")).catch(
+            () => null,
+          );
+          if (staleOwner && now() - staleOwner.mtimeMs <= lockTtlMs) {
+            if (await removeOwnedPath("yield")) {
+              await rename(staleDir, lockDir).catch(() => {});
+            }
+            throw new DeliveryLockBusyError(
+              "The previous delivery owner renewed during stale recovery.",
+            );
+          }
+          await rm(staleDir, { recursive: true, force: true });
+        }
       } catch (error) {
-        await rmdir(lockDir).catch(() => {});
-        throw error;
+        await removeOwnedPath("recovery-failed");
+        await acquiredHandle.close().catch(() => {});
+        if (error instanceof DeliveryLockBusyError) throw error;
+        throw new DeliveryLockBusyError("Delivery lock recovery is ambiguous.");
       }
 
-      const heartbeat = setInterval(() => {
-        const now = new Date();
-        void utimes(lockDir, now, now).catch(() => {});
-      }, DELIVERY_LOCK_HEARTBEAT_MS);
-      heartbeat.unref();
+      let ownershipLost: Error | null = null;
+      const assertOwned = async () => {
+        if (ownershipLost) throw ownershipLost;
+        const handleInfo = await acquiredHandle.stat();
+        const buffer = Buffer.alloc(Buffer.byteLength(lockOwner, "utf8"));
+        const { bytesRead } = await acquiredHandle.read(
+          buffer,
+          0,
+          buffer.length,
+          0,
+        );
+        if (bytesRead !== buffer.length || buffer.toString("utf8") !== lockOwner) {
+          ownershipLost = new DeliveryLockLostError("Delivery lock ownership was lost.");
+          throw ownershipLost;
+        }
+        const instant = new Date(now());
+        await acquiredHandle.utimes(instant, instant);
+        const pathInfo = await lstat(ownerFile).catch(() => null);
+        const currentOwner = await readFile(ownerFile, "utf8").catch(() => null);
+        if (
+          !pathInfo ||
+          pathInfo.dev !== handleInfo.dev ||
+          pathInfo.ino !== handleInfo.ino ||
+          currentOwner !== lockOwner
+        ) {
+          ownershipLost = new DeliveryLockLostError("Delivery lock ownership was lost.");
+          throw ownershipLost;
+        }
+      };
+      const lease: DeliveryLockLease = {
+        token: lockOwner,
+        renew: assertOwned,
+        assertOwned,
+      };
+      let pendingHeartbeat = Promise.resolve();
+      const heartbeat =
+        lockHeartbeatMs > 0
+          ? setInterval(() => {
+              pendingHeartbeat = pendingHeartbeat
+                .then(assertOwned)
+                .catch((error: unknown) => {
+                  ownershipLost =
+                    error instanceof Error
+                      ? error
+                      : new DeliveryLockLostError("Delivery lock ownership was lost.");
+                });
+            }, lockHeartbeatMs)
+          : null;
+      heartbeat?.unref();
 
       try {
-        return await operation();
+        await assertOwned();
+        return await operation(lease);
       } finally {
-        clearInterval(heartbeat);
-        const currentOwner = await readFile(ownerFile, "utf8").catch(() => null);
-        if (currentOwner === lockOwner) {
-          await unlink(ownerFile).catch(() => {});
-          await rmdir(lockDir).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== "ENOENT") throw error;
-          });
-        }
+        if (heartbeat) clearInterval(heartbeat);
+        await pendingHeartbeat.catch(() => {});
+        await removeOwnedPath("release");
+        await acquiredHandle.close().catch(() => {});
       }
     },
   };
 }
 
+const inMemoryDeliveryPayloads = new Map<string, Buffer>();
+
 export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
   snapshot(): DeliveryState[];
 } {
   const states = new Map<string, DeliveryState>();
+  const failures = new Map<string, TerminalFailureRecord>();
   const locks = new Map<string, Promise<void>>();
 
   return {
@@ -847,6 +1291,39 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
         structuredClone(normalized) as DeliveryState,
       );
     },
+    async loadTerminalFailure(investigationId) {
+      const failure = failures.get(investigationId);
+      return failure ? structuredClone(failure) : null;
+    },
+    async saveTerminalFailure(record) {
+      const normalized = normalizeTerminalFailure(record);
+      failures.set(normalized.investigationId, structuredClone(normalized));
+    },
+    async persistPayload(investigationId, kind, payload) {
+      if (!isInvestigationId(investigationId)) throw new Error("Unsafe investigation id.");
+      const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
+      const digest = sha256(raw);
+      const reference = {
+        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${kind}-${digest}.json`,
+        sha256: digest,
+        sizeBytes: raw.length,
+      } satisfies DeliveryArtifactReference;
+      inMemoryDeliveryPayloads.set(`${investigationId}:${reference.path}`, raw);
+      return reference;
+    },
+    async loadPayload(investigationId, reference) {
+      const safe = sanitizeArtifactReference(reference);
+      if (!safe) throw new Error("Unsafe protected delivery artifact reference.");
+      const raw = inMemoryDeliveryPayloads.get(`${investigationId}:${safe.path}`);
+      if (
+        !raw ||
+        raw.length !== safe.sizeBytes ||
+        sha256(raw) !== safe.sha256
+      ) {
+        throw new Error("Protected delivery artifact failed integrity verification.");
+      }
+      return JSON.parse(raw.toString("utf8")) as unknown;
+    },
     async withLock(investigationId, operation) {
       const previous = locks.get(investigationId) ?? Promise.resolve();
       let release!: () => void;
@@ -857,9 +1334,20 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
       locks.set(investigationId, tail);
 
       await previous;
+      let owned = true;
+      const lease: DeliveryLockLease = {
+        token: randomUUID(),
+        async renew() {
+          if (!owned) throw new DeliveryLockLostError("Delivery lock ownership was lost.");
+        },
+        async assertOwned() {
+          if (!owned) throw new DeliveryLockLostError("Delivery lock ownership was lost.");
+        },
+      };
       try {
-        return await operation();
+        return await operation(lease);
       } finally {
+        owned = false;
         release();
         if (locks.get(investigationId) === tail) {
           locks.delete(investigationId);
@@ -880,13 +1368,62 @@ export function terminalCommentMarker(investigationId: string): string {
   return `<!-- sherlock-terminal-comment:${investigationId} -->`;
 }
 
+export async function findTerminalCommentPaginated(input: {
+  marker: string;
+  listPage: (
+    page: number,
+    perPage: number,
+  ) => Promise<Array<{ body?: string | null }>>;
+  assertOwnership: () => Promise<void>;
+  maxPages?: number;
+}): Promise<boolean> {
+  const perPage = 100;
+  const maxPages = input.maxPages ?? 20;
+  for (let page = 1; page <= maxPages; page += 1) {
+    await input.assertOwnership();
+    const comments = await input.listPage(page, perPage);
+    if (
+      !Array.isArray(comments) ||
+      comments.length > perPage ||
+      comments.some(
+        (comment) =>
+          !comment ||
+          (comment.body !== null &&
+            comment.body !== undefined &&
+            typeof comment.body !== "string"),
+      )
+    ) {
+      throw Object.assign(new Error("GitHub comment reconciliation was ambiguous."), {
+        status: 502,
+      });
+    }
+    if (
+      comments.some(
+        (comment) =>
+          typeof comment.body === "string" &&
+          comment.body.includes(input.marker),
+      )
+    ) {
+      return true;
+    }
+    if (comments.length < perPage) return false;
+  }
+  throw Object.assign(
+    new Error("GitHub comment history exceeded the bounded reconciliation scan."),
+    { status: 503 },
+  );
+}
+
 // Build the terminal comment from the CURRENT delivery state, so the posted
 // text always tells the truth about what was actually delivered: a fix is
 // only presented with a pull request when that pull request really exists.
-export function buildTerminalComment(state: DeliveryState): string {
+export function buildTerminalComment(
+  state: DeliveryState,
+  payload: TerminalCommentPayload,
+): string {
   const summary: InvestigationSummary = state.fixVerified
-    ? { ...state.summary, pullRequestStatus: summaryPullRequestStatus(state) }
-    : state.summary;
+    ? { ...payload.summary, pullRequestStatus: summaryPullRequestStatus(state) }
+    : payload.summary;
 
   const pullRequestSection =
     state.fixVerified && state.fixAttemptId
@@ -902,8 +1439,8 @@ export function buildTerminalComment(state: DeliveryState): string {
       : null;
 
   const sections = [
-    state.analysisComment,
-    state.fixComment,
+    payload.analysisComment,
+    payload.fixComment,
     pullRequestSection,
   ].filter((section): section is string => Boolean(section));
 
@@ -921,6 +1458,10 @@ function summaryPullRequestStatus(state: DeliveryState): string {
       return "created";
     case "reused":
       return "already_exists";
+    case "merged":
+      return "already_merged";
+    case "blocked":
+      return "delivery_blocked";
     case "failed":
       return "delivery_failed";
     case "pending":
@@ -936,6 +1477,10 @@ function pullRequestCommentStatus(state: DeliveryState): string {
       return "created";
     case "reused":
       return "already_exists";
+    case "merged":
+      return "already_exists";
+    case "blocked":
+      return "delivery_failed";
     case "failed":
       return state.pullRequest.branchPushed && state.pullRequest.branch
         ? "pull_request_failed"
@@ -949,15 +1494,30 @@ function pullRequestCommentStatus(state: DeliveryState): string {
 
 // The pull-request REST surface plus the Git Data operations a workspace-less
 // push retry needs. Tests inject a mock; production uses the fetch client.
-export type DeliveryGitHubClient = GitHubClient & {
+export type DeliveryPullRequest = {
+  number: number;
+  url: string;
+  state: "open" | "closed";
+  merged: boolean;
+};
+
+export type DeliveryGitHubClient = {
   // Resolves the branch head and commit identity, or null when the branch does
   // not exist. Commit metadata proves an existing branch was created for this
   // exact investigation/fix attempt before it is reused.
   getBranch: (branch: string) => Promise<{
     sha: string;
-    message: string;
+    treeSha: string;
     parentShas: string[];
   } | null>;
+  findPullRequests: (input: {
+    head: string;
+    base: string;
+    assertOwnership: () => Promise<void>;
+  }) => Promise<{
+    matches: DeliveryPullRequest[];
+    conflictingBase: boolean;
+  }>;
   // Recreates the fix commit through the Git Data API (blobs -> tree ->
   // commit -> ref) on top of the recorded source commit.
   createBranchWithCommit: (input: {
@@ -965,7 +1525,16 @@ export type DeliveryGitHubClient = GitHubClient & {
     baseCommitSha: string;
     message: string;
     files: DeliveryFile[];
-  }) => Promise<{ commitSha: string }>;
+    expectedTreeSha: string;
+    assertOwnership: () => Promise<void>;
+  }) => Promise<{ commitSha: string; treeSha: string }>;
+  createPullRequest: (input: {
+    title: string;
+    head: string;
+    base: string;
+    body: string;
+    assertOwnership: () => Promise<void>;
+  }) => Promise<{ number: number; url: string }>;
 };
 
 export function createDeliveryGitHubRestClient(options: {
@@ -974,6 +1543,7 @@ export function createDeliveryGitHubRestClient(options: {
   repo: string;
   apiBaseUrl?: string;
 }): DeliveryGitHubClient {
+  validateRepositoryIdentity(options.owner, options.repo);
   const apiBaseUrl = options.apiBaseUrl ?? "https://api.github.com";
   const repoUrl = `${apiBaseUrl}/repos/${options.owner}/${options.repo}`;
   const headers = {
@@ -987,7 +1557,9 @@ export function createDeliveryGitHubRestClient(options: {
     method: string,
     url: string,
     body?: unknown,
+    assertOwnership?: () => Promise<void>,
   ): Promise<T> => {
+    await assertOwnership?.();
     const response = await fetch(url, {
       method,
       headers,
@@ -995,10 +1567,9 @@ export function createDeliveryGitHubRestClient(options: {
     });
 
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
       throw Object.assign(
         new Error(
-          `GitHub ${method} ${url.slice(apiBaseUrl.length)} failed: ${response.status} ${response.statusText} ${detail.slice(0, 300)}`,
+          `GitHub ${method} request failed: ${response.status} ${response.statusText}`,
         ),
         { status: response.status },
       );
@@ -1008,7 +1579,6 @@ export function createDeliveryGitHubRestClient(options: {
   };
 
   return {
-    ...createGitHubRestClient(options),
     getBranch: async (branch) => {
       const response = await fetch(
         `${repoUrl}/git/ref/heads/${encodeURIComponent(branch)}`,
@@ -1032,28 +1602,123 @@ export function createDeliveryGitHubRestClient(options: {
 
       const data = (await response.json()) as { object?: { sha?: string } };
 
-      if (!data.object?.sha) {
-        return null;
+      if (!data.object?.sha || !GIT_SHA_PATTERN.test(data.object.sha)) {
+        throw Object.assign(new Error("GitHub branch lookup was ambiguous."), {
+          status: 502,
+        });
       }
 
       const commit = await request<{
-        message?: string;
+        tree?: { sha?: string };
         parents?: { sha?: string }[];
       }>("GET", `${repoUrl}/git/commits/${data.object.sha}`);
 
+      if (
+        !commit.tree?.sha ||
+        !GIT_SHA_PATTERN.test(commit.tree.sha) ||
+        !Array.isArray(commit.parents) ||
+        commit.parents.some(
+          (parent) => !parent?.sha || !GIT_SHA_PATTERN.test(parent.sha),
+        )
+      ) {
+        throw Object.assign(new Error("GitHub branch commit has no tree identity."), {
+          status: 502,
+        });
+      }
+
       return {
         sha: data.object.sha,
-        message: commit.message ?? "",
-        parentShas: (commit.parents ?? [])
-          .map((parent) => parent.sha)
-          .filter((sha): sha is string => typeof sha === "string"),
+        treeSha: commit.tree.sha,
+        parentShas: commit.parents.map((parent) => parent.sha!),
       };
     },
-    createBranchWithCommit: async ({ branch, baseCommitSha, message, files }) => {
-      const baseCommit = await request<{ tree: { sha: string } }>(
+    findPullRequests: async ({ head, base, assertOwnership }) => {
+      const matches: DeliveryPullRequest[] = [];
+      let conflictingBase = false;
+      const maxPages = 10;
+      for (let page = 1; page <= maxPages; page += 1) {
+        const url = new URL(`${repoUrl}/pulls`);
+        url.searchParams.set("state", "all");
+        url.searchParams.set("head", head);
+        url.searchParams.set("per_page", "100");
+        url.searchParams.set("page", String(page));
+        const pulls = await request<Array<{
+          number?: number;
+          html_url?: string;
+          state?: string;
+          merged_at?: string | null;
+          head?: { ref?: string; repo?: { full_name?: string } | null };
+          base?: { ref?: string; repo?: { full_name?: string } | null };
+        }>>("GET", url.toString(), undefined, assertOwnership);
+        if (!Array.isArray(pulls) || pulls.length > 100) {
+          throw Object.assign(new Error("GitHub PR reconciliation was ambiguous."), {
+            status: 502,
+          });
+        }
+        const expectedHeadRef = head.slice(head.indexOf(":") + 1);
+        const expectedRepo = `${options.owner}/${options.repo}`.toLowerCase();
+        for (const pull of pulls) {
+          const exactHead =
+            pull.head?.ref === expectedHeadRef &&
+            pull.head.repo?.full_name?.toLowerCase() === expectedRepo;
+          if (!exactHead) continue;
+          const exactBase =
+            pull.base?.ref === base &&
+            pull.base.repo?.full_name?.toLowerCase() === expectedRepo;
+          if (!exactBase) {
+            conflictingBase = true;
+            continue;
+          }
+          if (
+            !Number.isSafeInteger(pull.number) ||
+            pull.number! <= 0 ||
+            (pull.merged_at !== null &&
+              pull.merged_at !== undefined &&
+              typeof pull.merged_at !== "string") ||
+            (pull.state === "open" && pull.merged_at != null) ||
+            (pull.state !== "open" && pull.state !== "closed")
+          ) {
+            throw Object.assign(new Error("GitHub PR reconciliation was ambiguous."), {
+              status: 502,
+            });
+          }
+          matches.push({
+            number: pull.number!,
+            url: canonicalPullRequestUrl(
+              options.owner,
+              options.repo,
+              pull.number!,
+            )!,
+            state: pull.state,
+            merged: pull.merged_at != null,
+          });
+        }
+        if (pulls.length < 100) return { matches, conflictingBase };
+      }
+      throw Object.assign(
+        new Error("GitHub PR history exceeded the bounded reconciliation scan."),
+        { status: 503 },
+      );
+    },
+    createBranchWithCommit: async ({
+      branch,
+      baseCommitSha,
+      message,
+      files,
+      expectedTreeSha,
+      assertOwnership,
+    }) => {
+      const baseCommit = await request<{ tree?: { sha?: string } }>(
         "GET",
         `${repoUrl}/git/commits/${baseCommitSha}`,
+        undefined,
+        assertOwnership,
       );
+      if (!baseCommit.tree?.sha || !GIT_SHA_PATTERN.test(baseCommit.tree.sha)) {
+        throw Object.assign(new Error("GitHub base commit response was ambiguous."), {
+          status: 502,
+        });
+      }
 
       const treeEntries = [] as {
         path: string;
@@ -1077,7 +1742,13 @@ export function createDeliveryGitHubRestClient(options: {
           "POST",
           `${repoUrl}/git/blobs`,
           { content: file.contents, encoding: "utf-8" },
+          assertOwnership,
         );
+        if (!blob.sha || !GIT_SHA_PATTERN.test(blob.sha)) {
+          throw Object.assign(new Error("GitHub blob response was ambiguous."), {
+            status: 502,
+          });
+        }
         treeEntries.push({
           path: file.path,
           mode: file.mode,
@@ -1089,7 +1760,16 @@ export function createDeliveryGitHubRestClient(options: {
       const tree = await request<{ sha: string }>("POST", `${repoUrl}/git/trees`, {
         base_tree: baseCommit.tree.sha,
         tree: treeEntries,
-      });
+      }, assertOwnership);
+
+      if (!tree.sha || !GIT_SHA_PATTERN.test(tree.sha)) {
+        throw Object.assign(new Error("GitHub tree response was ambiguous."), {
+          status: 502,
+        });
+      }
+      if (tree.sha !== expectedTreeSha) {
+        throw new Error("GitHub constructed a tree different from the verified delivery tree.");
+      }
 
       const commit = await request<{ sha: string }>(
         "POST",
@@ -1104,14 +1784,47 @@ export function createDeliveryGitHubRestClient(options: {
             date: new Date().toISOString(),
           },
         },
+        assertOwnership,
       );
+      if (!commit.sha || !GIT_SHA_PATTERN.test(commit.sha)) {
+        throw Object.assign(new Error("GitHub commit response was ambiguous."), {
+          status: 502,
+        });
+      }
 
       await request("POST", `${repoUrl}/git/refs`, {
         ref: `refs/heads/${branch}`,
         sha: commit.sha,
-      });
+      }, assertOwnership);
 
-      return { commitSha: commit.sha };
+      return { commitSha: commit.sha, treeSha: tree.sha };
+    },
+    createPullRequest: async ({
+      title,
+      head,
+      base,
+      body,
+      assertOwnership,
+    }) => {
+      const created = await request<{ number?: number; html_url?: string }>(
+        "POST",
+        `${repoUrl}/pulls`,
+        { title, head, base, body },
+        assertOwnership,
+      );
+      if (!Number.isSafeInteger(created.number) || created.number! <= 0) {
+        throw Object.assign(new Error("GitHub PR creation response was ambiguous."), {
+          status: 502,
+        });
+      }
+      return {
+        number: created.number!,
+        url: canonicalPullRequestUrl(
+          options.owner,
+          options.repo,
+          created.number!,
+        )!,
+      };
     },
   };
 }
@@ -1145,6 +1858,7 @@ export type DeliveryExecutorDeps = {
     repo: string;
     issueNumber: number;
     body: string;
+    assertOwnership: () => Promise<void>;
   }) => Promise<void>;
   // True when the issue already carries a comment containing the marker.
   findTerminalComment: (input: {
@@ -1153,7 +1867,7 @@ export type DeliveryExecutorDeps = {
     repo: string;
     issueNumber: number;
     marker: string;
-    createdAfter: string;
+    assertOwnership: () => Promise<void>;
   }) => Promise<boolean>;
   // Retry classifier injected by the queue layer (kept out of this module so
   // services never depend on queue code).
@@ -1168,31 +1882,36 @@ export type DeliveryRunResult = {
 
 // One idempotent delivery attempt. Ordering matters: the pull-request state
 // is reconciled FIRST so the terminal comment (posted last, exactly once)
-// describes the final delivery truth. Throws a redacted error when a step
-// failed transiently and another attempt is allowed; otherwise records the
-// truthful terminal state and returns.
+// describes the final delivery truth. Retryable failures always leave the
+// durable state pending, including on the queue's final configured attempt.
 export async function runDeliveryFromState(
   initial: DeliveryState,
   deps: DeliveryExecutorDeps,
   options: { isFinalAttempt: boolean },
 ): Promise<DeliveryRunResult> {
+  // Queue exhaustion controls scheduling, not truth: a retryable GitHub or
+  // lock ambiguity must never be converted into a permanent delivery result.
+  void options.isFinalAttempt;
   try {
     return await deps.deliveryStore.withLock(
       initial.investigationId,
-      async () => {
+      async (lease) => {
         let latest: DeliveryState | null;
         try {
           latest = await deps.deliveryStore.load(initial.investigationId);
         } catch (error) {
-          throw new DeliveryRetryableError(safeMessage(error));
+          throw new DeliveryRetryableError(retryableDeliveryMessage(error));
         }
 
-        return runDeliveryUnlocked(latest ?? initial, deps, options);
+        return runDeliveryUnlocked(latest ?? initial, deps, lease);
       },
     );
   } catch (error) {
-    if (error instanceof DeliveryLockBusyError) {
-      throw new DeliveryRetryableError(safeMessage(error));
+    if (
+      error instanceof DeliveryLockBusyError ||
+      error instanceof DeliveryLockLostError
+    ) {
+      throw new DeliveryRetryableError(retryableDeliveryMessage(error));
     }
     throw error;
   }
@@ -1201,10 +1920,16 @@ export async function runDeliveryFromState(
 async function runDeliveryUnlocked(
   initial: DeliveryState,
   deps: DeliveryExecutorDeps,
-  options: { isFinalAttempt: boolean },
+  lease: DeliveryLockLease,
 ): Promise<DeliveryRunResult> {
   const log = deps.log ?? (() => {});
   const state = structuredClone(initial) as DeliveryState;
+  const terminalPayloadForMetadata = await loadTerminalCommentPayload(
+    deps.deliveryStore,
+    state,
+  ).catch(() => null);
+  const originalOutcome =
+    terminalPayloadForMetadata?.summary.originalOutcome ?? null;
 
   const recordState = async (event: InvestigationStateEventInput) => {
     try {
@@ -1221,6 +1946,7 @@ async function runDeliveryUnlocked(
   };
 
   const saveState = async () => {
+    await lease.assertOwned();
     state.updatedAt = new Date().toISOString();
     await deps.deliveryStore.save(state);
   };
@@ -1236,7 +1962,6 @@ async function runDeliveryUnlocked(
     repoName: state.repoName,
     repoUrl: safeRepoUrl(state.repoOwner, state.repoName),
     issueNumber: state.issueNumber,
-    issueTitle: state.issueTitle,
   });
 
   if (isDeliveryTerminal(state)) {
@@ -1260,7 +1985,7 @@ async function runDeliveryUnlocked(
     await recordState({
       type: "final_outcome",
       outcome: state.executionOutcome,
-      originalOutcome: state.summary.originalOutcome ?? null,
+      originalOutcome,
       pullRequestStatus: summaryPullRequestStatus(state),
       error: null,
     });
@@ -1270,6 +1995,7 @@ async function runDeliveryUnlocked(
   // --- Pull-request delivery (branch push + PR create/reuse) ---------------
   if (state.fixVerified && state.pullRequest.status === "pending") {
     try {
+      await lease.assertOwned();
       const auth = await deps.getInstallationToken(state.installationId);
 
       if (!auth) {
@@ -1284,7 +2010,7 @@ async function runDeliveryUnlocked(
         repo: state.repoName,
       });
 
-      await reconcilePullRequest(state, github, log);
+      await reconcilePullRequest(state, github, deps.deliveryStore, lease, log);
       await saveState();
       await recordState({
         type: "pull_request",
@@ -1294,13 +2020,16 @@ async function runDeliveryUnlocked(
         branch: state.pullRequest.branch,
       });
     } catch (error) {
-      if (deps.isRetryableError(error) && !options.isFinalAttempt) {
+      if (error instanceof DeliveryLockLostError) {
+        throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+      }
+      if (deps.isRetryableError(error)) {
         await saveState().catch(() => {});
-        throw new DeliveryRetryableError(safeMessage(error));
+        throw new DeliveryRetryableError(retryableDeliveryMessage(error));
       }
 
       state.pullRequest.status = "failed";
-      state.pullRequest.reason = safeMessage(error);
+      state.pullRequest.reason = PULL_REQUEST_FAILED_REASON;
       log(
         `[${state.investigationId}] Pull-request delivery failed permanently: ${state.pullRequest.reason}`,
       );
@@ -1325,7 +2054,7 @@ async function runDeliveryUnlocked(
         repo: state.repoName,
         issueNumber: state.issueNumber,
         marker,
-        createdAfter: state.createdAt,
+        assertOwnership: lease.assertOwned,
       });
 
       if (alreadyPosted) {
@@ -1333,12 +2062,18 @@ async function runDeliveryUnlocked(
           `[${state.investigationId}] Terminal comment already exists on the issue; not posting a duplicate.`,
         );
       } else {
+        const terminalPayload = await loadTerminalCommentPayload(
+          deps.deliveryStore,
+          state,
+        );
+        await lease.assertOwned();
         await deps.postIssueComment({
           installationId: state.installationId,
           owner: state.repoOwner,
           repo: state.repoName,
           issueNumber: state.issueNumber,
-          body: buildTerminalComment(state),
+          body: buildTerminalComment(state, terminalPayload),
+          assertOwnership: lease.assertOwned,
         });
       }
 
@@ -1350,14 +2085,17 @@ async function runDeliveryUnlocked(
       await saveState();
       await recordState({ type: "terminal_comment", status: "posted" });
     } catch (error) {
-      if (deps.isRetryableError(error) && !options.isFinalAttempt) {
-        throw new DeliveryRetryableError(safeMessage(error));
+      if (error instanceof DeliveryLockLostError) {
+        throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+      }
+      if (deps.isRetryableError(error)) {
+        throw new DeliveryRetryableError(retryableDeliveryMessage(error));
       }
 
       state.terminalComment = {
         status: "failed",
         postedAt: null,
-        reason: safeMessage(error),
+        reason: TERMINAL_COMMENT_FAILED_REASON,
       };
       log(
         `[${state.investigationId}] Terminal comment delivery failed permanently: ${state.terminalComment.reason}`,
@@ -1377,7 +2115,7 @@ async function runDeliveryUnlocked(
   await recordState({
     type: "final_outcome",
     outcome: state.executionOutcome,
-    originalOutcome: state.summary.originalOutcome ?? null,
+    originalOutcome,
     pullRequestStatus: summaryPullRequestStatus(state),
     error: null,
   });
@@ -1390,19 +2128,12 @@ async function runDeliveryUnlocked(
 async function reconcilePullRequest(
   state: DeliveryState,
   github: DeliveryGitHubClient,
+  store: DeliveryStateStore,
+  lease: DeliveryLockLease,
   log: (message: string) => void,
 ): Promise<void> {
   const plan = state.retryPlan;
-  const branch =
-    state.pullRequest.branch ??
-    plan?.branch ??
-    (state.fixAttemptId
-      ? buildFixBranchName({
-          issueNumber: state.issueNumber,
-          issueTitle: state.issueTitle,
-          fixAttemptId: state.fixAttemptId,
-        })
-      : null);
+  const branch = state.pullRequest.branch ?? plan?.branch ?? null;
 
   if (!branch) {
     throw new Error(
@@ -1411,66 +2142,96 @@ async function reconcilePullRequest(
   }
 
   state.pullRequest.branch = branch;
+  // A persisted "pushed" bit is only a hint. Every attempt proves the remote
+  // branch tree again before it may authorize PR reconciliation.
+  state.pullRequest.branchPushed = false;
 
-  if (!state.pullRequest.branchPushed) {
-    const existingBranch = await github.getBranch(branch);
+  await lease.assertOwned();
+  const existingBranch = await github.getBranch(branch);
 
-    if (existingBranch) {
-      if (
-        !plan ||
-        existingBranch.message.trim() !== plan.commitMessage.trim() ||
-        existingBranch.parentShas[0] !== plan.sourceCommit
-      ) {
-        throw new Error(
-          `The existing branch ${branch} does not match this investigation's verified fix; refusing to reuse it.`,
-        );
-      }
-      log(
-        `[${state.investigationId}] Matching fix branch ${branch} already exists on GitHub; reusing it.`,
-      );
-    } else {
-      if (!plan) {
-        throw new Error(
-          `The fix branch ${branch} was never pushed and no retry plan was persisted.`,
-        );
-      }
-
-      const { commitSha } = await github.createBranchWithCommit({
-        branch,
-        baseCommitSha: plan.sourceCommit,
-        message: plan.commitMessage,
-        files: plan.files,
-      });
-      log(
-        `[${state.investigationId}] Recreated fix branch ${branch} at ${commitSha} through the GitHub API.`,
+  if (existingBranch) {
+    if (
+      !plan ||
+      existingBranch.treeSha !== plan.expectedTreeSha ||
+      existingBranch.parentShas.length !== 1 ||
+      existingBranch.parentShas[0] !== plan.sourceCommit
+    ) {
+      throw new Error(
+        `The existing branch ${branch} does not match this investigation's verified tree; refusing to reuse it.`,
       );
     }
-
-    state.pullRequest.branchPushed = true;
+    log(
+      `[${state.investigationId}] Matching fix branch ${branch} already exists on GitHub; reusing it.`,
+    );
+  } else {
+    if (!plan) {
+      throw new Error(
+        `The fix branch ${branch} is absent and no protected retry plan is available.`,
+      );
+    }
+    const payload = await loadPullRequestRetryPayload(store, state, plan);
+    const { commitSha, treeSha } = await github.createBranchWithCommit({
+      branch,
+      baseCommitSha: plan.sourceCommit,
+      message: payload.commitMessage,
+      files: payload.files,
+      expectedTreeSha: plan.expectedTreeSha,
+      assertOwnership: lease.assertOwned,
+    });
+    if (treeSha !== plan.expectedTreeSha) {
+      throw new Error("Created branch did not return the verified tree identity.");
+    }
+    log(
+      `[${state.investigationId}] Recreated fix branch ${branch} at ${commitSha} through the GitHub API.`,
+    );
   }
+  state.pullRequest.branchPushed = true;
 
+  if (!plan) {
+    throw new Error("No protected pull-request retry metadata is available.");
+  }
   const head = `${state.repoOwner}:${branch}`;
-  const existing = await github.findOpenPullRequest(head);
+  const reconciliation = await github.findPullRequests({
+    head,
+    base: plan.baseBranch,
+    assertOwnership: lease.assertOwned,
+  });
 
+  if (reconciliation.matches.length > 1) {
+    throw Object.assign(
+      new Error("Multiple matching Sherlock pull requests make delivery ambiguous."),
+      { status: 503 },
+    );
+  }
+  const existing = reconciliation.matches[0];
   if (existing) {
-    state.pullRequest.status = "reused";
     state.pullRequest.number = existing.number;
     state.pullRequest.url = existing.url;
     state.pullRequest.reason = null;
+    if (existing.merged) {
+      state.pullRequest.status = "merged";
+    } else if (existing.state === "open") {
+      state.pullRequest.status = "reused";
+    } else {
+      state.pullRequest.status = "blocked";
+      state.pullRequest.reason = PULL_REQUEST_BLOCKED_REASON;
+    }
     return;
   }
 
-  if (!plan) {
+  if (reconciliation.conflictingBase) {
     throw new Error(
-      "The fix branch exists but no pull request is open, and no retry plan was persisted to create one.",
+      "A pull request for the Sherlock branch targets a different base; refusing to create or reuse another pull request.",
     );
   }
 
+  const payload = await loadPullRequestRetryPayload(store, state, plan);
   const created = await github.createPullRequest({
-    title: plan.title,
+    title: payload.title,
     head: branch,
     base: plan.baseBranch,
-    body: plan.body,
+    body: payload.body,
+    assertOwnership: lease.assertOwned,
   });
 
   state.pullRequest.status = "created";
@@ -1479,9 +2240,85 @@ async function reconcilePullRequest(
   state.pullRequest.reason = null;
 }
 
+async function loadPullRequestRetryPayload(
+  store: DeliveryStateStore,
+  state: DeliveryState,
+  plan: PullRequestRetryPlan,
+): Promise<PullRequestRetryPayload> {
+  const value = (await store.loadPayload(
+    state.investigationId,
+    plan.payload,
+  )) as Partial<PullRequestRetryPayload>;
+  if (
+    !value ||
+    value.version !== 1 ||
+    value.investigationId !== state.investigationId ||
+    typeof value.title !== "string" ||
+    value.title.length > 500 ||
+    typeof value.body !== "string" ||
+    value.body.length > MAX_DELIVERY_TEXT_CHARS ||
+    typeof value.commitMessage !== "string" ||
+    value.commitMessage.length > 2_000 ||
+    !Array.isArray(value.files) ||
+    value.files.length !== plan.files.length
+  ) {
+    throw new Error("Protected pull-request payload has an invalid shape.");
+  }
+  const files = value.files as DeliveryFile[];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const identity = plan.files[index];
+    if (
+      !file ||
+      file.path !== identity.path ||
+      file.mode !== identity.mode ||
+      (file.contents !== null && typeof file.contents !== "string") ||
+      (file.contents === null
+        ? identity.contentSha256 !== null
+        : sha256(Buffer.from(file.contents, "utf8")) !== identity.contentSha256)
+    ) {
+      throw new Error("Protected pull-request payload does not match its file identities.");
+    }
+  }
+  return value as PullRequestRetryPayload;
+}
+
+async function loadTerminalCommentPayload(
+  store: DeliveryStateStore,
+  state: DeliveryState,
+): Promise<TerminalCommentPayload> {
+  const value = (await store.loadPayload(
+    state.investigationId,
+    state.terminalPayload,
+  )) as Partial<TerminalCommentPayload>;
+  if (
+    !value ||
+    value.version !== 1 ||
+    value.investigationId !== state.investigationId ||
+    !value.summary ||
+    typeof value.summary !== "object" ||
+    (value.analysisComment !== null && typeof value.analysisComment !== "string") ||
+    (value.fixComment !== null && typeof value.fixComment !== "string")
+  ) {
+    throw new Error("Protected terminal-comment payload has an invalid shape.");
+  }
+  return value as TerminalCommentPayload;
+}
+
+function sha256(value: Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function safeMessage(error: unknown): string {
   return boundedSafeText(
     error instanceof Error ? error.message : String(error),
     MAX_DELIVERY_ERROR_CHARS,
   );
+}
+
+function retryableDeliveryMessage(error: unknown): string {
+  return error instanceof DeliveryLockBusyError ||
+    error instanceof DeliveryLockLostError
+    ? "Delivery lock ownership is temporarily unavailable."
+    : "Delivery reconciliation is temporarily unavailable.";
 }

@@ -70,7 +70,10 @@ export type DeliveryJobPayload = {
 // blips deserve a slower, slightly longer backoff (30s, 1m, 2m) than the
 // pipeline's 5s-based schedule, and their attempts must not consume the
 // investigation job's budget.
-export const DELIVERY_JOB_ATTEMPTS = 4;
+// Six attempts keep recovery available well beyond the 20-second filesystem
+// lease: 30s, 1m, 2m, 4m, and 8m backoffs. A crashed lease is reclaimable
+// before the first retry, while a healthy owner renews every five seconds.
+export const DELIVERY_JOB_ATTEMPTS = 6;
 export const DELIVERY_RETRY_BACKOFF_MS = 30_000;
 
 // Deterministic delivery job id: at most one delivery job per investigation

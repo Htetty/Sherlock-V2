@@ -59,6 +59,7 @@ import {
 import { truncateUtf8Bytes } from "./reproduction-evidence.js";
 import {
   capturePullRequestRetryPlan,
+  type DeliveryStateStore,
   type PullRequestRetryPlan,
 } from "./delivery.js";
 import {
@@ -178,6 +179,7 @@ export type PipelineOptions = {
   // Defaults to the no-op store, so leaving this unset preserves behavior.
   // Writes are best-effort: a failing store never fails the investigation.
   stateStore?: InvestigationStateStore;
+  deliveryPayloadStore?: Pick<DeliveryStateStore, "persistPayload">;
 };
 
 export type ReproducerFallbackCase =
@@ -1171,6 +1173,7 @@ export async function runInvestigationPipeline(
 
         pullRequestRetryPlan = await capturePullRequestRetryPlan(
           pullRequestInput,
+          options.deliveryPayloadStore,
         ).catch((error: unknown) => {
           log(`Could not capture the pull-request retry plan: ${formatError(error)}`);
           return null;

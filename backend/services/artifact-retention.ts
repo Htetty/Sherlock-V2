@@ -16,6 +16,7 @@ import {
   isFixFullyDelivered,
   type DeliveryState,
   type DeliveryStateStore,
+  type TerminalFailureRecord,
 } from "./delivery.js";
 import {
   buildConcurrencyLeaseMemberPrefix,
@@ -99,7 +100,7 @@ function booleanValue(value: string | undefined, fallback: boolean): boolean {
 }
 
 export type ArtifactCleanupProtectionSnapshot = {
-  isProtected(state: DeliveryState): Promise<boolean>;
+  isProtected(state: DeliveryState | TerminalFailureRecord): Promise<boolean>;
 };
 
 export type ArtifactCleanupProtection = {
@@ -151,10 +152,16 @@ end
 return 0
 `;
 
+export const ACTIVE_DELIVERY_JOB_SCRIPT = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local terminal = redis.call('HMGET', KEYS[1], 'finishedOn', 'failedReason')
+if terminal[1] or terminal[2] then return 0 end
+return 1
+`;
+
 export function createRedisArtifactCleanupProtection(input: {
-  queue: Pick<Queue, "getJobCounts" | "getJobs" | "getJob">;
+  queue: Pick<Queue, "getJobCounts" | "toKey">;
   redis: RedisScriptRunner;
-  maxQueueJobs: number;
   now?: () => number;
 }): ArtifactCleanupProtection {
   const now = input.now ?? Date.now;
@@ -162,58 +169,26 @@ export function createRedisArtifactCleanupProtection(input: {
 
   return {
     async snapshot() {
-      const counts = await input.queue.getJobCounts(...PROTECTED_JOB_TYPES);
-      const pendingCount = PROTECTED_JOB_TYPES.reduce(
-        (total, type) => total + Number(counts[type] ?? 0),
-        0,
-      );
-
-      if (pendingCount > input.maxQueueJobs) {
-        throw new Error("Pending queue state exceeds the bounded cleanup scan.");
-      }
-
-      const jobs =
-        pendingCount === 0
-          ? []
-          : await input.queue.getJobs(
-              PROTECTED_JOB_TYPES,
-              0,
-              input.maxQueueJobs - 1,
-              true,
-            );
-      const protectedInvestigationIds = new Set<string>();
-
-      for (const job of jobs) {
-        const investigationId = (job.data as { investigationId?: unknown })
-          ?.investigationId;
-        if (!isInvestigationId(investigationId)) {
-          throw new Error("A pending queue job has no valid investigation id.");
-        }
-        protectedInvestigationIds.add(investigationId);
-      }
+      // Counts prove Redis/BullMQ metadata is reachable. Exact protection
+      // below inspects one deterministic delivery job ID, so queue volume does
+      // not expand the privacy or latency bound.
+      await input.queue.getJobCounts(...PROTECTED_JOB_TYPES);
 
       return {
         isProtected: async (state) => {
-          if (protectedInvestigationIds.has(state.investigationId)) {
-            return true;
-          }
-
-          // Close the narrow race where a delivery job is created after the
-          // bounded snapshot. Its deterministic id permits an exact lookup.
-          const deliveryJob = await input.queue.getJob(
-            buildDeliveryJobId(state.investigationId),
+          // Terminal records cannot still have a retryable investigation job;
+          // only the deterministic delivery-only job can race cleanup. Check
+          // that one safe ID directly in BullMQ's metadata structures, never
+          // a Job object or its data hash field.
+          const deliveryJobActive = Number(
+            await input.redis.eval(
+              ACTIVE_DELIVERY_JOB_SCRIPT,
+              1,
+              input.queue.toKey(buildDeliveryJobId(state.investigationId)),
+            ),
           );
-          if (deliveryJob) {
-            const deliveryJobState = await deliveryJob.getState();
-            if (
-              deliveryJobState === "active" ||
-              deliveryJobState === "delayed" ||
-              deliveryJobState === "waiting" ||
-              deliveryJobState === "waiting-children" ||
-              deliveryJobState === "prioritized"
-            ) {
-              return true;
-            }
+          if (deliveryJobActive !== 0) {
+            return true;
           }
 
           const tenantKey = `${TENANT_CONCURRENCY_KEY_PREFIX}${state.tenantId}`;
@@ -277,6 +252,22 @@ export type ArtifactCleanupService = {
   scanExpired(): Promise<ArtifactCleanupScanResult>;
 };
 
+export async function evaluateTerminalJobArtifactRetention(input: {
+  cleanup: ArtifactCleanupService;
+  investigationId: string;
+  onResult?: (result: ArtifactCleanupResult) => void | Promise<void>;
+}): Promise<ArtifactCleanupResult | null> {
+  try {
+    const result = await input.cleanup.cleanupInvestigation(input.investigationId);
+    await input.onResult?.(result);
+    return result;
+  } catch {
+    // Retention is detached operational work. A cleanup or visibility failure
+    // must never change the BullMQ job's already-decided outcome.
+    return null;
+  }
+}
+
 export type ArtifactCleanupServiceOptions = {
   rootDir?: string;
   deliveryStore: DeliveryStateStore;
@@ -337,24 +328,33 @@ export function createArtifactCleanupService(
         }
 
         const state = await options.deliveryStore.load(investigationId);
+        const terminalFailure = state
+          ? null
+          : await options.deliveryStore.loadTerminalFailure(investigationId);
         const currentTime = now();
-        const expiry = state ? artifactExpiry(state, config) : null;
+        const expiry = state
+          ? artifactExpiry(state, config)
+          : terminalFailure
+            ? Date.parse(terminalFailure.retentionEligibleAt)
+            : null;
         const retainedFailedAgeMs = state
           ? failedArtifactAge(state, currentTime)
-          : null;
+          : terminalFailure
+            ? Math.max(0, currentTime - Date.parse(terminalFailure.terminalAt))
+            : null;
         const retained = (status: ArtifactCleanupStatus) => ({
           investigationId,
           status,
           ...(retainedFailedAgeMs === null ? {} : { retainedFailedAgeMs }),
         });
 
-        if (!state || expiry === null) {
+        if ((!state && !terminalFailure) || expiry === null || !Number.isFinite(expiry)) {
           return retained("not_terminal");
         }
         if (currentTime < expiry) {
           return retained("not_expired");
         }
-        if (await snapshot.isProtected(state)) {
+        if (await snapshot.isProtected(state ?? terminalFailure!)) {
           return retained("protected");
         }
 
@@ -491,6 +491,12 @@ function artifactExpiry(
   state: DeliveryState,
   config: ArtifactRetentionConfig,
 ): number | null {
+  if (state.terminalComment.status === "failed") {
+    const failedAt = Date.parse(state.updatedAt);
+    return Number.isFinite(failedAt)
+      ? failedAt + config.failedRetentionMs
+      : null;
+  }
   const deliveredAt = state.terminalComment.postedAt
     ? Date.parse(state.terminalComment.postedAt)
     : Number.NaN;
@@ -502,8 +508,14 @@ function artifactExpiry(
   }
 
   if (state.executionOutcome === "verified_fix") {
-    return isFixFullyDelivered(state)
-      ? deliveredAt + config.successfulRetentionMs
+    if (isFixFullyDelivered(state)) {
+      return deliveredAt + config.successfulRetentionMs;
+    }
+    // A truthful blocked/failed PR plus a posted terminal comment is a
+    // terminal failed delivery, not an indefinitely active delivery.
+    return state.pullRequest.status === "failed" ||
+      state.pullRequest.status === "blocked"
+      ? deliveredAt + config.failedRetentionMs
       : null;
   }
 
@@ -523,6 +535,22 @@ function artifactExpiry(
 }
 
 function failedArtifactAge(state: DeliveryState, nowMs: number): number | null {
+  if (state.terminalComment.status === "failed") {
+    const failedAt = Date.parse(state.updatedAt);
+    return Number.isFinite(failedAt) ? Math.max(0, nowMs - failedAt) : null;
+  }
+  if (
+    state.executionOutcome === "verified_fix" &&
+    (state.pullRequest.status === "failed" ||
+      state.pullRequest.status === "blocked") &&
+    state.terminalComment.status === "posted" &&
+    state.terminalComment.postedAt
+  ) {
+    const deliveredAt = Date.parse(state.terminalComment.postedAt);
+    return Number.isFinite(deliveredAt)
+      ? Math.max(0, nowMs - deliveredAt)
+      : null;
+  }
   if (
     !RETAINED_FAILURE_OUTCOMES.has(state.executionOutcome) ||
     state.fixVerified ||

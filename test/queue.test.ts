@@ -181,7 +181,9 @@ describe("investigation worker processing", () => {
       (rejection: unknown) => rejection as Error,
     );
     expect(transientRejection).not.toBeInstanceOf(UnrecoverableError);
-    expect(transientRejection.message).toBe("socket hang up");
+    expect(transientRejection.message).toBe(
+      "An infrastructure operation is temporarily unavailable; the job will retry.",
+    );
     expect(comments).toHaveLength(0);
 
     // Same transient failure on the final attempt: reported and permanent.
@@ -211,7 +213,7 @@ describe("investigation worker processing", () => {
     expect(failureComment).toContain("Investigation: inv_0TEST123ABC");
     expect(failureComment).toContain("Outcome: failed");
     expect(failureComment).not.toContain("hunter2");
-    expect(failureComment).toContain("[REDACTED]");
+    expect(failureComment).toContain("worker failed permanently");
     expect(stages.filter((stage) => stage === "failed")).toHaveLength(2);
 
     // The standalone formatter also redacts.
@@ -303,7 +305,7 @@ describe("worker-level state store writes", () => {
         { data: jobPayload, attemptsMade: 0, opts: { attempts: 3 } },
         deps,
       ),
-    ).rejects.toThrowError("socket hang up");
+    ).rejects.toThrowError("temporarily unavailable");
 
     expect(pipelineRan).toBe(false);
 
@@ -358,7 +360,7 @@ describe("worker-level state store writes", () => {
       },
       (rejection: unknown) => rejection as Error,
     );
-    expect(retryRejection.message).toContain("[REDACTED]");
+    expect(retryRejection.message).toContain("temporarily unavailable");
     expect(retryRejection.message).not.toContain("example-secret");
     expect(retryRejection.message).not.toContain("redact-me");
 
@@ -375,7 +377,7 @@ describe("worker-level state store writes", () => {
     );
     expect(finalRejection).toBeInstanceOf(UnrecoverableError);
     expect(finalRejection.message).toContain("inv_0TEST123ABC");
-    expect(finalRejection.message).toContain("[REDACTED]");
+    expect(finalRejection.message).toContain("failed permanently");
     expect(finalRejection.message).not.toContain("example-secret");
     expect(finalRejection.message).not.toContain("redact-me");
 
@@ -389,7 +391,7 @@ describe("worker-level state store writes", () => {
     ].join("\n");
     expect(escaped).not.toContain("example-secret");
     expect(escaped).not.toContain("redact-me");
-    expect(escaped).toContain("[REDACTED]");
+    expect(escaped).toContain("temporarily unavailable");
   });
 
   test("a post-pipeline comment failure keeps the pipeline outcome and records the failed delivery", async () => {

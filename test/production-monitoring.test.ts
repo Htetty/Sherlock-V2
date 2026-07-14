@@ -299,6 +299,7 @@ describe("durable worker heartbeat", () => {
 describe("payload-free queue summary", () => {
   test("reports the five operational counts and oldest ages", async () => {
     const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
       getJobCounts: vi.fn().mockResolvedValue({
         waiting: 2,
         active: 1,
@@ -306,12 +307,31 @@ describe("payload-free queue summary", () => {
         completed: 40,
         failed: 4,
       }),
-      getJobs: vi
-        .fn()
-        .mockResolvedValueOnce([{ timestamp: NOW - 70_000, data: "secret" }])
-        .mockResolvedValueOnce([{ timestamp: NOW - 30_000, data: "secret" }]),
     };
-    const summary = await readQueueOperationalSummary(queue as never, () => NOW);
+    const redis = {
+      lrange: vi.fn().mockResolvedValue(["wait-1", "wait-2"]),
+      zrange: vi.fn().mockResolvedValue([
+        "delay-1", String((NOW - 10_000) * 0x1000),
+        "delay-2", String((NOW + 10_000) * 0x1000),
+        "delay-3", String((NOW + 20_000) * 0x1000),
+      ]),
+      hmget: vi.fn(async (key: string, field: string) => {
+        expect(field).toBe("timestamp");
+        const timestamps: Record<string, number> = {
+          "bull:test:wait-1": NOW - 70_000,
+          "bull:test:wait-2": NOW - 20_000,
+          "bull:test:delay-1": NOW - 30_000,
+          "bull:test:delay-2": NOW - 20_000,
+          "bull:test:delay-3": NOW - 10_000,
+        };
+        return [String(timestamps[key])];
+      }),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
     expect(summary).toEqual({
       waiting: 2,
       active: 1,
@@ -319,9 +339,143 @@ describe("payload-free queue summary", () => {
       completed: 40,
       failed: 4,
       oldestWaitingAgeMs: 70_000,
-      oldestDelayedAgeMs: 30_000,
+      oldestDelayedCreationAgeMs: 30_000,
+      oldestDelayedOverdueAgeMs: 10_000,
+      waitingAgeComplete: true,
+      delayedCreationAgeComplete: true,
+      delayedDueAgeComplete: true,
     });
     expect(JSON.stringify(summary)).not.toContain("secret");
+  });
+
+  test("empty queues determine ages without reading any job hash", async () => {
+    const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
+      getJobCounts: vi.fn().mockResolvedValue({
+        waiting: 0,
+        active: 0,
+        delayed: 0,
+        completed: 0,
+        failed: 0,
+      }),
+      getJobs: vi.fn(),
+      getJob: vi.fn(),
+    };
+    const redis = {
+      lrange: vi.fn(),
+      zrange: vi.fn(),
+      hmget: vi.fn(),
+      hgetall: vi.fn(),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
+    expect(summary).toMatchObject({
+      oldestWaitingAgeMs: null,
+      oldestDelayedCreationAgeMs: null,
+      oldestDelayedOverdueAgeMs: null,
+      waitingAgeComplete: true,
+      delayedCreationAgeComplete: true,
+      delayedDueAgeComplete: true,
+    });
+    expect(redis.hmget).not.toHaveBeenCalled();
+    expect(queue.getJobs).not.toHaveBeenCalled();
+    expect(queue.getJob).not.toHaveBeenCalled();
+    expect(redis.hgetall).not.toHaveBeenCalled();
+  });
+
+  test("delayed creation age is distinct from scheduled overdue age", async () => {
+    const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
+      getJobCounts: vi.fn().mockResolvedValue({
+        waiting: 0,
+        active: 0,
+        delayed: 1,
+        completed: 0,
+        failed: 0,
+      }),
+    };
+    const redis = {
+      lrange: vi.fn(),
+      zrange: vi
+        .fn()
+        .mockResolvedValue(["delay-1", String((NOW - 5_000) * 0x1000)]),
+      hmget: vi.fn().mockResolvedValue([String(NOW - 600_000)]),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
+    expect(summary.oldestDelayedCreationAgeMs).toBe(600_000);
+    expect(summary.oldestDelayedOverdueAgeMs).toBe(5_000);
+  });
+
+  test("inspection is capped and reports creation ages as unproven", async () => {
+    const ids = Array.from({ length: 100 }, (_, index) => `delay-${index}`);
+    const entries = ids.flatMap((id, index) => [
+      id,
+      String((NOW + index * 1_000) * 0x1000),
+    ]);
+    const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
+      getJobCounts: vi.fn().mockResolvedValue({
+        waiting: 101,
+        active: 0,
+        delayed: 101,
+        completed: 0,
+        failed: 0,
+      }),
+    };
+    const redis = {
+      lrange: vi.fn(),
+      zrange: vi.fn().mockResolvedValue(entries),
+      hmget: vi.fn().mockResolvedValue([String(NOW)]),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
+    expect(redis.lrange).not.toHaveBeenCalled();
+    expect(redis.zrange).toHaveBeenCalledWith(
+      "bull:test:delayed",
+      0,
+      99,
+      "WITHSCORES",
+    );
+    expect(redis.hmget).toHaveBeenCalledTimes(100);
+    expect(summary.waitingAgeComplete).toBe(false);
+    expect(summary.delayedCreationAgeComplete).toBe(false);
+    expect(summary.oldestWaitingAgeMs).toBeNull();
+    expect(summary.oldestDelayedCreationAgeMs).toBeNull();
+  });
+
+  test("missing or malformed exact timestamps make age unknown", async () => {
+    const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
+      getJobCounts: vi.fn().mockResolvedValue({
+        waiting: 1,
+        active: 0,
+        delayed: 0,
+        completed: 0,
+        failed: 0,
+      }),
+    };
+    const redis = {
+      lrange: vi.fn().mockResolvedValue(["wait-1"]),
+      zrange: vi.fn(),
+      hmget: vi.fn().mockResolvedValue([null]),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
+    expect(summary.waitingAgeComplete).toBe(false);
+    expect(summary.oldestWaitingAgeMs).toBeNull();
   });
 
   test("old waiting work is a warning, not a false healthy result", async () => {
@@ -590,6 +744,7 @@ describe("operator command safety and failure semantics", () => {
   test("queue payload secrets never enter operator output", async () => {
     const secret = "ghp_private-token-from-job-payload";
     const queue = {
+      toKey: (value: string) => `bull:test:${value}`,
       getJobCounts: vi.fn().mockResolvedValue({
         waiting: 1,
         active: 0,
@@ -597,14 +752,28 @@ describe("operator command safety and failure semantics", () => {
         completed: 0,
         failed: 0,
       }),
-      getJobs: vi.fn().mockResolvedValue([{ timestamp: NOW, data: { secret } }]),
+      getJobs: vi.fn(() => { throw new Error(`forbidden ${secret}`); }),
+      getJob: vi.fn(() => { throw new Error(`forbidden ${secret}`); }),
     };
-    const summary = await readQueueOperationalSummary(queue as never, () => NOW);
+    const redis = {
+      lrange: vi.fn().mockResolvedValue(["wait-1"]),
+      zrange: vi.fn(),
+      hmget: vi.fn().mockResolvedValue([String(NOW)]),
+      hgetall: vi.fn(() => { throw new Error(`forbidden ${secret}`); }),
+    };
+    const summary = await readQueueOperationalSummary(
+      queue as never,
+      redis as never,
+      () => NOW,
+    );
     const report = await runProductionOpsCheck(
       getProductionMonitoringConfig({}),
       baseAdapters({ queueSummary: async () => summary }),
     );
     expect(formatProductionOpsReport(report)).not.toContain(secret);
+    expect(queue.getJobs).not.toHaveBeenCalled();
+    expect(queue.getJob).not.toHaveBeenCalled();
+    expect(redis.hgetall).not.toHaveBeenCalled();
   });
 
   test("private artifact paths and contents from adapter errors are not printed", async () => {

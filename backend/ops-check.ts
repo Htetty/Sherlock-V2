@@ -133,7 +133,7 @@ export function createProductionOpsAdapters(input: {
       },
       queueSummary: async () => {
         await ensureRedis();
-        return readQueueOperationalSummary(queue, now);
+        return readQueueOperationalSummary(queue, operationalRedis, now);
       },
       filesystemUsage: () =>
         readFilesystemUsage(productionFilesystemTargets(env), { statfs }),
@@ -182,7 +182,11 @@ export function createTestOpsAdapters(
       completed: 3,
       failed: 0,
       oldestWaitingAgeMs: null,
-      oldestDelayedAgeMs: null,
+      oldestDelayedCreationAgeMs: null,
+      oldestDelayedOverdueAgeMs: null,
+      waitingAgeComplete: true,
+      delayedCreationAgeComplete: true,
+      delayedDueAgeComplete: true,
     }),
     filesystemUsage: async () =>
       ["artifacts", "sherlock-data", "temporary-workspaces", "root", "docker-storage"].map(

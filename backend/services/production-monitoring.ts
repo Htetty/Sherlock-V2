@@ -51,6 +51,14 @@ export type OperationalRedis = {
     countValue: number,
   ): Promise<[string, string[]]>;
   mget(...keys: string[]): Promise<Array<string | null>>;
+  lrange(key: string, start: number, stop: number): Promise<string[]>;
+  zrange(
+    key: string,
+    start: number,
+    stop: number,
+    withScores: "WITHSCORES",
+  ): Promise<string[]>;
+  hmget(key: string, ...fields: string[]): Promise<Array<string | null>>;
 };
 
 export function asOperationalRedis(redis: Redis): OperationalRedis {
@@ -388,11 +396,18 @@ export type QueueOperationalSummary = {
   completed: number;
   failed: number;
   oldestWaitingAgeMs: number | null;
-  oldestDelayedAgeMs: number | null;
+  oldestDelayedCreationAgeMs: number | null;
+  oldestDelayedOverdueAgeMs: number | null;
+  waitingAgeComplete: boolean;
+  delayedCreationAgeComplete: boolean;
+  delayedDueAgeComplete: boolean;
 };
 
+const MAX_QUEUE_AGE_IDS = 100;
+
 export async function readQueueOperationalSummary(
-  queue: Pick<Queue, "getJobCounts" | "getJobs">,
+  queue: Pick<Queue, "getJobCounts" | "toKey">,
+  redis: Pick<OperationalRedis, "lrange" | "zrange" | "hmget">,
   now: () => number = Date.now,
 ): Promise<QueueOperationalSummary> {
   const counts = await queue.getJobCounts(
@@ -402,27 +417,102 @@ export async function readQueueOperationalSummary(
     "completed",
     "failed",
   );
-  const waiting = Number(counts.waiting ?? 0);
-  const delayed = Number(counts.delayed ?? 0);
-  const [oldestWaiting, oldestDelayed] = await Promise.all([
-    waiting > 0 ? queue.getJobs("waiting", 0, 0, true) : Promise.resolve([]),
-    delayed > 0 ? queue.getJobs("delayed", 0, 0, true) : Promise.resolve([]),
-  ]);
+  const count = (name: "waiting" | "active" | "delayed" | "completed" | "failed") => {
+    if (counts[name] === undefined || counts[name] === null) {
+      throw new Error("Queue counts are unavailable.");
+    }
+    const value = Number(counts[name]);
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("Queue counts are unavailable.");
+    }
+    return value;
+  };
+  const waiting = count("waiting");
+  const delayed = count("delayed");
+  const waitingIds =
+    waiting > 0 && waiting <= MAX_QUEUE_AGE_IDS
+      ? await redis.lrange(queue.toKey("wait"), 0, waiting - 1)
+      : [];
+  const delayedEntries =
+    delayed > 0
+      ? await redis.zrange(
+          queue.toKey("delayed"),
+          0,
+          Math.min(delayed, MAX_QUEUE_AGE_IDS) - 1,
+          "WITHSCORES",
+        )
+      : [];
+  const delayedIds = delayedEntries.filter((_, index) => index % 2 === 0);
+  const delayedScores = delayedEntries
+    .filter((_, index) => index % 2 === 1)
+    .map(Number);
+  const waitingTimestamps = await safeJobTimestamps(queue, redis, waitingIds);
+  const delayedTimestamps = await safeJobTimestamps(queue, redis, delayedIds);
+  const waitingAgeComplete =
+    waiting === 0 ||
+    (waiting <= MAX_QUEUE_AGE_IDS &&
+      waitingIds.length === waiting &&
+      new Set(waitingIds).size === waitingIds.length &&
+      waitingTimestamps.length === waiting &&
+      waitingTimestamps.every(Number.isFinite));
+  const delayedCreationAgeComplete =
+    delayed === 0 ||
+    (delayed <= MAX_QUEUE_AGE_IDS &&
+      delayedIds.length === delayed &&
+      new Set(delayedIds).size === delayedIds.length &&
+      delayedTimestamps.length === delayed &&
+      delayedTimestamps.every(Number.isFinite));
+  const delayedDueAgeComplete =
+    delayed === 0 ||
+    (delayedScores.length > 0 &&
+      Number.isFinite(delayedScores[0]) &&
+      delayedEntries.length % 2 === 0);
+  const nowMs = now();
+  const oldestDueAt = delayedDueAgeComplete && delayed > 0
+    ? Math.floor(delayedScores[0] / 0x1000)
+    : null;
 
   return {
     waiting,
-    active: Number(counts.active ?? 0),
+    active: count("active"),
     delayed,
-    completed: Number(counts.completed ?? 0),
-    failed: Number(counts.failed ?? 0),
-    oldestWaitingAgeMs: jobAge(oldestWaiting[0]?.timestamp, now()),
-    oldestDelayedAgeMs: jobAge(oldestDelayed[0]?.timestamp, now()),
+    completed: count("completed"),
+    failed: count("failed"),
+    oldestWaitingAgeMs: waitingAgeComplete
+      ? oldestAge(waitingTimestamps, nowMs)
+      : null,
+    oldestDelayedCreationAgeMs: delayedCreationAgeComplete
+      ? oldestAge(delayedTimestamps, nowMs)
+      : null,
+    oldestDelayedOverdueAgeMs:
+      oldestDueAt !== null && oldestDueAt <= nowMs
+        ? Math.max(0, nowMs - oldestDueAt)
+        : null,
+    waitingAgeComplete,
+    delayedCreationAgeComplete,
+    delayedDueAgeComplete,
   };
 }
 
-function jobAge(timestamp: unknown, nowMs: number): number | null {
-  return typeof timestamp === "number" && Number.isFinite(timestamp)
-    ? Math.max(0, nowMs - timestamp)
+async function safeJobTimestamps(
+  queue: Pick<Queue, "toKey">,
+  redis: Pick<OperationalRedis, "hmget">,
+  ids: string[],
+): Promise<number[]> {
+  const values = await Promise.all(
+    ids.map(async (id) => {
+      const [timestamp] = await redis.hmget(queue.toKey(id), "timestamp");
+      return timestamp !== null && timestamp.trim() !== ""
+        ? Number(timestamp)
+        : Number.NaN;
+    }),
+  );
+  return values.map((value) => (Number.isFinite(value) && value >= 0 ? value : Number.NaN));
+}
+
+function oldestAge(timestamps: number[], nowMs: number): number | null {
+  return timestamps.length > 0
+    ? Math.max(...timestamps.map((timestamp) => Math.max(0, nowMs - timestamp)))
     : null;
 }
 

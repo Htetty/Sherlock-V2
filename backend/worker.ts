@@ -32,12 +32,14 @@ import { cleanupAllContainers } from "./services/container.js";
 import {
   createArtifactCleanupService,
   createRedisArtifactCleanupProtection,
+  evaluateTerminalJobArtifactRetention,
   getArtifactRetentionConfig,
   startArtifactCleanupScheduler,
 } from "./services/artifact-retention.js";
 import {
   createDeliveryGitHubRestClient,
   createFileDeliveryStateStore,
+  findTerminalCommentPaginated,
 } from "./services/delivery.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
@@ -90,9 +92,11 @@ const stateStore = createInvestigationStateStoreFromEnv();
 const deliveryStore = createFileDeliveryStateStore();
 const deliveryQueueConnection = createRedisConnection();
 const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
+const artifactRetentionConfig = getArtifactRetentionConfig();
 
 const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
+  failedArtifactRetentionMs: artifactRetentionConfig.failedRetentionMs,
   delivery: {
     store: deliveryStore,
     enqueue: (payload: DeliveryJobPayload) =>
@@ -104,41 +108,31 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
       repo,
       issueNumber,
       marker,
-      createdAfter,
+      assertOwnership,
     }) => {
       const octokit = await getInstallationOctokit(installationId);
-
-      // Bounded scan of the issue's comments for the terminal marker; enough
-      // for any real issue thread without risking an unbounded pagination.
-      for (let page = 1; page <= 3; page += 1) {
-        const { data } = await octokit.rest.issues.listComments({
-          owner,
-          repo,
-          issue_number: issueNumber,
-          per_page: 100,
-          page,
-          since: createdAfter,
-        });
-
-        if (
-          data.some(
-            (comment: { body?: string | null }) =>
-              typeof comment.body === "string" && comment.body.includes(marker),
-          )
-        ) {
-          return true;
-        }
-
-        if (data.length < 100) {
-          break;
-        }
-      }
-
-      return false;
+      return findTerminalCommentPaginated({
+        marker,
+        assertOwnership,
+        listPage: async (page, perPage) => {
+          const { data } = await octokit.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: perPage,
+            page,
+          });
+          return data;
+        },
+      });
     },
   },
   runPipeline: (payload, pipelineOptions) =>
-    runInvestigationPipeline(payload, { ...pipelineOptions, stateStore }),
+    runInvestigationPipeline(payload, {
+      ...pipelineOptions,
+      stateStore,
+      deliveryPayloadStore: deliveryStore,
+    }),
   getInstallationToken: async (installationId) => {
     const octokit = await getInstallationOctokit(installationId);
     // Single token request: @octokit/auth-app's installation auth result
@@ -155,8 +149,16 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
 
     return { token: auth.token, permissions: auth.permissions ?? null };
   },
-  postIssueComment: async ({ installationId, owner, repo, issueNumber, body }) => {
+  postIssueComment: async ({
+    installationId,
+    owner,
+    repo,
+    issueNumber,
+    body,
+    assertOwnership,
+  }) => {
     const octokit = await getInstallationOctokit(installationId);
+    await assertOwnership?.();
     await octokit.rest.issues.createComment({
       owner,
       repo,
@@ -192,15 +194,11 @@ const concurrencyGate = createInvestigationConcurrencyGate(() =>
   asScriptRunner(connection),
 );
 
-const artifactRetentionConfig = getArtifactRetentionConfig();
 const artifactCleanup = createArtifactCleanupService({
   deliveryStore,
   protection: createRedisArtifactCleanupProtection({
     queue: deliveryQueue,
     redis: asScriptRunner(connection),
-    // If protected queue state is larger than the configured bounded scan,
-    // cleanup skips safely instead of loading an unbounded job set.
-    maxQueueJobs: artifactRetentionConfig.maxDirectoriesPerScan,
   }),
   config: artifactRetentionConfig,
   log: (message) => console.log(message),
@@ -256,21 +254,28 @@ async function publishCleanupStatus(
   }
 }
 
-worker.on("completed", (job) => {
-  console.log(`[queue] Job ${job.id} completed.`);
+function evaluateArtifactRetention(investigationId: string) {
   // BullMQ has moved the job to its terminal set before this event. Cleanup
   // remains detached and non-fatal; a delivery job that is still waiting,
   // delayed, or active protects the artifacts through the activity probe.
-  void artifactCleanup
-    .cleanupInvestigation(job.data.investigationId)
-    .then((result) =>
+  void evaluateTerminalJobArtifactRetention({
+    cleanup: artifactCleanup,
+    investigationId,
+    onResult: (result) =>
       publishCleanupStatus(cleanupResultOperationalRecord(workerId, result)),
-    )
-    .catch(() => {});
+  });
+}
+
+worker.on("completed", (job) => {
+  console.log(`[queue] Job ${job.id} completed.`);
+  evaluateArtifactRetention(job.data.investigationId);
 });
 
 worker.on("failed", (job, error) => {
   console.error(`[queue] Job ${job?.id} failed: ${describeWorkerError(error)}`);
+  if (job?.data.investigationId) {
+    evaluateArtifactRetention(job.data.investigationId);
+  }
 });
 
 // Redis/worker infrastructure errors surface asynchronously; log them

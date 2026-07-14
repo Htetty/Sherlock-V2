@@ -17,6 +17,8 @@ import {
   type DeliveryGitHubClient,
   type DeliveryState,
   type DeliveryStateStore,
+  type TerminalFailureCategory,
+  type TerminalFailureRecord,
 } from "../services/delivery.js";
 import type {
   InvestigationPipelineInput,
@@ -72,6 +74,7 @@ export type WorkerDeps = {
     repo: string;
     issueNumber: number;
     body: string;
+    assertOwnership?: () => Promise<void>;
   }) => Promise<void>;
   reportStage?: (stage: InvestigationStage) => void | Promise<void>;
   // Lifecycle state store. Worker-level writes (queued/running before the
@@ -96,9 +99,10 @@ export type WorkerDeps = {
       repo: string;
       issueNumber: number;
       marker: string;
-      createdAfter: string;
+      assertOwnership: () => Promise<void>;
     }) => Promise<boolean>;
   };
+  failedArtifactRetentionMs?: number;
   log?: (message: string) => void;
 };
 
@@ -210,6 +214,42 @@ export function formatWorkerFailureComment(
   );
 }
 
+function terminalFailureCategory(
+  error: unknown,
+  pipelineStarted: boolean,
+): TerminalFailureCategory {
+  return error instanceof RepositoryError
+    ? "repository"
+    : isTransientInfrastructureError(error)
+      ? "infrastructure"
+      : !pipelineStarted
+        ? "preflight"
+        : "worker";
+}
+
+function retryableWorkerFailureMessage(error: unknown): string {
+  if (error instanceof DeliveryRetryableError) {
+    return "Delivery reconciliation is temporarily unavailable.";
+  }
+  if (error instanceof RepositoryError) {
+    return "A repository operation is temporarily unavailable; the job will retry.";
+  }
+  return "An infrastructure operation is temporarily unavailable; the job will retry.";
+}
+
+function terminalWorkerFailureMessage(category: TerminalFailureCategory): string {
+  switch (category) {
+    case "repository":
+      return "Repository access failed after the configured attempts.";
+    case "infrastructure":
+      return "Infrastructure failed after the configured attempts.";
+    case "preflight":
+      return "Worker preflight failed permanently.";
+    case "worker":
+      return "The investigation worker failed permanently.";
+  }
+}
+
 // How long a concurrency-blocked job waits before the queue retries it.
 // Intentional delay through the queue — never a drop and never a failure.
 export const CONCURRENCY_BLOCKED_RETRY_DELAY_MS = 30_000;
@@ -316,6 +356,7 @@ export async function processInvestigationJob(
 ): Promise<{ investigationId: string; outcome: string }> {
   const payload = job.data;
   const log = deps.log ?? (() => {});
+  let latestStage: InvestigationStage = "queued";
 
   // Best-effort, non-fatal worker-level state writes. A failing store must
   // never fail the job (which would trigger a spurious retry).
@@ -334,6 +375,7 @@ export async function processInvestigationJob(
   };
 
   const reportStage = async (stage: InvestigationStage) => {
+    latestStage = stage;
     if (stage !== "failed") {
       signal?.throwIfAborted();
     }
@@ -355,8 +397,12 @@ export async function processInvestigationJob(
   // result on a previous attempt (or the worker crashed/stalled after it).
   // Never rerun the pipeline: finish GitHub delivery from the durable state.
   let existingDeliveryState: DeliveryState | null;
+  let existingTerminalFailure: TerminalFailureRecord | null;
   try {
     existingDeliveryState = await deps.delivery.store.load(
+      payload.investigationId,
+    );
+    existingTerminalFailure = await deps.delivery.store.loadTerminalFailure(
       payload.investigationId,
     );
   } catch (error) {
@@ -367,6 +413,24 @@ export async function processInvestigationJob(
       throw new Error(message);
     }
     throw new UnrecoverableError(`[${payload.investigationId}] ${message}`);
+  }
+
+  if (existingTerminalFailure) {
+    if (
+      existingTerminalFailure.tenantId !== payload.tenantId ||
+      existingTerminalFailure.repoOwner !== payload.repositoryOwner ||
+      existingTerminalFailure.repoName !== payload.repositoryName
+    ) {
+      throw new UnrecoverableError(
+        `[${payload.investigationId}] Terminal failure state does not match the investigation job.`,
+      );
+    }
+    log(
+      `[${payload.investigationId}] Terminal infrastructure failure already exists; the investigation pipeline will not rerun.`,
+    );
+    throw new UnrecoverableError(
+      `[${payload.investigationId}] Investigation already terminalized at ${existingTerminalFailure.stage}.`,
+    );
   }
 
   if (existingDeliveryState) {
@@ -413,9 +477,9 @@ export async function processInvestigationJob(
 
       const message = safeErrorMessage(error);
 
-      if (error instanceof DeliveryRetryableError && !isFinalAttempt) {
+      if (error instanceof DeliveryRetryableError) {
         log(
-          `[${payload.investigationId}] Delivery retry failed transiently; the job will retry delivery only: ${message}`,
+          `[${payload.investigationId}] Delivery retry failed transiently; durable delivery remains pending: ${message}`,
         );
         await recordState({
           type: "error",
@@ -435,6 +499,7 @@ export async function processInvestigationJob(
   // failure (record a terminal worker outcome) from a post-pipeline failure
   // (the pipeline already recorded its own final outcome — do not overwrite).
   let pipelineResult: InvestigationPipelineResult | null = null;
+  let pipelineStarted = false;
   let persistedDeliveryState: DeliveryState | null = null;
   let deliveryPersistenceError: unknown = null;
 
@@ -455,7 +520,7 @@ export async function processInvestigationJob(
       fixComment: result.commentSections?.fix ?? null,
       pullRequest: result.pullRequest ?? null,
       retryPlan: result.pullRequestRetryPlan ?? null,
-    });
+    }, deps.delivery.store);
 
   try {
     // Worker-level state before any setup runs, so an investigation that dies
@@ -480,6 +545,7 @@ export async function processInvestigationJob(
 
     const installationAuth = await deps.getInstallationToken(payload.installationId);
 
+    pipelineStarted = true;
     const result = await deps.runPipeline(
       {
         investigationId: payload.investigationId,
@@ -504,7 +570,7 @@ export async function processInvestigationJob(
           // boundary can never trigger a contradictory worker-failure comment.
           pipelineResult = terminalResult;
           try {
-            const state = deliveryStateFor(terminalResult);
+            const state = await deliveryStateFor(terminalResult);
             await deps.delivery.store.save(state);
             persistedDeliveryState = state;
           } catch (error) {
@@ -538,7 +604,8 @@ export async function processInvestigationJob(
       // Injected/legacy pipeline adapters may not call onTerminalResult yet;
       // keep the post-return save as a compatibility fallback. Production's
       // real pipeline persists through the callback before workspace cleanup.
-      deliveryState = persistedDeliveryState ?? deliveryStateFor(result);
+      deliveryState =
+        persistedDeliveryState ?? (await deliveryStateFor(result));
       if (!persistedDeliveryState) {
         await deps.delivery.store.save(deliveryState);
       }
@@ -622,7 +689,7 @@ export async function processInvestigationJob(
         error instanceof DeliveryRetryableError) &&
       !isFinalAttempt
     ) {
-      const transientMessage = safeErrorMessage(error);
+      const transientMessage = retryableWorkerFailureMessage(error);
       log(
         `[${payload.investigationId}] Transient failure (attempt ${job.attemptsMade + 1}/${attemptsAllowed}), will retry: ${transientMessage}`,
       );
@@ -643,13 +710,41 @@ export async function processInvestigationJob(
     // Final failure: preserve the investigation id and artifacts (the
     // pipeline's own cleanup already stopped sandboxes and containers),
     // report to GitHub, and stop retrying.
+    const terminalFailureStage = latestStage;
     await reportStage("failed");
 
     // Record a terminal worker-level state. Always append the error; only own
     // the final outcome when the pipeline never produced one (a pre-pipeline
     // or worker-setup failure), so a post-pipeline failure — e.g. GitHub
     // comment posting — cannot overwrite the pipeline's real outcome.
-    const failureMessage = safeErrorMessage(error);
+    const failureCategory = terminalFailureCategory(error, pipelineStarted);
+    const failureMessage = terminalWorkerFailureMessage(failureCategory);
+    if (!pipelineResult) {
+      const terminalAt = new Date();
+      const failedRetentionMs = Math.max(
+        0,
+        deps.failedArtifactRetentionMs ?? 7 * 24 * 60 * 60_000,
+      );
+      try {
+        await deps.delivery.store.saveTerminalFailure({
+          version: 1,
+          investigationId: payload.investigationId,
+          tenantId: payload.tenantId,
+          repoOwner: payload.repositoryOwner,
+          repoName: payload.repositoryName,
+          category: failureCategory,
+          stage: terminalFailureStage,
+          terminalAt: terminalAt.toISOString(),
+          retentionEligibleAt: new Date(
+            terminalAt.getTime() + failedRetentionMs,
+          ).toISOString(),
+        });
+      } catch {
+        throw new UnrecoverableError(
+          `[${payload.investigationId}] Durable terminal failure state could not be persisted.`,
+        );
+      }
+    }
     await recordState({ type: "error", stage: "worker", message: failureMessage });
     if (!pipelineResult) {
       await recordState({
@@ -670,7 +765,10 @@ export async function processInvestigationJob(
           owner: payload.repositoryOwner,
           repo: payload.repositoryName,
           issueNumber: payload.issueNumber,
-          body: formatWorkerFailureComment(payload.investigationId, error),
+          body: formatWorkerFailureComment(
+            payload.investigationId,
+            new Error(failureMessage),
+          ),
         })
         .catch((commentError: unknown) => {
           log(
@@ -780,9 +878,9 @@ export async function processDeliveryJob(
 
     const message = safeErrorMessage(error);
 
-    if (error instanceof DeliveryRetryableError && !isFinalAttempt) {
+    if (error instanceof DeliveryRetryableError) {
       log(
-        `[${payload.investigationId}] Delivery attempt ${job.attemptsMade + 1}/${attemptsAllowed} failed transiently, will retry: ${message}`,
+        `[${payload.investigationId}] Delivery attempt ${job.attemptsMade + 1}/${attemptsAllowed} failed transiently; durable delivery remains pending: ${message}`,
       );
       await recordState({
         type: "error",

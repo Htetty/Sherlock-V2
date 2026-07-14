@@ -1,0 +1,258 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { UnrecoverableError } from "bullmq";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  processInvestigationJob,
+  type WorkerDeps,
+} from "../backend/queue/process-investigation.js";
+import type { InvestigationJobPayload } from "../backend/queue/investigation-queue.js";
+import {
+  ARTIFACT_RETENTION_DEFAULTS,
+  createArtifactCleanupService,
+  createNoopArtifactCleanupProtection,
+  evaluateTerminalJobArtifactRetention,
+} from "../backend/services/artifact-retention.js";
+import {
+  createFileDeliveryStateStore,
+  createInMemoryDeliveryStateStore,
+  TERMINAL_FAILURE_FILE,
+  type DeliveryStateStore,
+} from "../backend/services/delivery.js";
+
+const INV = "inv_0TERMINALF01";
+const payload: InvestigationJobPayload = {
+  investigationId: INV,
+  tenantId: "tenant-gh-2",
+  installationId: 2,
+  repositoryOwner: "acme",
+  repositoryName: "app",
+  repositoryUrl: "https://github.com/acme/app",
+  defaultBranch: "main",
+  issueNumber: 42,
+  issueTitle: "Infrastructure failure",
+  issueBody: "customer issue body",
+  issueUrl: "https://github.com/acme/app/issues/42",
+  triggeringCommentId: 99,
+  triggerComment: "/sherlock investigate",
+  triggeredBy: "octocat",
+  sourceRef: null,
+  deliveryId: null,
+};
+const roots: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
+  );
+});
+
+function deps(store: DeliveryStateStore, failure: unknown): WorkerDeps {
+  return {
+    failedArtifactRetentionMs: 1_000,
+    delivery: {
+      store,
+      enqueue: async () => {},
+      createGitHubClient: () => {
+        throw new Error("delivery is unreachable");
+      },
+      findTerminalComment: async () => false,
+    },
+    runPipeline: async () => {
+      throw failure;
+    },
+    getInstallationToken: async () => ({ token: "fresh", permissions: null }),
+    postIssueComment: async () => {},
+  };
+}
+
+describe("exhausted investigation terminalization", () => {
+  test("a transient clone failure remains nonterminal while a retry remains", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const cloneFailure = Object.assign(new Error("clone failed: early EOF"), {
+      code: "ECONNRESET",
+    });
+    const fixture = deps(store, cloneFailure);
+    const runPipeline = vi.fn(fixture.runPipeline);
+    fixture.runPipeline = runPipeline;
+    await expect(
+      processInvestigationJob(
+        { data: payload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture,
+      ),
+    ).rejects.not.toBeInstanceOf(UnrecoverableError);
+    // A fresh worker process sees no terminal marker and performs the normal
+    // next pipeline attempt; only exhaustion may create the marker.
+    await expect(
+      processInvestigationJob(
+        { data: payload, attemptsMade: 1, opts: { attempts: 3 } },
+        fixture,
+      ),
+    ).rejects.not.toBeInstanceOf(UnrecoverableError);
+    expect(runPipeline).toHaveBeenCalledTimes(2);
+    await expect(store.loadTerminalFailure(INV)).resolves.toBeNull();
+  });
+
+  test("the final transient clone failure writes bounded durable metadata", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const secret = "Authorization: Bearer clone-secret customer/source.ts";
+    const cloneFailure = Object.assign(new Error(secret), {
+      code: "ECONNRESET",
+    });
+    await expect(
+      processInvestigationJob(
+        { data: payload, attemptsMade: 2, opts: { attempts: 3 } },
+        deps(store, cloneFailure),
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    const terminal = await store.loadTerminalFailure(INV);
+    expect(terminal).toMatchObject({
+      investigationId: INV,
+      category: "infrastructure",
+      stage: "running",
+    });
+    expect(
+      Date.parse(terminal!.retentionEligibleAt) - Date.parse(terminal!.terminalAt),
+    ).toBe(1_000);
+    const serialized = JSON.stringify(terminal);
+    expect(serialized).not.toContain("clone-secret");
+    expect(serialized).not.toContain("customer/source.ts");
+  });
+
+  test("a final preflight failure terminalizes without running the pipeline", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const runPipeline = vi.fn();
+    const fixture = deps(store, new Error("unused"));
+    fixture.runPipeline = runPipeline;
+    fixture.getInstallationToken = async () => {
+      throw new Error("installation auth unavailable");
+    };
+    await expect(
+      processInvestigationJob(
+        { data: payload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(runPipeline).not.toHaveBeenCalled();
+    await expect(store.loadTerminalFailure(INV)).resolves.toMatchObject({
+      category: "preflight",
+      stage: "running",
+    });
+  });
+
+  test("a restart after terminalization never reruns the pipeline", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    await store.saveTerminalFailure({
+      version: 1,
+      investigationId: INV,
+      tenantId: payload.tenantId,
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      category: "infrastructure",
+      stage: "running",
+      terminalAt: new Date(0).toISOString(),
+      retentionEligibleAt: new Date(1_000).toISOString(),
+    });
+    const runPipeline = vi.fn();
+    const fixture = deps(store, new Error("unused"));
+    fixture.runPipeline = runPipeline;
+    await expect(
+      processInvestigationJob(
+        { data: payload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(runPipeline).not.toHaveBeenCalled();
+  });
+});
+
+describe("terminal-failure artifact retention", () => {
+  test("failed-job completion invokes one bounded cleanup evaluation non-fatally", async () => {
+    const cleanupInvestigation = vi
+      .fn()
+      .mockResolvedValueOnce({ investigationId: INV, status: "not_expired" });
+    await expect(
+      evaluateTerminalJobArtifactRetention({
+        cleanup: {
+          cleanupInvestigation,
+          scanExpired: vi.fn(),
+        },
+        investigationId: INV,
+      }),
+    ).resolves.toMatchObject({ status: "not_expired" });
+    expect(cleanupInvestigation).toHaveBeenCalledOnce();
+
+    await expect(
+      evaluateTerminalJobArtifactRetention({
+        cleanup: {
+          cleanupInvestigation: vi.fn().mockRejectedValue(new Error("disk unavailable")),
+          scanExpired: vi.fn(),
+        },
+        investigationId: INV,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("the configured eligibility timestamp controls failed artifact cleanup", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-terminal-failure-"));
+    roots.push(root);
+    const store = createFileDeliveryStateStore(root);
+    await store.saveTerminalFailure({
+      version: 1,
+      investigationId: INV,
+      tenantId: payload.tenantId,
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      category: "repository",
+      stage: "running",
+      terminalAt: new Date(1_000).toISOString(),
+      retentionEligibleAt: new Date(2_000).toISOString(),
+    });
+    await writeFile(path.join(root, INV, "partial-clone.txt"), "raw repository bytes", "utf8");
+
+    const before = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: { ...ARTIFACT_RETENTION_DEFAULTS, cleanupIntervalMs: 0 },
+      now: () => 1_999,
+    });
+    await expect(before.cleanupInvestigation(INV)).resolves.toMatchObject({
+      status: "not_expired",
+    });
+
+    const after = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: { ...ARTIFACT_RETENTION_DEFAULTS, cleanupIntervalMs: 0 },
+      now: () => 2_000,
+    });
+    await expect(after.cleanupInvestigation(INV)).resolves.toMatchObject({
+      status: "deleted",
+    });
+  });
+
+  test("the on-disk terminal record contains no raw exception or repository content", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-terminal-metadata-"));
+    roots.push(root);
+    const store = createFileDeliveryStateStore(root);
+    await store.saveTerminalFailure({
+      version: 1,
+      investigationId: INV,
+      tenantId: payload.tenantId,
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      category: "infrastructure",
+      stage: "running",
+      terminalAt: new Date(0).toISOString(),
+      retentionEligibleAt: new Date(1_000).toISOString(),
+    });
+    const raw = await readFile(path.join(root, INV, TERMINAL_FAILURE_FILE), "utf8");
+    expect(raw).not.toContain("Authorization");
+    expect(raw).not.toContain("customer/source.ts");
+    expect(raw.length).toBeLessThan(2_000);
+  });
+});
