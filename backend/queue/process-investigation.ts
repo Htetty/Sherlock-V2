@@ -11,7 +11,9 @@ import { DelayedError, UnrecoverableError } from "bullmq";
 import { randomUUID } from "node:crypto";
 import {
   buildDeliveryState,
+  deliveryCommentMarker,
   runDeliveryFromState,
+  terminalCommentMarker,
   DeliveryRetryableError,
   type DeliveryExecutorDeps,
   type DeliveryGitHubClient,
@@ -20,6 +22,10 @@ import {
   type TerminalFailureCategory,
   type TerminalFailureRecord,
 } from "../services/delivery.js";
+import {
+  buildWorkerFailureReportData,
+  renderWorkerFailureIssueReport,
+} from "../services/issue-report-renderer.js";
 import type {
   InvestigationPipelineInput,
   InvestigationPipelineResult,
@@ -199,23 +205,19 @@ export function safeErrorMessage(error: unknown): string {
   return redactSecrets(error instanceof Error ? error.message : String(error));
 }
 
+// Terminal report body for a pre-pipeline worker failure. The visible text
+// carries no investigation id; the id lives only in the hidden markers, which
+// let delivery reconciliation recognize this as the terminal report and let
+// the failure path reuse the owned queued comment.
 export function formatWorkerFailureComment(
   investigationId: string,
   error: unknown,
 ): string {
-  const message = safeErrorMessage(error);
-
-  return redactSecrets(
-    [
-      "Sherlock could not complete this investigation because of an internal failure.",
-      "",
-      `Investigation: ${investigationId}`,
-      "Outcome: failed",
-      `Error: ${message.slice(0, 600)}`,
-      "",
-      "Any artifacts collected before the failure were preserved on the Sherlock server.",
-    ].join("\n"),
-  );
+  return [
+    renderWorkerFailureIssueReport({ error: safeErrorMessage(error) }),
+    terminalCommentMarker(investigationId),
+    deliveryCommentMarker(investigationId),
+  ].join("\n\n");
 }
 
 function terminalFailureCategory(
@@ -252,6 +254,82 @@ function terminalWorkerFailureMessage(category: TerminalFailureCategory): string
     case "worker":
       return "The investigation worker failed permanently.";
   }
+}
+
+// Durable delivery of a pre-pipeline worker-failure report. It uses the same
+// protected v2 payload, delivery lease, owned-comment reconciliation, persisted
+// create intent, acknowledgement-loss handling, and delivery-only retry queue
+// as every pipeline terminal report. A failed or ambiguous scan can therefore
+// never become permission to create a second comment.
+async function deliverWorkerFailureReport(
+  deps: DeliveryWorkerDeps,
+  payload: InvestigationJobPayload,
+  failureMessage: string,
+  failureStage: string,
+): Promise<void> {
+  const report = buildWorkerFailureReportData({
+    error: failureMessage,
+    stage: failureStage,
+  });
+  const state = await buildDeliveryState(
+    {
+      investigationId: payload.investigationId,
+      tenantId: payload.tenantId,
+      installationId: payload.installationId,
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      issueNumber: payload.issueNumber,
+      issueTitle: payload.issueTitle,
+      outcome: "failed",
+      // The v1-only summary is not rendered for this v2 payload. Keep its
+      // legacy enum valid while the delivery state's execution truth is failed.
+      summary: {
+        investigationId: payload.investigationId,
+        outcome: "execution_failed",
+        stage: failureStage,
+        error: failureMessage,
+      },
+      fixVerified: false,
+      fixAttemptId: null,
+      analysisComment: null,
+      fixComment: null,
+      report,
+      pullRequest: null,
+      retryPlan: null,
+    },
+    deps.delivery.store,
+  );
+
+  // Persist before the first GitHub read or write. A restarted investigation
+  // worker will hit the delivery-state resume guard and cannot rerun execution.
+  await deps.delivery.store.save(state);
+
+  try {
+    const { complete } = await runDeliveryFromState(
+      state,
+      toDeliveryExecutorDeps(deps),
+      { isFinalAttempt: false },
+    );
+    if (complete) return;
+    // A permanent terminal-comment failure was already recorded by delivery.
+    return;
+  } catch (error) {
+    if (
+      !(error instanceof DeliveryRetryableError) &&
+      !isTransientInfrastructureError(error)
+    ) {
+      throw error;
+    }
+  }
+
+  await deps.delivery.enqueue({
+    investigationId: payload.investigationId,
+    tenantId: payload.tenantId,
+    installationId: payload.installationId,
+    repositoryOwner: payload.repositoryOwner,
+    repositoryName: payload.repositoryName,
+    issueNumber: payload.issueNumber,
+  });
 }
 
 // How long a concurrency-blocked job waits before the queue retries it.
@@ -522,6 +600,7 @@ export async function processInvestigationJob(
       fixAttemptId: result.fixAttempt?.fixAttemptId ?? null,
       analysisComment: result.commentSections?.analysis ?? null,
       fixComment: result.commentSections?.fix ?? null,
+      report: result.report ?? null,
       pullRequest: result.pullRequest ?? null,
       retryPlan: result.pullRequestRetryPlan ?? null,
     }, deps.delivery.store);
@@ -723,32 +802,6 @@ export async function processInvestigationJob(
     // comment posting — cannot overwrite the pipeline's real outcome.
     const failureCategory = terminalFailureCategory(error, pipelineStarted);
     const failureMessage = terminalWorkerFailureMessage(failureCategory);
-    if (!pipelineResult) {
-      const terminalAt = new Date();
-      const failedRetentionMs = Math.max(
-        0,
-        deps.failedArtifactRetentionMs ?? 7 * 24 * 60 * 60_000,
-      );
-      try {
-        await deps.delivery.store.saveTerminalFailure({
-          version: 1,
-          investigationId: payload.investigationId,
-          tenantId: payload.tenantId,
-          repoOwner: payload.repositoryOwner,
-          repoName: payload.repositoryName,
-          category: failureCategory,
-          stage: terminalFailureStage,
-          terminalAt: terminalAt.toISOString(),
-          retentionEligibleAt: new Date(
-            terminalAt.getTime() + failedRetentionMs,
-          ).toISOString(),
-        });
-      } catch {
-        throw new UnrecoverableError(
-          `[${payload.investigationId}] Durable terminal failure state could not be persisted.`,
-        );
-      }
-    }
     await recordState({ type: "error", stage: "worker", message: failureMessage });
     if (!pipelineResult) {
       await recordState({
@@ -761,24 +814,22 @@ export async function processInvestigationJob(
     // The failure comment is only for runs whose pipeline never completed.
     // Once execution is terminal, all issue messaging belongs to the delivery
     // layer — a worker failure comment here would be a second, contradictory
-    // terminal message.
+    // terminal message. The failure report reconciles and updates the owned
+    // queued comment instead of posting a separate unmarked comment, keeping
+    // the public lifecycle at one canonical comment (queued -> terminal).
     if (!pipelineResult) {
-      await deps
-        .postIssueComment({
-          installationId: payload.installationId,
-          owner: payload.repositoryOwner,
-          repo: payload.repositoryName,
-          issueNumber: payload.issueNumber,
-          body: formatWorkerFailureComment(
-            payload.investigationId,
-            new Error(failureMessage),
-          ),
-        })
-        .catch((commentError: unknown) => {
-          log(
-            `[${payload.investigationId}] Could not post failure comment: ${safeErrorMessage(commentError)}`,
-          );
-        });
+      try {
+        await deliverWorkerFailureReport(
+          deps,
+          payload,
+          failureMessage,
+          terminalFailureStage,
+        );
+      } catch (deliveryError) {
+        throw new UnrecoverableError(
+          `[${payload.investigationId}] Durable worker-failure delivery could not be persisted or scheduled: ${safeErrorMessage(deliveryError)}`,
+        );
+      }
     }
 
     // The message becomes the job's stored BullMQ failed reason; redacted.

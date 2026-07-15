@@ -451,6 +451,7 @@ describe("production terminal-comment pagination", () => {
     state.pullRequest.branchPushed = true;
     state.pullRequest.number = 7;
     state.pullRequest.url = "https://github.com/acme/app/pull/7";
+    state.retryPlan = null;
     await store.save(state);
     let remoteComment = false;
     let creates = 0;
@@ -483,6 +484,7 @@ describe("production terminal-comment pagination", () => {
     state.pullRequest.branchPushed = true;
     state.pullRequest.number = 7;
     state.pullRequest.url = "https://github.com/acme/app/pull/7";
+    state.retryPlan = null;
     await store.save(state);
     let updates = 0;
     let creates = 0;

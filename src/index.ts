@@ -6,6 +6,7 @@
 import { Probot } from "probot";
 import { createInvestigationId } from "../backend/services/artifacts.js";
 import { deliveryCommentMarker } from "../backend/services/delivery.js";
+import { renderQueuedIssueReport } from "../backend/services/issue-report-renderer.js";
 import {
   createInvestigationQueueAdapter,
   createRedisConnection,
@@ -216,15 +217,14 @@ export const createSherlockApp =
         `[${investigationId}] Queued investigation job ${jobId}.`,
       );
 
+      // The visible queued text carries no investigation id; the id lives
+      // only in the hidden delivery marker, which terminal delivery uses to
+      // find and update this exact comment.
       await postComment(
         [
-          "Investigation queued.",
-          "",
-          `Investigation: ${investigationId}`,
-          "Sherlock will post results on this issue when the investigation completes.",
-          "",
+          renderQueuedIssueReport(),
           deliveryCommentMarker(investigationId),
-        ].join("\n"),
+        ].join("\n\n"),
       );
     });
   };

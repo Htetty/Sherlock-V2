@@ -265,8 +265,8 @@ describe("verified fix -> pull request", () => {
     };
 
     const body = await buildPullRequestBody(input);
-    expect(body).toContain("ADVISORY regression_test");
-    expect(body).not.toContain("PASS regression_test");
+    expect(body).toContain("| Generated regression test | Inconclusive");
+    expect(body).not.toMatch(/\b(?:PASS|FAIL|ADVISORY)\b/);
 
     const result = await createFixPullRequest(input);
     expect(result.status).toBe("created");
@@ -370,38 +370,44 @@ describe("verified fix -> pull request", () => {
     expect(persisted.branch).not.toBeNull();
   });
 
-  test("the PR body contains reproduction and verification evidence without local paths", async () => {
+  test("the PR body presents structured evidence without internal ids, paths, or plan dumps", async () => {
     const { workspace, attempt, input } = await buildInput();
 
-    const body = await buildPullRequestBody(input);
+    const body = await buildPullRequestBody(input, "sherlock/fix-42-login-abc123");
 
     for (const section of [
       "## Summary",
-      "## Original Failure",
-      "## Reproduction",
-      "## Root Cause",
+      "## Root cause",
       "## Changes",
-      "## Verification",
-      "## Tests",
-      "## Evidence",
-      "## Risk and Limitations",
-      "## Sherlock Metadata",
+      "## Validation",
+      "## Limitations",
     ]) {
       expect(body).toContain(section);
     }
 
-    expect(body).toContain("step-1: goto /");
-    expect(body).toContain('"expected":401');
-    expect(body).toContain("Post-patch reproduction outcome: **not_reproduced**");
-    expect(body).toContain("PASS exact_plan_replayed");
-    expect(body).toContain("`node check-login.mjs` -> exit 0 (targeted");
-    expect(body).toContain(`Investigation: ${attempt.investigationId}`);
-    expect(body).toContain(`Source commit: ${workspace.commit}`);
-    expect(body).toContain("screenshots/final.png");
+    // Structured validation truth, without raw check details.
+    expect(body).toContain("| Exact reproduction replay | Passed — failure no longer observed |");
+    expect(body).toContain("| Repository tests | Passed |");
+    expect(body).toContain("`login-does-not-return-500`");
+    expect(body).toContain("| Targeted check: `node check-login.mjs` | Passed |");
 
-    // No local absolute filesystem paths leak into the public PR body.
+    // Native diff link instead of any diff or artifact dump.
+    expect(body).toContain(
+      "https://github.com/acme/app/compare/main...sherlock%2Ffix-42-login-abc123",
+    );
+
+    // No internal identifiers, artifact names, screenshot paths, repro plan
+    // dumps, or local filesystem paths in the public description.
+    expect(body).not.toContain(attempt.investigationId);
+    expect(body).not.toContain(attempt.fixAttemptId);
+    expect(body).not.toContain(workspace.commit);
+    expect(body).not.toContain("git-diff.patch");
+    expect(body).not.toContain("fix-proposal.json");
+    expect(body).not.toContain("screenshots/final.png");
+    expect(body).not.toContain("step-1: goto");
     expect(body).not.toContain(workspace.repoPath);
     expect(body).not.toContain(attempt.fixAttempt.attemptDir);
+    expect(body).not.toContain("localhost");
   });
 
   test("secrets are redacted from the PR body and issue comment", async () => {
@@ -414,7 +420,7 @@ describe("verified fix -> pull request", () => {
 
     const body = await buildPullRequestBody(input);
     expect(body).not.toContain("hunter2");
-    expect(body).toContain("[REDACTED]");
+    expect(body).toContain("REDACTED");
 
     const comment = formatPullRequestComment({
       investigationId: input.investigationId,
