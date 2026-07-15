@@ -4,7 +4,7 @@
 // branch, one PR, one terminal comment), and truthful — and a delivery-only
 // retry must never call the reproduction or fixer pipeline again.
 import { UnrecoverableError } from "bullmq";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -27,16 +27,24 @@ import {
   createInMemoryDeliveryStateStore,
   isDeliveryComplete,
   isFixFullyDelivered,
+  reconcileTerminalCommentPaginated,
   runDeliveryFromState,
   terminalCommentMarker,
+  validateDeliveryConsistency,
   DeliveryRetryableError,
   type DeliveryExecutorDeps,
   type DeliveryGitHubClient,
   type DeliveryState,
+  type DeliveryStateInput,
   type DeliveryStateStore,
   type PullRequestRetryPlan,
 } from "../backend/services/delivery.js";
 import type { FixAttemptResult } from "../backend/services/fix.js";
+import {
+  buildInvestigationReportData,
+  buildWorkerFailureReportData,
+  type InvestigationReportData,
+} from "../backend/services/issue-report-renderer.js";
 import {
   createInMemoryInvestigationStateStore,
   createSupabaseInvestigationStateStore,
@@ -148,6 +156,14 @@ async function verifiedDeliveryState(input: {
 
 function transientError(message = "GitHub is unavailable") {
   return Object.assign(new Error(message), { status: 502 });
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  return { promise, resolve };
 }
 
 function mockGitHub(options: {
@@ -866,6 +882,68 @@ describe("worker delivery decoupling", () => {
     expect(fixture.comments).toHaveLength(1);
   });
 
+  test("the production deferred verified-fix shape persists before return and delivers on the retry-plan branch", async () => {
+    const github = mockGitHub();
+    const createBranch = vi.spyOn(github.client, "createBranchWithCommit");
+    const result = {
+      ...verifiedPipelineResult(null),
+      report: verifiedReportData(),
+    };
+    const fixture = makeWorkerDeps({ pipelineResult: result, github: github.client });
+    let executionCalls = 0;
+    let stateBeforePipelineReturn: DeliveryState | null = null;
+    fixture.deps.runPipeline = async (_payload, options) => {
+      executionCalls += 1;
+      await options.onTerminalResult?.(result);
+      // Production cleanup runs only after this terminal callback and return
+      // boundary. The pending delivery state and protected payload must already
+      // be durable before that cleanup can begin.
+      stateBeforePipelineReturn = await fixture.deliveryStore.load(INV);
+      return result;
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).resolves.toMatchObject({ outcome: "verified_fix" });
+
+    expect(executionCalls).toBe(1);
+    expect(stateBeforePipelineReturn).toMatchObject({
+      executionOutcome: "verified_fix",
+      fixVerified: true,
+      pullRequest: {
+        status: "pending",
+        branch: retryPlan().branch,
+        number: null,
+        url: null,
+      },
+      retryPlan: { branch: retryPlan().branch },
+      terminalComment: { status: "pending" },
+    });
+    const pending = await fixture.deliveryStore.load(INV);
+    expect(pending).not.toBeNull();
+    await expect(
+      fixture.deliveryStore.loadPayload(INV, pending!.terminalPayload),
+    ).resolves.toMatchObject({ version: 2, investigationId: INV });
+    expect(fixture.enqueued).toEqual([deliveryPayload]);
+    expect(fixture.comments).toHaveLength(0);
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 4 } },
+        fixture.deps,
+      ),
+    ).resolves.toMatchObject({ outcome: "verified_fix" });
+
+    expect(executionCalls).toBe(1);
+    expect(createBranch).toHaveBeenCalledWith(
+      expect.objectContaining({ branch: retryPlan().branch }),
+    );
+    expect(fixture.comments).toHaveLength(1);
+  });
+
   test("an investigate-job retry after terminal execution resumes delivery only (pipeline is not called)", async () => {
     // Simulates a stalled/crashed worker: delivery state persisted, job retried.
     const fixture = makeWorkerDeps({});
@@ -1102,6 +1180,775 @@ describe("worker delivery decoupling", () => {
       ),
     ).rejects.toBeInstanceOf(UnrecoverableError);
     expect(fixture.comments).toHaveLength(0);
+  });
+
+  test("an integrity-valid but malformed terminal payload blocks every GitHub side effect", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const state = await verifiedDeliveryStateV2(
+      { pullRequest: pullRequestResult("push_failed") },
+      store,
+    );
+    const malformedReport = structuredClone(verifiedReportData()) as
+      InvestigationReportData & Record<string, unknown>;
+    delete malformedReport.fixReason;
+    state.terminalPayload = await store.persistPayload(INV, "terminal", {
+      version: 2,
+      investigationId: INV,
+      report: malformedReport,
+    });
+    await store.save(state);
+
+    const github = mockGitHub();
+    const fixture = makeWorkerDeps({ deliveryStore: store, github: github.client });
+    const scan = vi.fn(async () => false);
+    const update = vi.fn();
+    fixture.deps.delivery.findTerminalComment = scan;
+    fixture.deps.updateIssueComment = update;
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 3, opts: { attempts: 4 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(fixture.pipelineCalls()).toBe(0);
+    expect(github.calls).toEqual({
+      getBranch: 0,
+      createBranchWithCommit: 0,
+      findPullRequests: 0,
+      createPullRequest: 0,
+    });
+    expect(scan).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+    expect(fixture.comments).toHaveLength(0);
+    await expect(store.load(INV)).resolves.toMatchObject({
+      pullRequest: { status: "pending", branchPushed: false },
+      terminalComment: { status: "pending" },
+    });
+  });
+});
+
+// --- Structured v2 terminal payloads ------------------------------------------
+
+function verifiedReportData(): InvestigationReportData {
+  return buildInvestigationReportData({
+    summary: verifiedSummary(),
+    fixAttempt: {
+      outcome: "verified",
+      reason: "All verification checks passed.",
+      rootCause: "The login handler always responds with HTTP 500.",
+      summary: "Return 401 for unknown users.",
+      changedFiles: ["server.mjs"],
+      checks: [],
+      postPatchOutcome: "not_reproduced",
+      repositoryValidation: {
+        aggregate: "passed",
+        categories: [{ category: "test", status: "passed" }],
+      },
+      regressionTest: null,
+    },
+  });
+}
+
+function verifiedDeliveryInput(
+  overrides: Partial<DeliveryStateInput> = {},
+): DeliveryStateInput {
+  return {
+    investigationId: INV,
+    tenantId: "tenant-gh-2",
+    installationId: 2,
+    repoOwner: "acme",
+    repoName: "app",
+    issueNumber: 42,
+    issueTitle: "Login returns 500",
+    outcome: "verified_fix",
+    summary: verifiedSummary(),
+    fixVerified: true,
+    fixAttemptId: FIX,
+    analysisComment: null,
+    fixComment: null,
+    report: verifiedReportData(),
+    pullRequest: null,
+    retryPlan: retryPlan(),
+    ...overrides,
+  };
+}
+
+async function verifiedDeliveryStateV2(input: {
+  pullRequest: PullRequestResult | null;
+  retryPlan?: PullRequestRetryPlan | null;
+}, store: DeliveryStateStore = createInMemoryDeliveryStateStore()): Promise<DeliveryState> {
+  return buildDeliveryState({
+    investigationId: INV,
+    tenantId: "tenant-gh-2",
+    installationId: 2,
+    repoOwner: "acme",
+    repoName: "app",
+    issueNumber: 42,
+    issueTitle: "Login returns 500",
+    outcome: "verified_fix",
+    summary: verifiedSummary(),
+    fixVerified: true,
+    fixAttemptId: FIX,
+    analysisComment: null,
+    fixComment: null,
+    report: verifiedReportData(),
+    pullRequest: input.pullRequest,
+    retryPlan: input.retryPlan === undefined ? retryPlan() : input.retryPlan,
+  }, store);
+}
+
+describe("authoritative delivery consistency validation", () => {
+  test("invalid construction performs no protected-payload write and leaves no artifact", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-prevalidate-"));
+    try {
+      const store = createFileDeliveryStateStore(root);
+      const persist = vi.spyOn(store, "persistPayloadTracked");
+      await expect(
+        buildDeliveryState(
+          verifiedDeliveryInput({ fixVerified: false, fixAttemptId: null }),
+          store,
+        ),
+      ).rejects.toThrow(/execution and verification outcomes disagree/i);
+      expect(persist).not.toHaveBeenCalled();
+      expect(await readdir(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("valid deferred construction persists one terminal payload with the final reference", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-valid-payload-"));
+    try {
+      const store = createFileDeliveryStateStore(root);
+      const persist = vi.spyOn(store, "persistPayloadTracked");
+      const state = await buildDeliveryState(verifiedDeliveryInput(), store);
+
+      expect(persist).toHaveBeenCalledTimes(1);
+      expect(state.pullRequest).toMatchObject({
+        status: "pending",
+        branch: retryPlan().branch,
+        number: null,
+        url: null,
+      });
+      expect(state.retryPlan?.branch).toBe(retryPlan().branch);
+      const payloadFiles = await readdir(
+        path.join(root, INV, "protected-delivery"),
+      );
+      expect(payloadFiles).toEqual([state.terminalPayload.sha256]);
+      await expect(
+        store.loadPayload(INV, state.terminalPayload),
+      ).resolves.toMatchObject({ version: 2, investigationId: INV });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a concurrent valid file-store publication keeps content created by a failing construction", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-retained-payload-race-"));
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const base = createFileDeliveryStateStore(root);
+      const createdByA = deferred<Awaited<
+        ReturnType<DeliveryStateStore["persistPayloadTracked"]>
+      >>();
+      const resumeA = deferred();
+      const failingStore: DeliveryStateStore = {
+        ...base,
+        async persistPayloadTracked(investigationId, kind, payload) {
+          const persisted = await base.persistPayloadTracked(
+            investigationId,
+            kind,
+            payload,
+          );
+          createdByA.resolve(persisted);
+          await resumeA.promise;
+          // Force the unexpected post-write reference-verification failure only
+          // after construction B has reused and durably referenced the real
+          // content-addressed file.
+          return {
+            created: persisted.created,
+            reference: {
+              ...persisted.reference,
+              sizeBytes: persisted.reference.sizeBytes + 1,
+            },
+          };
+        },
+      };
+      const input = verifiedDeliveryInput({
+        pullRequest: pullRequestResult("created", {
+          pullRequestNumber: 7,
+          pullRequestUrl: "https://github.com/acme/app/pull/7",
+          reason: null,
+        }),
+      });
+
+      const constructionA = buildDeliveryState(input, failingStore);
+      const payloadA = await createdByA.promise;
+      expect(payloadA.created).toBe(true);
+
+      let constructionBCreated: boolean | null = null;
+      const publishingStore: DeliveryStateStore = {
+        ...base,
+        async persistPayloadTracked(investigationId, kind, payload) {
+          const persisted = await base.persistPayloadTracked(
+            investigationId,
+            kind,
+            payload,
+          );
+          constructionBCreated = persisted.created;
+          return persisted;
+        },
+      };
+      const stateB = await buildDeliveryState(input, publishingStore);
+      expect(constructionBCreated).toBe(false);
+      expect(stateB.terminalPayload).toEqual(payloadA.reference);
+      await base.save(stateB);
+
+      resumeA.resolve();
+      await expect(constructionA).rejects.toThrow(
+        /does not match its validated content identity/i,
+      );
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("content was retained"),
+      );
+
+      const durable = await base.load(INV);
+      expect(durable?.terminalPayload).toEqual(payloadA.reference);
+      await expect(
+        base.loadPayload(INV, durable!.terminalPayload),
+      ).resolves.toMatchObject({ version: 2, investigationId: INV });
+
+      const resumed = makeExecutorDeps({ deliveryStore: base });
+      await expect(
+        runDeliveryFromState(durable!, resumed.deps, { isFinalAttempt: false }),
+      ).resolves.toMatchObject({ complete: true });
+      expect(resumed.comments).toHaveLength(1);
+    } finally {
+      warning.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("post-write validation failure retains a pre-existing content-addressed payload", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "sherlock-existing-payload-"));
+    try {
+      const base = createFileDeliveryStateStore(root);
+      const existing = await base.persistPayloadTracked(INV, "terminal", {
+        unique: "pre-existing-construction-payload",
+      });
+      expect(existing.created).toBe(true);
+      const store: DeliveryStateStore = {
+        ...base,
+        async persistPayloadTracked() {
+          return { reference: existing.reference, created: false };
+        },
+      };
+
+      await expect(
+        buildDeliveryState(verifiedDeliveryInput(), store),
+      ).rejects.toThrow(/does not match its validated content identity/i);
+      await expect(base.loadPayload(INV, existing.reference)).resolves.toEqual({
+        unique: "pre-existing-construction-payload",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts representative pending, delivered, and worker-failure states", async () => {
+    const pending = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("push_failed"),
+    });
+    const verifiedPayload = {
+      version: 2 as const,
+      investigationId: INV,
+      report: verifiedReportData(),
+    };
+    expect(() => validateDeliveryConsistency(pending, verifiedPayload)).not.toThrow();
+
+    const delivered = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("created", {
+        pullRequestNumber: 7,
+        pullRequestUrl: "https://github.com/acme/app/pull/7",
+        reason: null,
+      }),
+    });
+    expect(() => validateDeliveryConsistency(delivered, verifiedPayload)).not.toThrow();
+
+    const workerReport = buildWorkerFailureReportData({
+      error: "The investigation worker failed permanently.",
+      stage: "failed",
+    });
+    const worker = await buildDeliveryState(
+      {
+        investigationId: INV,
+        tenantId: "tenant-gh-2",
+        installationId: 2,
+        repoOwner: "acme",
+        repoName: "app",
+        issueNumber: 42,
+        issueTitle: "Login returns 500",
+        outcome: "failed",
+        summary: {
+          investigationId: INV,
+          outcome: "execution_failed",
+          stage: "failed",
+          error: "The investigation worker failed permanently.",
+        },
+        fixVerified: false,
+        fixAttemptId: null,
+        analysisComment: null,
+        fixComment: null,
+        report: workerReport,
+        pullRequest: null,
+        retryPlan: null,
+      },
+      createInMemoryDeliveryStateStore(),
+    );
+    expect(() =>
+      validateDeliveryConsistency(worker, {
+        version: 2,
+        investigationId: INV,
+        report: workerReport,
+      }),
+    ).not.toThrow();
+  });
+
+  test.each([
+    ["execution/fix outcome", (state: DeliveryState) => { state.executionOutcome = "reproduced"; }],
+    ["verified fix identity", (state: DeliveryState) => { state.fixAttemptId = null; }],
+    ["no-fix identity", (state: DeliveryState) => {
+      state.executionOutcome = "reproduced";
+      state.fixVerified = false;
+    }],
+    ["pending retry plan", (state: DeliveryState) => { state.retryPlan = null; }],
+    ["pull-request number/url", (state: DeliveryState) => {
+      state.pullRequest.number = 7;
+      state.pullRequest.url = null;
+    }],
+    ["pull-request status", (state: DeliveryState) => {
+      state.pullRequest.status = "created";
+      state.retryPlan = null;
+    }],
+    ["comment status/timestamp", (state: DeliveryState) => {
+      state.terminalComment.status = "posted";
+      state.terminalComment.postedAt = null;
+    }],
+    ["comment/PR ordering", (state: DeliveryState) => {
+      state.terminalComment.status = "posted";
+      state.terminalComment.postedAt = state.createdAt;
+    }],
+    ["state timestamp ordering", (state: DeliveryState) => {
+      state.updatedAt = new Date(Date.parse(state.createdAt) - 1).toISOString();
+    }],
+    ["comment timestamp ordering", (state: DeliveryState) => {
+      state.terminalComment.createAttemptedAt = new Date(
+        Date.parse(state.updatedAt) + 1,
+      ).toISOString();
+    }],
+    ["unknown pull-request status", (state: DeliveryState) => {
+      state.pullRequest.status = "unknown" as DeliveryState["pullRequest"]["status"];
+    }],
+    ["unknown comment status", (state: DeliveryState) => {
+      state.terminalComment.status = "unknown" as DeliveryState["terminalComment"]["status"];
+    }],
+  ])("rejects inconsistent %s", async (_label, mutate) => {
+    const state = structuredClone(
+      await verifiedDeliveryStateV2({
+        pullRequest: pullRequestResult("push_failed"),
+      }),
+    );
+    mutate(state);
+    expect(() => validateDeliveryConsistency(state)).toThrow(
+      /internally inconsistent/i,
+    );
+  });
+
+  test("rejects payload identity and report-outcome disagreements", async () => {
+    const state = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("push_failed"),
+    });
+    expect(() =>
+      validateDeliveryConsistency(state, {
+        version: 2,
+        investigationId: "inv_0OTHERDELIV",
+        report: verifiedReportData(),
+      }),
+    ).toThrow(/different investigation/i);
+    expect(() =>
+      validateDeliveryConsistency(state, {
+        version: 2,
+        investigationId: INV,
+        report: buildWorkerFailureReportData({ error: "failed" }),
+      }),
+    ).toThrow(/report and execution outcomes disagree/i);
+  });
+
+  test("the durable store applies the same semantic validator", async () => {
+    const store = createInMemoryDeliveryStateStore();
+    const state = await verifiedDeliveryStateV2(
+      { pullRequest: pullRequestResult("push_failed") },
+      store,
+    );
+    state.retryPlan = null;
+    await expect(store.save(state)).rejects.toThrow(/internally inconsistent/i);
+  });
+});
+
+describe("structured v2 terminal payloads", () => {
+  test("delivery renders the structured report against the final PR state, with no visible ids", async () => {
+    const state = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("push_failed"),
+    });
+    const github = mockGitHub();
+    const { deps, comments } = makeExecutorDeps({ github: github.client });
+
+    const { complete } = await runDeliveryFromState(state, deps, {
+      isFinalAttempt: false,
+    });
+
+    expect(complete).toBe(true);
+    expect(comments).toHaveLength(1);
+    const comment = comments[0];
+    expect(comment).toContain("**Fix verified**");
+    expect(comment).toContain("### Root cause");
+    expect(comment).toContain("### Validation");
+    expect(comment).toContain("opened the verified fix");
+    expect(comment).toContain("https://github.com/acme/app/pull/7");
+    expect(comment).toContain(terminalCommentMarker(INV));
+    expect(
+      comment.endsWith(
+        `${terminalCommentMarker(INV)}\n\n<!-- sherlock-delivery-comment:${INV} -->`,
+      ),
+    ).toBe(true);
+    expect(comment.match(/<!-- sherlock-terminal-comment:/g)).toHaveLength(1);
+    expect(comment.match(/<!-- sherlock-delivery-comment:/g)).toHaveLength(1);
+    // The investigation id appears only inside the two hidden markers.
+    expect(comment.split(INV)).toHaveLength(3);
+    expect(comment).not.toMatch(/Investigation: inv_/);
+    expect(comment).not.toContain(FIX);
+  });
+
+  test("a v2 report tells the truth when PR delivery failed permanently", async () => {
+    const state = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("push_failed"),
+      retryPlan: null,
+    });
+    expect(state.pullRequest.status).toBe("failed");
+
+    const comment = buildTerminalComment(state, {
+      version: 2,
+      investigationId: INV,
+      report: verifiedReportData(),
+    });
+    expect(comment).toContain(
+      "did not open a pull request because GitHub delivery failed",
+    );
+    expect(comment).not.toContain("opened a pull request with the verified fix:");
+  });
+
+  test.each([
+    ["merged", "already merged"],
+    ["blocked", "closed without being merged"],
+    ["reused", "contains this fix"],
+  ] as const)("a v2 report renders the %s PR state truthfully", async (status, phrase) => {
+    const state = await verifiedDeliveryStateV2({
+      pullRequest: pullRequestResult("push_failed"),
+    });
+    state.pullRequest.status = status;
+    state.pullRequest.branchPushed = true;
+    state.pullRequest.number = 12;
+    state.pullRequest.url = "https://github.com/acme/app/pull/12";
+
+    const comment = buildTerminalComment(state, {
+      version: 2,
+      investigationId: INV,
+      report: verifiedReportData(),
+    });
+    expect(comment).toContain(phrase);
+  });
+
+  test("v1 pending payloads and v2 payloads both load and render (v1 keeps its legacy shape)", async () => {
+    const storeV1 = createInMemoryDeliveryStateStore();
+    const stateV1 = await verifiedDeliveryState(
+      {
+        pullRequest: pullRequestResult("created", {
+          pullRequestNumber: 9,
+          pullRequestUrl: "https://github.com/acme/app/pull/9",
+          reason: null,
+        }),
+      },
+      storeV1,
+    );
+    const v1 = makeExecutorDeps({ deliveryStore: storeV1 });
+    const v1Run = await runDeliveryFromState(stateV1, v1.deps, {
+      isFinalAttempt: false,
+    });
+    expect(v1Run.complete).toBe(true);
+    expect(v1.comments).toHaveLength(1);
+    // Legacy presentation is preserved for old payloads.
+    expect(v1.comments[0]).toContain("Outcome: verified_fix");
+    expect(v1.comments[0]).toContain("Sherlock verified a local fix.");
+
+    const storeV2 = createInMemoryDeliveryStateStore();
+    const stateV2 = await verifiedDeliveryStateV2(
+      {
+        pullRequest: pullRequestResult("created", {
+          pullRequestNumber: 9,
+          pullRequestUrl: "https://github.com/acme/app/pull/9",
+          reason: null,
+        }),
+      },
+      storeV2,
+    );
+    const v2 = makeExecutorDeps({ deliveryStore: storeV2 });
+    const v2Run = await runDeliveryFromState(stateV2, v2.deps, {
+      isFinalAttempt: false,
+    });
+    expect(v2Run.complete).toBe(true);
+    expect(v2.comments).toHaveLength(1);
+    expect(v2.comments[0]).toContain("### Validation");
+    expect(v2.comments[0]).not.toContain("Outcome: verified_fix");
+  });
+});
+
+// --- Pre-pipeline worker failures reconcile the queued comment ----------------
+
+describe("worker failure comment reconciliation", () => {
+  test("a pre-pipeline failure updates the owned queued comment instead of posting a second comment", async () => {
+    const fixture = makeWorkerDeps({});
+    const updates: { commentId: number; body: string }[] = [];
+    fixture.deps.delivery.findTerminalComment = async () => ({
+      terminalCommentId: null,
+      reusableCommentId: 55,
+    });
+    fixture.deps.updateIssueComment = async ({ commentId, body }) => {
+      updates.push({ commentId, body });
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    // The queued comment was updated in place; nothing was created.
+    expect(fixture.comments).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].commentId).toBe(55);
+    expect(updates[0].body).toContain("internal failure");
+    expect(updates[0].body).toContain(terminalCommentMarker(INV));
+    expect(updates[0].body).not.toMatch(/Investigation: inv_/);
+  });
+
+  test("an existing terminal comment suppresses any further failure comment", async () => {
+    const fixture = makeWorkerDeps({});
+    fixture.deps.delivery.findTerminalComment = async () => ({
+      terminalCommentId: 90,
+      reusableCommentId: null,
+    });
+    fixture.deps.updateIssueComment = async () => {
+      throw new Error("must not update");
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(fixture.comments).toHaveLength(0);
+  });
+
+  test.each([
+    ["transient 503", Object.assign(new Error("scan unavailable"), { status: 503 })],
+    ["timeout", Object.assign(new Error("scan timed out"), { code: "ETIMEDOUT" })],
+    ["ambiguous response", Object.assign(new Error("ambiguous response"), { status: 502 })],
+    ["authentication 401", Object.assign(new Error("authentication failed"), { status: 401 })],
+    ["authorization 403", Object.assign(new Error("authorization failed"), { status: 403 })],
+    ["missing-resource 404", Object.assign(new Error("resource missing"), { status: 404 })],
+    ["untyped error", new Error("comment scan failed")],
+  ])("a %s scan failure creates nothing and queues delivery-only retry", async (_name, scanError) => {
+    const fixture = makeWorkerDeps({});
+    const updates = vi.fn();
+    fixture.deps.updateIssueComment = updates;
+    fixture.deps.delivery.findTerminalComment = async () => {
+      throw scanError;
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(fixture.comments).toHaveLength(0);
+    expect(updates).not.toHaveBeenCalled();
+    expect(fixture.enqueued).toEqual([deliveryPayload]);
+    expect(fixture.pipelineCalls()).toBe(1);
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      executionOutcome: "failed",
+      terminalComment: { status: "pending", createAttemptedAt: null },
+    });
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 6 } },
+        fixture.deps,
+      ),
+    ).rejects.toThrow(/reconciliation is incomplete/i);
+    expect(fixture.pipelineCalls()).toBe(1);
+    expect(fixture.comments).toHaveLength(0);
+    expect(updates).not.toHaveBeenCalled();
+  });
+
+  test("an invalid comment-list response creates nothing and queues delivery-only retry", async () => {
+    const fixture = makeWorkerDeps({});
+    const updates = vi.fn();
+    fixture.deps.updateIssueComment = updates;
+    fixture.deps.delivery.findTerminalComment = async (input) =>
+      reconcileTerminalCommentPaginated({
+        terminalMarker: input.marker,
+        reusableMarker: input.reusableMarker,
+        appId: 123,
+        assertOwnership: input.assertOwnership,
+        listPage: async () => [
+          {
+            id: 77,
+            body: 42 as unknown as string,
+            performed_via_github_app: { id: 123 },
+          },
+        ],
+      });
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(fixture.comments).toHaveLength(0);
+    expect(updates).not.toHaveBeenCalled();
+    expect(fixture.enqueued).toEqual([deliveryPayload]);
+    expect(fixture.pipelineCalls()).toBe(1);
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      executionOutcome: "failed",
+      terminalComment: { status: "pending", createAttemptedAt: null },
+    });
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 6 } },
+        fixture.deps,
+      ),
+    ).rejects.toThrow(/reconciliation is incomplete/i);
+    expect(fixture.pipelineCalls()).toBe(1);
+    expect(fixture.comments).toHaveLength(0);
+    expect(updates).not.toHaveBeenCalled();
+  });
+
+  test("a complete scan with no owned report creates exactly one marked comment", async () => {
+    const fixture = makeWorkerDeps({});
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+
+    expect(fixture.comments).toHaveLength(1);
+    expect(fixture.comments[0]).toContain(terminalCommentMarker(INV));
+    expect(fixture.enqueued).toHaveLength(0);
+  });
+
+  test("a queued-comment update failure never falls back to create", async () => {
+    const fixture = makeWorkerDeps({});
+    fixture.deps.delivery.findTerminalComment = async () => ({
+      terminalCommentId: null,
+      reusableCommentId: 55,
+    });
+    fixture.deps.updateIssueComment = async () => {
+      throw Object.assign(new Error("update timed out"), { code: "ETIMEDOUT" });
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(fixture.comments).toHaveLength(0);
+    expect(fixture.enqueued).toEqual([deliveryPayload]);
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      terminalComment: { status: "pending", createAttemptedAt: null },
+    });
+  });
+
+  test("lost create acknowledgement preserves intent and reconciles without a second create", async () => {
+    const fixture = makeWorkerDeps({});
+    let scan = 0;
+    let creates = 0;
+    fixture.deps.delivery.findTerminalComment = async () => {
+      scan += 1;
+      if (scan <= 2) return false;
+      if (scan === 3) throw Object.assign(new Error("scan unavailable"), { status: 503 });
+      return true;
+    };
+    fixture.deps.postIssueComment = async () => {
+      creates += 1;
+      throw Object.assign(new Error("acknowledgement lost"), { status: 503 });
+    };
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      terminalComment: { status: "pending", createAttemptedAt: expect.any(String) },
+    });
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 6 } },
+        fixture.deps,
+      ),
+    ).resolves.toMatchObject({ outcome: "failed" });
+    expect(creates).toBe(1);
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      terminalComment: { status: "posted" },
+    });
+  });
+
+  test("an investigation-worker restart resumes ambiguous failure delivery without rerunning execution", async () => {
+    const fixture = makeWorkerDeps({});
+    fixture.deps.delivery.findTerminalComment = async () => {
+      throw Object.assign(new Error("scan unavailable"), { status: 503 });
+    };
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 2, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).rejects.toBeInstanceOf(UnrecoverableError);
+    expect(fixture.pipelineCalls()).toBe(1);
+
+    fixture.deps.delivery.findTerminalComment = async () => false;
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).resolves.toMatchObject({ outcome: "failed" });
+    expect(fixture.pipelineCalls()).toBe(1);
+    expect(fixture.comments).toHaveLength(1);
   });
 });
 

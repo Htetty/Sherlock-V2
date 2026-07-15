@@ -286,6 +286,7 @@ export type ArtifactCleanupServiceOptions = {
 };
 
 const RETAINED_FAILURE_OUTCOMES = new Set([
+  "failed",
   "reproduced",
   "not_reproduced",
   "plan_failed",

@@ -24,6 +24,7 @@ import {
   createFileDeliveryStateStore,
   DELIVERY_STATE_FILE,
   type DeliveryState,
+  type PullRequestRetryPlan,
 } from "../backend/services/delivery.js";
 import type { InvestigationOutcome } from "../backend/services/report.js";
 
@@ -49,12 +50,13 @@ function nextInvestigationId() {
 
 function terminalState(input: {
   investigationId: string;
-  outcome?: InvestigationOutcome;
+  outcome?: InvestigationOutcome | "failed";
   deliveredAt?: string;
 }): DeliveryState {
   const outcome = input.outcome ?? "verified_fix";
   const verified = outcome === "verified_fix";
   const createdAt = new Date(0).toISOString();
+  const deliveredAt = input.deliveredAt ?? createdAt;
   return {
     version: 2,
     investigationId: input.investigationId,
@@ -91,11 +93,32 @@ function terminalState(input: {
     },
     terminalComment: {
       status: "posted",
-      postedAt: input.deliveredAt ?? createdAt,
+      postedAt: deliveredAt,
       reason: null,
     },
     createdAt,
-    updatedAt: createdAt,
+    updatedAt: deliveredAt,
+  };
+}
+
+function pendingRetryPlan(state: DeliveryState): PullRequestRetryPlan {
+  return {
+    branch: state.pullRequest.branch!,
+    sourceCommit: "c0ffee123",
+    baseBranch: "main",
+    expectedTreeSha: "baddad123",
+    files: [
+      {
+        path: "server.mjs",
+        mode: "100644",
+        contentSha256: "b".repeat(64),
+      },
+    ],
+    payload: {
+      path: `protected-delivery/${"b".repeat(64)}`,
+      sha256: "b".repeat(64),
+      sizeBytes: 10,
+    },
   };
 }
 
@@ -174,6 +197,53 @@ describe("artifact retention configuration", () => {
 });
 
 describe("terminal delivery gates", () => {
+  test("failed-artifact retention removes retained unreferenced protected content", async () => {
+    const root = await temporaryRoot();
+    const investigationId = nextInvestigationId();
+    const store = createFileDeliveryStateStore(root);
+    const referenced = await store.persistPayload(investigationId, "terminal", {
+      version: 1,
+      investigationId,
+      summary: { investigationId, outcome: "execution_failed" },
+      analysisComment: null,
+      fixComment: null,
+    });
+    const retainedOrphan = await store.persistPayload(
+      investigationId,
+      "terminal",
+      { retainedAfterUnexpectedPostWriteFailure: true },
+    );
+    const state = terminalState({
+      investigationId,
+      outcome: "execution_failed",
+      deliveredAt: new Date(1_000).toISOString(),
+    });
+    state.terminalPayload = referenced;
+    await store.save(state);
+    const retainedPath = path.join(
+      root,
+      investigationId,
+      ...retainedOrphan.path.split("/"),
+    );
+    expect(await exists(retainedPath)).toBe(true);
+
+    const cleanup = createArtifactCleanupService({
+      rootDir: root,
+      deliveryStore: store,
+      protection: createNoopArtifactCleanupProtection(),
+      config: config({ failedRetentionMs: 5_000 }),
+      now: () => 6_001,
+      log: () => {},
+    });
+
+    await expect(cleanup.cleanupInvestigation(investigationId)).resolves.toEqual({
+      investigationId,
+      status: "deleted",
+    });
+    expect(await exists(retainedPath)).toBe(false);
+    expect(await exists(path.join(root, investigationId))).toBe(false);
+  });
+
   test("fully delivered verified fixes are cleaned immediately", async () => {
     const root = await temporaryRoot();
     const investigationId = nextInvestigationId();
@@ -202,6 +272,7 @@ describe("terminal delivery gates", () => {
     state.pullRequest.branchPushed = false;
     state.pullRequest.number = null;
     state.pullRequest.url = null;
+    state.retryPlan = pendingRetryPlan(state);
     state.terminalComment = { status: "pending", postedAt: null, reason: null };
     const store = await persistState(root, state);
     const cleanup = createArtifactCleanupService({
@@ -250,7 +321,7 @@ describe("terminal delivery gates", () => {
     state.pullRequest.branchPushed = false;
     state.pullRequest.number = null;
     state.pullRequest.url = null;
-    state.pullRequest.reason = "delivery failed";
+    state.pullRequest.reason = "GitHub pull-request delivery failed permanently.";
     const store = await persistState(root, state);
     const before = createArtifactCleanupService({
       rootDir: root,
@@ -281,7 +352,11 @@ describe("terminal delivery gates", () => {
     const root = await temporaryRoot();
     const investigationId = nextInvestigationId();
     const state = terminalState({ investigationId });
-    state.terminalComment = { status: "failed", postedAt: null, reason: null };
+    state.terminalComment = {
+      status: "failed",
+      postedAt: null,
+      reason: "GitHub terminal-comment delivery failed permanently.",
+    };
     const store = await persistState(root, state);
     const cleanup = createArtifactCleanupService({
       rootDir: root,
@@ -474,7 +549,7 @@ describe("failed investigation retention", () => {
     const deliveredAt = new Date(1_000).toISOString();
     const store = await persistState(
       root,
-      terminalState({ investigationId, outcome: "execution_failed", deliveredAt }),
+      terminalState({ investigationId, outcome: "failed", deliveredAt }),
     );
     const cleanup = createArtifactCleanupService({
       rootDir: root,

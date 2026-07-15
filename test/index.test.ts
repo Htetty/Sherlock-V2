@@ -96,8 +96,13 @@ function mockGithub(expectedComments: number) {
     .post("/app/installations/2/access_tokens")
     .reply(200, { token: "test", permissions: { issues: "write" } })
     .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
-      expect(body.body).toContain("Investigation queued.");
-      expect(body.body).toMatch(/Investigation: inv_[0-9A-Z]{10,}/);
+      expect(body.body).toContain("**Investigation queued**");
+      // The investigation id lives only inside the hidden delivery marker;
+      // the visible text never shows it.
+      expect(body.body).toMatch(
+        /<!-- sherlock-delivery-comment:inv_[0-9A-Z]{10,} -->/,
+      );
+      expect(body.body).not.toMatch(/Investigation: inv_/);
       return true;
     })
     .times(expectedComments)

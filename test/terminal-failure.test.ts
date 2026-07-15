@@ -94,7 +94,7 @@ describe("exhausted investigation terminalization", () => {
     await expect(store.loadTerminalFailure(INV)).resolves.toBeNull();
   });
 
-  test("the final transient clone failure writes bounded durable metadata", async () => {
+  test("the final transient clone failure writes bounded durable delivery state", async () => {
     const store = createInMemoryDeliveryStateStore();
     const secret = "Authorization: Bearer clone-secret customer/source.ts";
     const cloneFailure = Object.assign(new Error(secret), {
@@ -107,15 +107,14 @@ describe("exhausted investigation terminalization", () => {
       ),
     ).rejects.toBeInstanceOf(UnrecoverableError);
 
-    const terminal = await store.loadTerminalFailure(INV);
+    const terminal = await store.load(INV);
     expect(terminal).toMatchObject({
       investigationId: INV,
-      category: "infrastructure",
-      stage: "running",
+      executionOutcome: "failed",
+      fixVerified: false,
+      pullRequest: { status: "not_applicable" },
+      terminalComment: { status: "posted" },
     });
-    expect(
-      Date.parse(terminal!.retentionEligibleAt) - Date.parse(terminal!.terminalAt),
-    ).toBe(1_000);
     const serialized = JSON.stringify(terminal);
     expect(serialized).not.toContain("clone-secret");
     expect(serialized).not.toContain("customer/source.ts");
@@ -136,9 +135,9 @@ describe("exhausted investigation terminalization", () => {
       ),
     ).rejects.toBeInstanceOf(UnrecoverableError);
     expect(runPipeline).not.toHaveBeenCalled();
-    await expect(store.loadTerminalFailure(INV)).resolves.toMatchObject({
-      category: "preflight",
-      stage: "running",
+    await expect(store.load(INV)).resolves.toMatchObject({
+      executionOutcome: "failed",
+      terminalComment: { status: "posted" },
     });
   });
 

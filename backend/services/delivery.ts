@@ -72,6 +72,12 @@ import {
   type InvestigationSummary,
 } from "./report.js";
 import {
+  normalizeInvestigationReportData,
+  renderIssueReport,
+  type InvestigationReportData,
+  type ReportPullRequest,
+} from "./issue-report-renderer.js";
+import {
   safeRepoUrl,
   type InvestigationStateEvent,
   type InvestigationStateEventInput,
@@ -128,13 +134,26 @@ export type PullRequestRetryPayload = {
   files: DeliveryFile[];
 };
 
-export type TerminalCommentPayload = {
+// v1 (legacy, still deliverable): preformatted analysis/fix Markdown strings
+// captured at execution time. v2 (new investigations): structured report data
+// rendered by the issue-report renderer at delivery time.
+export type TerminalCommentPayloadV1 = {
   version: 1;
   investigationId: string;
   summary: InvestigationSummary;
   analysisComment: string | null;
   fixComment: string | null;
 };
+
+export type TerminalCommentPayloadV2 = {
+  version: 2;
+  investigationId: string;
+  report: InvestigationReportData;
+};
+
+export type TerminalCommentPayload =
+  | TerminalCommentPayloadV1
+  | TerminalCommentPayloadV2;
 
 // Everything needed to recreate the fix branch and pull request through the
 // GitHub API when the local workspace (and its git commit) no longer exists.
@@ -157,8 +176,8 @@ export type DeliveryState = {
   repoOwner: string;
   repoName: string;
   issueNumber: number;
-  // Terminal execution outcome of the pipeline (verified_fix, reproduced,
-  // not_reproduced, plan_failed, environment_failed, execution_failed).
+  // Terminal execution outcome of the pipeline, or "failed" for a worker
+  // failure that occurred before the pipeline produced a terminal result.
   executionOutcome: string;
   // Patch verification outcome, independent of any GitHub delivery.
   fixVerified: boolean;
@@ -214,6 +233,7 @@ export const DELIVERY_LOCK_TTL_MS = 20_000;
 export const DELIVERY_LOCK_HEARTBEAT_MS = 5_000;
 const execFileAsync = promisify(execFile);
 const DELIVERY_OUTCOMES = new Set([
+  "failed",
   "reproduced",
   "not_reproduced",
   "plan_failed",
@@ -282,6 +302,10 @@ export type DeliveryStateInput = {
   fixAttemptId: string | null;
   analysisComment: string | null;
   fixComment: string | null;
+  // Structured v2 report data for new investigations. When present it becomes
+  // the persisted terminal payload; when absent a legacy v1 payload with the
+  // preformatted comment strings above is persisted instead.
+  report?: InvestigationReportData | null;
   // The in-pipeline pull-request result (null when the PR flow never ran or
   // threw before producing one).
   pullRequest: PullRequestResult | null;
@@ -308,19 +332,27 @@ export async function buildDeliveryState(
   const at = new Date().toISOString();
   const retryPlan = sanitizeRetryPlan(input.retryPlan);
   const pullRequest = mapPipelinePullRequest({ ...input, retryPlan });
-  const terminalPayload = await store.persistPayload(
-    input.investigationId,
-    "terminal",
-    {
-      version: 1,
-      investigationId: input.investigationId,
-      summary: input.summary,
-      analysisComment: input.analysisComment,
-      fixComment: input.fixComment,
-    } satisfies TerminalCommentPayload,
+  const terminalPayloadValue: TerminalCommentPayload = input.report
+    ? {
+        version: 2,
+        investigationId: input.investigationId,
+        report: normalizeInvestigationReportData(input.report),
+      }
+    : {
+        version: 1,
+        investigationId: input.investigationId,
+        summary: input.summary,
+        analysisComment: input.analysisComment,
+        fixComment: input.fixComment,
+      };
+  // The content-addressed reference is deterministic from the exact bytes the
+  // store will persist. Use it to validate the complete state/report model
+  // before creating any protected artifact, then replace it with the store's
+  // verified reference and validate once more.
+  const provisionalTerminalPayload = payloadReferenceForValue(
+    terminalPayloadValue,
   );
-
-  return {
+  const state: DeliveryState = {
     version: 2,
     investigationId: input.investigationId,
     tenantId: input.tenantId,
@@ -334,7 +366,7 @@ export async function buildDeliveryState(
     pullRequest,
     // The retry plan is only needed while PR delivery is unfinished.
     retryPlan: pullRequest.status === "pending" ? retryPlan : null,
-    terminalPayload,
+    terminalPayload: provisionalTerminalPayload,
     terminalComment: {
       status: "pending",
       postedAt: null,
@@ -344,6 +376,70 @@ export async function buildDeliveryState(
     createdAt: at,
     updatedAt: at,
   };
+  validateDeliveryConsistency(state, terminalPayloadValue);
+
+  let persisted:
+    | { reference: DeliveryArtifactReference; created: boolean }
+    | null = null;
+  try {
+    persisted = await store.persistPayloadTracked(
+      input.investigationId,
+      "terminal",
+      terminalPayloadValue,
+    );
+    if (!sameArtifactReference(persisted.reference, provisionalTerminalPayload)) {
+      throw new Error(
+        "Protected terminal payload reference does not match its validated content identity.",
+      );
+    }
+    state.terminalPayload = persisted.reference;
+    validateDeliveryConsistency(state, terminalPayloadValue);
+    return state;
+  } catch (error) {
+    if (persisted?.created) {
+      // Fail-safe retention: state publication happens after this function
+      // returns and does not share an atomic lock with payload creation. A
+      // concurrent construction may already have reused this content-addressed
+      // file and may publish a durable reference at any point, so an immediate
+      // unlink could turn valid delivery state into a dangling reference.
+      // Retain the bounded mode-0600 content; normal investigation artifact
+      // retention removes it with the investigation directory after terminal
+      // delivery. Do not log the path, hash, payload, or original error.
+      console.warn(
+        `[${input.investigationId}] Protected delivery content was retained after an unexpected post-write construction failure.`,
+      );
+    }
+    throw error;
+  }
+}
+
+function serializedPayload(value: unknown): Buffer {
+  const raw = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  if (raw.length <= 1 || raw.length > MAX_DELIVERY_PAYLOAD_BYTES) {
+    throw new Error("Protected delivery payload exceeds the size limit.");
+  }
+  return raw;
+}
+
+function payloadReferenceForValue(value: unknown): DeliveryArtifactReference {
+  const raw = serializedPayload(value);
+  const digest = sha256(raw);
+  return {
+    path: `${DELIVERY_PAYLOAD_DIRECTORY}/${digest}`,
+    sha256: digest,
+    sizeBytes: raw.length,
+  };
+}
+
+function sameArtifactReference(
+  left: DeliveryArtifactReference,
+  right: DeliveryArtifactReference,
+): boolean {
+  return (
+    left.path === right.path &&
+    left.sha256 === right.sha256 &&
+    left.sizeBytes === right.sizeBytes
+  );
 }
 
 function boundedSafeText(value: string, maxChars: number): string {
@@ -522,7 +618,12 @@ function mapPipelinePullRequest(
     // The PR flow threw before producing a result; retry through the API
     // when a plan was captured, otherwise record a truthful failure.
     return input.retryPlan
-      ? { ...none, status: "pending", branchPushed: false }
+      ? {
+          ...none,
+          status: "pending",
+          branchPushed: false,
+          branch: input.retryPlan.branch,
+        }
       : {
           ...none,
           status: "failed",
@@ -675,7 +776,7 @@ export async function capturePullRequestRetryPlan(
       version: 1,
       investigationId: input.investigationId,
       title: buildPullRequestTitle(input),
-      body: await buildPullRequestBody(input),
+      body: await buildPullRequestBody(input, branch),
       commitMessage: buildCommitMessage(input),
       files,
     } satisfies PullRequestRetryPayload,
@@ -744,6 +845,11 @@ export type DeliveryStateStore = {
     kind: "retry" | "terminal",
     payload: unknown,
   ): Promise<DeliveryArtifactReference>;
+  persistPayloadTracked(
+    investigationId: string,
+    kind: "retry" | "terminal",
+    payload: unknown,
+  ): Promise<{ reference: DeliveryArtifactReference; created: boolean }>;
   loadPayload(
     investigationId: string,
     reference: DeliveryArtifactReference,
@@ -801,11 +907,22 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     typeof state.updatedAt !== "string" ||
     !Number.isFinite(Date.parse(state.updatedAt)) ||
     !state.pullRequest ||
+    typeof state.pullRequest.status !== "string" ||
+    typeof state.pullRequest.branchPushed !== "boolean" ||
+    (state.pullRequest.branch !== null &&
+      typeof state.pullRequest.branch !== "string") ||
     (state.pullRequest.number !== null &&
       (!Number.isSafeInteger(state.pullRequest.number) ||
         state.pullRequest.number <= 0)) ||
+    (state.pullRequest.url !== null && typeof state.pullRequest.url !== "string") ||
+    (state.pullRequest.reason !== null &&
+      typeof state.pullRequest.reason !== "string") ||
+    (state.retryPlan !== null && typeof state.retryPlan !== "object") ||
     !sanitizeArtifactReference(state.terminalPayload) ||
     !state.terminalComment ||
+    typeof state.terminalComment.status !== "string" ||
+    (state.terminalComment.reason !== null &&
+      typeof state.terminalComment.reason !== "string") ||
     (state.terminalComment.createAttemptedAt !== null &&
       (typeof state.terminalComment.createAttemptedAt !== "string" ||
         !Number.isFinite(Date.parse(state.terminalComment.createAttemptedAt)))) ||
@@ -846,21 +963,6 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     throw new Error("Delivery state contains an unsafe branch name.");
   }
   state.pullRequest.branch = branch;
-  state.pullRequest.url = canonicalPullRequestUrl(
-    state.repoOwner,
-    state.repoName,
-    state.pullRequest.number,
-  );
-  state.pullRequest.reason =
-    state.pullRequest.status === "blocked"
-      ? PULL_REQUEST_BLOCKED_REASON
-      : state.pullRequest.status === "failed"
-        ? PULL_REQUEST_FAILED_REASON
-        : null;
-  state.terminalComment.reason =
-    state.terminalComment.status === "failed"
-      ? TERMINAL_COMMENT_FAILED_REASON
-      : null;
   state.terminalPayload = sanitizeArtifactReference(state.terminalPayload)!;
 
   if (state.retryPlan) {
@@ -876,7 +978,193 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     throw new Error("Delivery state exceeds the size limit.");
   }
 
+  validateDeliveryConsistency(state);
   return state;
+}
+
+// One authoritative semantic validator for newly constructed state, persisted
+// state, and the state+terminal-payload pair used by delivery. Shape-specific
+// normalizers run first; this function owns every relationship between those
+// independently valid fields.
+export function validateDeliveryConsistency(
+  state: DeliveryState,
+  terminalPayload?: TerminalCommentPayload,
+): void {
+  const invalid = (detail: string): never => {
+    throw new Error(`Delivery state is internally inconsistent: ${detail}.`);
+  };
+  const createdAt = Date.parse(state.createdAt);
+  const updatedAt = Date.parse(state.updatedAt);
+  if (!Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || updatedAt < createdAt) {
+    invalid("state timestamps are out of order");
+  }
+
+  const verifiedOutcome = state.executionOutcome === "verified_fix";
+  if (verifiedOutcome !== state.fixVerified) {
+    invalid("execution and verification outcomes disagree");
+  }
+  if (state.executionOutcome === "failed" && state.fixVerified) {
+    invalid("a worker failure claims a verified fix");
+  }
+  if (state.fixVerified && !state.fixAttemptId) {
+    invalid("a verified fix has no fix-attempt identity");
+  }
+  if (!state.fixVerified && state.fixAttemptId !== null) {
+    invalid("a no-fix execution carries a fix-attempt identity");
+  }
+
+  const pullRequest = state.pullRequest;
+  const expectedUrl = canonicalPullRequestUrl(
+    state.repoOwner,
+    state.repoName,
+    pullRequest.number,
+  );
+  if (pullRequest.url !== expectedUrl) {
+    invalid("pull-request number and URL disagree");
+  }
+  if (
+    state.retryPlan &&
+    pullRequest.branch !== state.retryPlan.branch
+  ) {
+    invalid("pull-request and retry-plan branches disagree");
+  }
+
+  switch (pullRequest.status) {
+    case "not_applicable":
+      if (
+        state.fixVerified ||
+        pullRequest.branchPushed ||
+        pullRequest.branch !== null ||
+        pullRequest.number !== null ||
+        pullRequest.reason !== null ||
+        state.retryPlan !== null
+      ) {
+        invalid("a no-fix pull-request state carries delivery data");
+      }
+      break;
+    case "pending":
+      if (
+        !state.fixVerified ||
+        !state.retryPlan ||
+        pullRequest.number !== null ||
+        pullRequest.reason !== null ||
+        (pullRequest.branchPushed && pullRequest.branch === null)
+      ) {
+        invalid("pending pull-request delivery lacks its verified retry identity");
+      }
+      break;
+    case "created":
+    case "reused":
+    case "merged":
+      if (
+        !state.fixVerified ||
+        !pullRequest.branchPushed ||
+        !pullRequest.branch ||
+        pullRequest.number === null ||
+        pullRequest.url === null ||
+        pullRequest.reason !== null ||
+        state.retryPlan !== null
+      ) {
+        invalid(`${pullRequest.status} pull-request delivery lacks terminal identity`);
+      }
+      break;
+    case "blocked":
+      if (
+        !state.fixVerified ||
+        !pullRequest.branchPushed ||
+        !pullRequest.branch ||
+        pullRequest.number === null ||
+        pullRequest.url === null ||
+        pullRequest.reason !== PULL_REQUEST_BLOCKED_REASON ||
+        state.retryPlan !== null
+      ) {
+        invalid("blocked pull-request delivery is contradictory");
+      }
+      break;
+    case "failed":
+      if (
+        !state.fixVerified ||
+        pullRequest.number !== null ||
+        pullRequest.url !== null ||
+        pullRequest.reason !== PULL_REQUEST_FAILED_REASON ||
+        state.retryPlan !== null
+      ) {
+        invalid("failed pull-request delivery claims successful or retryable state");
+      }
+      break;
+    default:
+      invalid("pull-request delivery has an unknown status");
+  }
+
+  if (!state.fixVerified && pullRequest.status !== "not_applicable") {
+    invalid("a failed or no-fix execution carries fix delivery");
+  }
+
+  const comment = state.terminalComment;
+  const attemptedAt = comment.createAttemptedAt
+    ? Date.parse(comment.createAttemptedAt)
+    : null;
+  const postedAt = comment.postedAt ? Date.parse(comment.postedAt) : null;
+  if (
+    attemptedAt !== null &&
+    (!Number.isFinite(attemptedAt) ||
+      attemptedAt < createdAt ||
+      attemptedAt > updatedAt)
+  ) {
+    invalid("comment create intent falls outside the delivery-state lifetime");
+  }
+  if (
+    postedAt !== null &&
+    (!Number.isFinite(postedAt) || postedAt < createdAt || postedAt > updatedAt)
+  ) {
+    invalid("comment completion falls outside the delivery-state lifetime");
+  }
+  if (attemptedAt !== null && postedAt !== null && postedAt < attemptedAt) {
+    invalid("comment completion predates create intent");
+  }
+  switch (comment.status) {
+    case "pending":
+      if (comment.postedAt !== null || comment.reason !== null) {
+        invalid("pending terminal comment carries completion state");
+      }
+      break;
+    case "posted":
+      if (comment.postedAt === null || comment.reason !== null) {
+        invalid("posted terminal comment lacks a clean completion timestamp");
+      }
+      break;
+    case "failed":
+      if (
+        comment.postedAt !== null ||
+        comment.reason !== TERMINAL_COMMENT_FAILED_REASON
+      ) {
+        invalid("failed terminal comment carries contradictory completion state");
+      }
+      break;
+    default:
+      invalid("terminal comment has an unknown status");
+  }
+  if (comment.status !== "pending" && pullRequest.status === "pending") {
+    invalid("a terminal comment completed before pull-request delivery");
+  }
+
+  if (terminalPayload) {
+    if (terminalPayload.investigationId !== state.investigationId) {
+      invalid("terminal payload belongs to a different investigation");
+    }
+    if (
+      terminalPayload.version === 2 &&
+      terminalPayload.report.outcome !== state.executionOutcome
+    ) {
+      invalid("structured report and execution outcomes disagree");
+    }
+    if (
+      terminalPayload.version === 1 &&
+      terminalPayload.summary.outcome !== state.executionOutcome
+    ) {
+      invalid("legacy summary and execution outcomes disagree");
+    }
+  }
 }
 
 function normalizeTerminalFailure(value: unknown): TerminalFailureRecord {
@@ -1336,6 +1624,56 @@ export function createFileDeliveryStateStore(
     }
   };
 
+  const persistPayloadTracked = async (
+    investigationId: string,
+    kind: "retry" | "terminal",
+    payload: unknown,
+  ): Promise<{ reference: DeliveryArtifactReference; created: boolean }> => {
+    if (!isInvestigationId(investigationId)) {
+      throw new Error("Refusing a protected payload for an unsafe investigation id.");
+    }
+    void kind;
+    const raw = serializedPayload(payload);
+    const reference = payloadReferenceForValue(payload);
+    const dir = await ensureDir(investigationId);
+    const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
+    await mkdir(payloadDir, { recursive: true, mode: 0o700 });
+    const payloadDirInfo = await lstat(payloadDir);
+    if (!payloadDirInfo.isDirectory() || payloadDirInfo.isSymbolicLink()) {
+      throw new Error("Refusing an unsafe protected delivery directory.");
+    }
+    const destination = path.join(payloadDir, reference.sha256);
+    let created = false;
+    try {
+      await writeFile(destination, raw, { mode: 0o600, flag: "wx" });
+      created = true;
+      const existing = await openVerifiedPayload(investigationId, reference);
+      if (!existing.equals(raw)) {
+        throw new Error("Existing protected delivery payload failed integrity verification.");
+      }
+      return { reference, created };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        const existing = await openVerifiedPayload(investigationId, reference);
+        if (!existing.equals(raw)) {
+          throw new Error("Existing protected delivery payload failed integrity verification.");
+        }
+        return { reference, created: false };
+      }
+      if (created) {
+        // The file became visible at its content-addressed destination before
+        // verification failed. Another construction can reuse and publish a
+        // reference to it concurrently, while delivery-state save is outside
+        // this function. Without a publication-wide lock, deletion is
+        // ambiguous and must fail safe by retaining the bounded protected file.
+        console.warn(
+          `[${investigationId}] Protected delivery content was retained after an unexpected post-write verification failure.`,
+        );
+      }
+      throw error;
+    }
+  };
+
   return {
     async load(investigationId) {
       const value = await readRecord(
@@ -1375,39 +1713,9 @@ export function createFileDeliveryStateStore(
       );
     },
     async persistPayload(investigationId, kind, payload) {
-      if (!isInvestigationId(investigationId)) {
-        throw new Error("Refusing a protected payload for an unsafe investigation id.");
-      }
-      void kind;
-      const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
-      if (raw.length <= 1 || raw.length > MAX_DELIVERY_PAYLOAD_BYTES) {
-        throw new Error("Protected delivery payload exceeds the size limit.");
-      }
-      const digest = sha256(raw);
-      const reference = {
-        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${digest}`,
-        sha256: digest,
-        sizeBytes: raw.length,
-      } satisfies DeliveryArtifactReference;
-      const dir = await ensureDir(investigationId);
-      const payloadDir = path.join(dir, DELIVERY_PAYLOAD_DIRECTORY);
-      await mkdir(payloadDir, { recursive: true, mode: 0o700 });
-      const payloadDirInfo = await lstat(payloadDir);
-      if (!payloadDirInfo.isDirectory() || payloadDirInfo.isSymbolicLink()) {
-        throw new Error("Refusing an unsafe protected delivery directory.");
-      }
-      const destination = path.join(payloadDir, digest);
-      try {
-        await writeFile(destination, raw, { mode: 0o600, flag: "wx" });
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      }
-      const existing = await openVerifiedPayload(investigationId, reference);
-      if (!existing.equals(raw)) {
-        throw new Error("Existing protected delivery payload failed integrity verification.");
-      }
-      return reference;
+      return (await persistPayloadTracked(investigationId, kind, payload)).reference;
     },
+    persistPayloadTracked,
     async loadPayload(investigationId, reference) {
       const raw = await openVerifiedPayload(investigationId, reference);
       return JSON.parse(raw.toString("utf8")) as unknown;
@@ -1575,6 +1883,24 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
   const states = new Map<string, DeliveryState>();
   const failures = new Map<string, TerminalFailureRecord>();
   const locks = new Map<string, Promise<void>>();
+  const persistPayloadTracked = async (
+    investigationId: string,
+    kind: "retry" | "terminal",
+    payload: unknown,
+  ): Promise<{ reference: DeliveryArtifactReference; created: boolean }> => {
+    if (!isInvestigationId(investigationId)) throw new Error("Unsafe investigation id.");
+    void kind;
+    const raw = serializedPayload(payload);
+    const reference = payloadReferenceForValue(payload);
+    const key = `${investigationId}:${reference.path}`;
+    const created = !inMemoryDeliveryPayloads.has(key);
+    if (created) inMemoryDeliveryPayloads.set(key, raw);
+    const existing = inMemoryDeliveryPayloads.get(key);
+    if (!existing || !existing.equals(raw)) {
+      throw new Error("Existing protected delivery payload failed integrity verification.");
+    }
+    return { reference, created };
+  };
 
   return {
     async load(investigationId) {
@@ -1597,18 +1923,9 @@ export function createInMemoryDeliveryStateStore(): DeliveryStateStore & {
       failures.set(normalized.investigationId, structuredClone(normalized));
     },
     async persistPayload(investigationId, kind, payload) {
-      if (!isInvestigationId(investigationId)) throw new Error("Unsafe investigation id.");
-      void kind;
-      const raw = Buffer.from(`${JSON.stringify(payload)}\n`, "utf8");
-      const digest = sha256(raw);
-      const reference = {
-        path: `${DELIVERY_PAYLOAD_DIRECTORY}/${digest}`,
-        sha256: digest,
-        sizeBytes: raw.length,
-      } satisfies DeliveryArtifactReference;
-      inMemoryDeliveryPayloads.set(`${investigationId}:${reference.path}`, raw);
-      return reference;
+      return (await persistPayloadTracked(investigationId, kind, payload)).reference;
     },
+    persistPayloadTracked,
     async loadPayload(investigationId, reference) {
       const safe = sanitizeArtifactReference(reference);
       if (!safe) throw new Error("Unsafe protected delivery artifact reference.");
@@ -1801,6 +2118,17 @@ export async function findTerminalCommentPaginated(input: {
   );
 }
 
+// Pull-request view handed to the issue-report renderer, derived from the
+// reconciled delivery state so the visible report tells the delivery truth.
+export function reportPullRequestFromDeliveryState(
+  state: DeliveryState,
+): ReportPullRequest | null {
+  if (!state.fixVerified) {
+    return null;
+  }
+  return { status: state.pullRequest.status, url: state.pullRequest.url };
+}
+
 // Build the terminal comment from the CURRENT delivery state, so the posted
 // text always tells the truth about what was actually delivered: a fix is
 // only presented with a pull request when that pull request really exists.
@@ -1808,6 +2136,17 @@ export function buildTerminalComment(
   state: DeliveryState,
   payload: TerminalCommentPayload,
 ): string {
+  if (payload.version === 2) {
+    return [
+      renderIssueReport(payload.report, reportPullRequestFromDeliveryState(state)),
+      terminalCommentMarker(state.investigationId),
+      deliveryCommentMarker(state.investigationId),
+    ].join("\n\n");
+  }
+
+  // Legacy v1 compatibility: render the pending payload's preformatted
+  // sections exactly as before, so already-persisted terminal payloads finish
+  // with their original presentation.
   const summary: InvestigationSummary = state.fixVerified
     ? { ...payload.summary, pullRequestStatus: summaryPullRequestStatus(state) }
     : payload.summary;
@@ -2356,12 +2695,19 @@ async function runDeliveryUnlocked(
 ): Promise<DeliveryRunResult> {
   const log = deps.log ?? (() => {});
   const state = structuredClone(initial) as DeliveryState;
-  const terminalPayloadForMetadata = await loadTerminalCommentPayload(
+  // The protected terminal payload is part of the delivery authorization, not
+  // merely rendering data. Load, integrity-check, strictly normalize, and
+  // cross-check it before the first GitHub read or write. Reuse this exact
+  // validated object for metadata and final rendering throughout the attempt.
+  const terminalPayload = await loadTerminalCommentPayload(
     deps.deliveryStore,
     state,
-  ).catch(() => null);
+  );
+  validateDeliveryConsistency(state, terminalPayload);
   const originalOutcome =
-    terminalPayloadForMetadata?.summary.originalOutcome ?? null;
+    terminalPayload.version === 2
+      ? terminalPayload.report.originalOutcome
+      : terminalPayload.summary.originalOutcome ?? null;
 
   const recordState = async (event: InvestigationStateEventInput) => {
     try {
@@ -2462,6 +2808,7 @@ async function runDeliveryUnlocked(
 
       state.pullRequest.status = "failed";
       state.pullRequest.reason = PULL_REQUEST_FAILED_REASON;
+      state.retryPlan = null;
       log(
         `[${state.investigationId}] Pull-request delivery failed permanently: ${state.pullRequest.reason}`,
       );
@@ -2482,21 +2829,49 @@ async function runDeliveryUnlocked(
       const marker = terminalCommentMarker(state.investigationId);
       const reusableMarker = deliveryCommentMarker(state.investigationId);
       const reconcileComment = async (): Promise<TerminalCommentReconciliation> => {
-        const result = await deps.findTerminalComment({
-          installationId: state.installationId,
-          owner: state.repoOwner,
-          repo: state.repoName,
-          issueNumber: state.issueNumber,
-          marker,
-          reusableMarker,
-          assertOwnership: lease.assertOwned,
-        });
-        return typeof result === "boolean"
-          ? {
-              terminalCommentId: result ? -1 : null,
-              reusableCommentId: null,
-            }
-          : result;
+        try {
+          const result = await deps.findTerminalComment({
+            installationId: state.installationId,
+            owner: state.repoOwner,
+            repo: state.repoName,
+            issueNumber: state.issueNumber,
+            marker,
+            reusableMarker,
+            assertOwnership: lease.assertOwned,
+          });
+          const normalized = typeof result === "boolean"
+            ? {
+                terminalCommentId: result ? -1 : null,
+                reusableCommentId: null,
+              }
+            : result;
+          const validId = (value: unknown, allowBooleanSentinel = false) =>
+            value === null ||
+            (allowBooleanSentinel && value === -1) ||
+            (Number.isSafeInteger(value) && Number(value) > 0);
+          if (
+            !normalized ||
+            typeof normalized !== "object" ||
+            !validId(normalized.terminalCommentId, true) ||
+            !validId(normalized.reusableCommentId)
+          ) {
+            throw new Error("GitHub comment reconciliation returned an incomplete result.");
+          }
+          return normalized;
+        } catch (error) {
+          const status =
+            error &&
+            typeof error === "object" &&
+            Number.isSafeInteger((error as { status?: unknown }).status)
+              ? ` (HTTP ${(error as { status: number }).status})`
+              : "";
+          log(
+            `[${state.investigationId}] Comment ownership reconciliation is incomplete${status}; delivery remains pending: ${safeMessage(error)}`,
+          );
+          throw new DeliveryRetryableError(
+            `Comment ownership reconciliation is incomplete${status}; delivery remains pending.`,
+          );
+        }
       };
 
       let reconciliation = await reconcileComment();
@@ -2505,10 +2880,6 @@ async function runDeliveryUnlocked(
           `[${state.investigationId}] Terminal comment already exists on the issue; not posting a duplicate.`,
         );
       } else {
-        const terminalPayload = await loadTerminalCommentPayload(
-          deps.deliveryStore,
-          state,
-        );
         const body = buildTerminalComment(state, terminalPayload);
 
         // Reconcile again immediately before the only non-idempotent comment
@@ -2519,14 +2890,22 @@ async function runDeliveryUnlocked(
             reconciliation.reusableCommentId !== null &&
             deps.updateIssueComment
           ) {
-            await deps.updateIssueComment({
-              installationId: state.installationId,
-              owner: state.repoOwner,
-              repo: state.repoName,
-              commentId: reconciliation.reusableCommentId,
-              body,
-              assertOwnership: lease.assertOwned,
-            });
+            try {
+              await deps.updateIssueComment({
+                installationId: state.installationId,
+                owner: state.repoOwner,
+                repo: state.repoName,
+                commentId: reconciliation.reusableCommentId,
+                body,
+                assertOwnership: lease.assertOwned,
+              });
+            } catch (error) {
+              // A failed update never authorizes a fallback create. The queued
+              // comment may have been updated despite a lost acknowledgement,
+              // or may simply have disappeared; a later owned scan decides
+              // whether to reconcile, update again, or create once.
+              throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+            }
           } else {
             if (state.terminalComment.createAttemptedAt) {
               throw new DeliveryRetryableError(
@@ -2548,8 +2927,8 @@ async function runDeliveryUnlocked(
               // If GitHub accepted the create but its acknowledgement was
               // lost, a complete owned-marker scan converts it to success.
               // Otherwise the durable intent prevents a blind second create.
-              const after = await reconcileComment().catch(() => null);
-              if (after?.terminalCommentId === null || after === null) {
+              const after = await reconcileComment();
+              if (after.terminalCommentId === null) {
                 throw error;
               }
             }
@@ -2697,6 +3076,7 @@ async function reconcilePullRequest(
         state.pullRequest.status = "blocked";
         state.pullRequest.reason = PULL_REQUEST_BLOCKED_REASON;
       }
+      state.retryPlan = null;
       return true;
     }
     if (reconciliation.conflictingBase) {
@@ -2738,6 +3118,7 @@ async function reconcilePullRequest(
   state.pullRequest.number = created.number;
   state.pullRequest.url = created.url;
   state.pullRequest.reason = null;
+  state.retryPlan = null;
 }
 
 async function loadPullRequestRetryPayload(
@@ -2790,11 +3171,29 @@ async function loadTerminalCommentPayload(
   const value = (await store.loadPayload(
     state.investigationId,
     state.terminalPayload,
-  )) as Partial<TerminalCommentPayload>;
+  )) as {
+    version?: unknown;
+    investigationId?: unknown;
+    summary?: InvestigationSummary | null;
+    analysisComment?: string | null;
+    fixComment?: string | null;
+    report?: unknown;
+  } | null;
+
+  if (!value || value.investigationId !== state.investigationId) {
+    throw new Error("Protected terminal-comment payload has an invalid shape.");
+  }
+
+  if (value.version === 2) {
+    return {
+      version: 2,
+      investigationId: state.investigationId,
+      report: normalizeInvestigationReportData(value.report),
+    } satisfies TerminalCommentPayloadV2;
+  }
+
   if (
-    !value ||
     value.version !== 1 ||
-    value.investigationId !== state.investigationId ||
     !value.summary ||
     typeof value.summary !== "object" ||
     (value.analysisComment !== null && typeof value.analysisComment !== "string") ||
@@ -2802,7 +3201,7 @@ async function loadTerminalCommentPayload(
   ) {
     throw new Error("Protected terminal-comment payload has an invalid shape.");
   }
-  return value as TerminalCommentPayload;
+  return value as TerminalCommentPayloadV1;
 }
 
 function sha256(value: Buffer): string {

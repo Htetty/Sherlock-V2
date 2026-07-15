@@ -166,7 +166,7 @@ describe("authorized command gate", () => {
       queue: fake.adapter,
       getRepositoryRole: async () => ({ roleName: "write" }),
     });
-    const mock = mockCommentPost("Investigation queued.");
+    const mock = mockCommentPost("**Investigation queued**");
 
     await receiveComment(probot);
 
@@ -238,7 +238,7 @@ describe("authorized command gate", () => {
       queue: fake.adapter,
       getRepositoryRole: async () => ({ roleName: "maintain" }),
     });
-    const mock = mockCommentPost("Investigation queued.");
+    const mock = mockCommentPost("**Investigation queued**");
 
     await receiveComment(probot);
 

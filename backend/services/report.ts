@@ -1,4 +1,6 @@
-// Builds the concise GitHub result comment for an investigation.
+// Shared redaction utilities plus the legacy (v1 terminal payload) comment
+// formatters that keep already-persisted pending deliveries renderable.
+// New investigations render through services/issue-report-renderer.ts.
 // Everything that leaves the backend for GitHub must pass through redactSecrets.
 
 export type InvestigationOutcome =
@@ -145,90 +147,6 @@ export function redactSecrets(text: string): string {
   );
 }
 
-export type FixCommentSummary = {
-  investigationId: string;
-  fixAttemptId: string;
-  outcome: string;
-  rootCause?: string | null;
-  changedFiles?: string[];
-  reason?: string | null;
-  verification?: string[];
-  // Truthful per-category repository validation lines, e.g. "Tests: passed".
-  repositoryValidation?: string[];
-  // Truthful regression-test lines, e.g. "Before patch: failed as expected".
-  regressionTest?: string[];
-};
-
-const FIX_OUTCOME_HEADLINES: Record<string, string> = {
-  verified: "Sherlock verified a local fix.",
-  rejected_reproduction_still_fails:
-    "Sherlock generated a fix, but the original failure still occurs.",
-  rejected_build_failed:
-    "Sherlock generated a fix, but the application failed to rebuild or restart with it.",
-  rejected_tests_failed: "Sherlock generated a fix, but verification failed.",
-  rejected_patch_invalid:
-    "Sherlock generated a fix, but it was rejected before being applied.",
-  rejected_environment_failed:
-    "Sherlock generated a fix, but the application environment failed during verification.",
-  rejected_verification_inconclusive:
-    "Sherlock generated a fix, but could not conclusively verify it.",
-  rejected_regression_test_failed:
-    "Sherlock generated a fix, but the generated regression test did not prove it.",
-};
-
-export function formatFixComment(summary: FixCommentSummary): string {
-  const lines = [
-    FIX_OUTCOME_HEADLINES[summary.outcome] ??
-      "Sherlock completed a fix attempt.",
-    "",
-    `Investigation: ${summary.investigationId}`,
-    `Fix attempt: ${summary.fixAttemptId}`,
-    `Outcome: ${summary.outcome}`,
-  ];
-
-  if (summary.rootCause) {
-    lines.push(`Root cause: ${truncate(summary.rootCause, MAX_ERROR_CHARS)}`);
-  }
-
-  if (summary.changedFiles && summary.changedFiles.length > 0) {
-    lines.push(`Changed: ${summary.changedFiles.join(", ")}`);
-  }
-
-  if (summary.reason) {
-    lines.push(`Reason: ${truncate(summary.reason, MAX_ERROR_CHARS)}`);
-  }
-
-  if (summary.verification && summary.verification.length > 0) {
-    lines.push("Verification:");
-
-    for (const item of summary.verification) {
-      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
-    }
-  }
-
-  if (summary.repositoryValidation && summary.repositoryValidation.length > 0) {
-    lines.push("Repository validation:");
-
-    for (const item of summary.repositoryValidation) {
-      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
-    }
-  }
-
-  if (summary.regressionTest && summary.regressionTest.length > 0) {
-    lines.push("Regression test:");
-
-    for (const item of summary.regressionTest) {
-      lines.push(`- ${truncate(item, MAX_ERROR_CHARS)}`);
-    }
-  }
-
-  if (summary.outcome !== "verified") {
-    lines.push("No pull request was opened.");
-  }
-
-  return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
-}
-
 export type PullRequestCommentSummary = {
   investigationId: string;
   fixAttemptId: string;
@@ -238,21 +156,6 @@ export type PullRequestCommentSummary = {
   branch?: string | null;
   reason?: string | null;
 };
-
-const MAX_ANALYSIS_CHARS = 900;
-
-export function formatAnalysisComment(analysis: unknown): string | null {
-  const text = extractAnalysisText(analysis);
-
-  if (!text) {
-    return null;
-  }
-
-  return [
-    "Analysis:",
-    truncate(redactSecrets(text.replace(/\s+\n/g, "\n").trim()), MAX_ANALYSIS_CHARS),
-  ].join("\n");
-}
 
 export function formatPullRequestComment(summary: PullRequestCommentSummary): string {
   const lines: string[] = [];
@@ -287,24 +190,6 @@ export function formatPullRequestComment(summary: PullRequestCommentSummary): st
   }
 
   return truncate(redactSecrets(lines.join("\n")), MAX_COMMENT_CHARS);
-}
-
-function extractAnalysisText(analysis: unknown): string | null {
-  if (typeof analysis === "string") {
-    return analysis;
-  }
-
-  if (
-    analysis &&
-    typeof analysis === "object" &&
-    "type" in analysis &&
-    (analysis as { type?: unknown }).type === "text" &&
-    typeof (analysis as { text?: unknown }).text === "string"
-  ) {
-    return (analysis as unknown as { text: string }).text;
-  }
-
-  return null;
 }
 
 function truncate(text: string, maxChars: number) {

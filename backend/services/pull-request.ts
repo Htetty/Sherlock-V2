@@ -8,8 +8,15 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { readJsonArtifact, type ArtifactStore } from "./artifacts.js";
 import type { FixAttemptResult } from "./fix.js";
+import { validateFixProposalShape } from "./fix-proposal.js";
 import { parseGitStatusPorcelainZ } from "./git-status.js";
-import type { ReproductionPlan } from "./plan.js";
+import { getPlanMode, type ReproductionPlan } from "./plan.js";
+import {
+  buildPullRequestDescriptionData,
+  renderPullRequestDescription,
+  renderPullRequestTitle,
+  type PullRequestReportingProposal,
+} from "./pull-request-description-renderer.js";
 import { createGitAuthContext, redactGitFailure, type GitAuthContext } from "./repo-auth.js";
 import { redactSecrets } from "./report.js";
 
@@ -18,7 +25,6 @@ const execFileAsync = promisify(execFile);
 export const SHERLOCK_AUTHOR_NAME = "sherlock[bot]";
 export const SHERLOCK_AUTHOR_EMAIL = "sherlock[bot]@users.noreply.github.com";
 const MAX_SLUG_CHARS = 24;
-const MAX_BODY_CHARS = 20_000;
 
 // Blocking verification checks that must all have passed before a PR may be
 // opened. Generated regression evidence is evaluated separately because it is
@@ -301,7 +307,7 @@ async function openPullRequest(
       return finish("already_exists", "An open pull request for this branch already exists.");
     }
 
-    const body = await buildPullRequestBody(input);
+    const body = await buildPullRequestBody(input, result.branch);
     input.abortSignal?.throwIfAborted();
     const created = await input.github.createPullRequest({
       title: buildPullRequestTitle(input),
@@ -478,9 +484,7 @@ async function remoteBranchExists(input: PullRequestInput, branch: string) {
 export function buildPullRequestTitle(
   input: Pick<PullRequestInput, "fixAttempt">,
 ) {
-  const summary = input.fixAttempt.summary ?? "Fix verified by reproduction replay";
-
-  return redactSecrets(`Sherlock: ${summary}`).slice(0, 120);
+  return renderPullRequestTitle(input.fixAttempt.summary);
 }
 
 export function buildCommitMessage(
@@ -498,140 +502,84 @@ export function buildCommitMessage(
   );
 }
 
-export async function buildPullRequestBody(input: PullRequestInput): Promise<string> {
+// Builds the public pull-request description from structured fix data only.
+// `branch` is the head branch the description's native compare link points
+// at; when absent (e.g. legacy callers) the deterministic derived branch name
+// is used, which matches the branch a workspace-less delivery retry creates.
+export async function buildPullRequestBody(
+  input: PullRequestInput,
+  branch?: string | null,
+): Promise<string> {
   const attempt = input.fixAttempt;
-  const postPatch = await readPostPatchResult(attempt.attemptDir);
+  const proposal = await readReportingProposal(attempt.attemptDir);
 
-  const reproductionSteps = input.plan.steps
-    .map((step) => `${step.id}: ${describeStep(step)}`)
-    .join("\n");
+  const data = buildPullRequestDescriptionData({
+    owner: input.owner,
+    repo: input.repo,
+    baseBranch: input.baseBranch,
+    branch:
+      branch ??
+      buildFixBranchName({
+        issueNumber: input.issueNumber,
+        issueTitle: input.issueTitle,
+        fixAttemptId: attempt.fixAttemptId,
+      }),
+    issueNumber: input.issueNumber,
+    issueTitle: input.issueTitle,
+    plan: {
+      stepCount: input.plan.steps.length,
+      mode: getPlanMode(input.plan),
+      expectedBehavior: input.plan.expectedBehavior,
+      failureCondition: input.plan.failureCondition,
+    },
+    fixAttempt: {
+      summary: attempt.summary,
+      rootCause: attempt.rootCause,
+      changedFiles: attempt.changedFiles,
+      postPatchOutcome: attempt.postPatchOutcome,
+      checks: attempt.checks.map((check) => ({
+        name: check.name,
+        status: check.status,
+      })),
+      repositoryValidation: attempt.repositoryValidation,
+      regressionTest: attempt.regressionTest,
+      testRuns: attempt.testRuns.map((run) => ({
+        command: run.command,
+        exitCode: run.exitCode,
+        targeted: run.targeted,
+        durationMs: run.durationMs,
+        timedOut: run.timedOut ?? false,
+      })),
+    },
+    proposal,
+  });
 
-  const verificationChecks = attempt.checks
-    .map(
-      (check) =>
-        `- ${check.status === "passed" ? "PASS" : check.status === "failed" ? "FAIL" : "ADVISORY"} ${check.name}: ${check.detail}`,
-    )
-    .join("\n");
-
-  const testLines =
-    attempt.testRuns.length > 0
-      ? attempt.testRuns
-          .map(
-            (run) =>
-              `- \`${run.command}\` -> exit ${run.exitCode} (${run.targeted ? "targeted" : "full suite"}, ${run.durationMs}ms)`,
-          )
-          .join("\n")
-      : "- No project test command was available.";
-
-  const screenshots =
-    postPatch?.screenshots && postPatch.screenshots.length > 0
-      ? postPatch.screenshots.map((name) => `- ${name}`).join("\n")
-      : "- (none)";
-
-  const assumptions = "(recorded in fix-proposal.json)";
-
-  const body = `## Summary
-
-${attempt.summary ?? "Sherlock verified a minimal fix by replaying the saved reproduction."}
-
-## Original Failure
-
-- Reported issue: #${input.issueNumber} — ${input.issueTitle}
-- Expected: ${input.plan.expectedBehavior}
-- Observed before the patch: ${input.plan.failureCondition}
-- The failure was deterministically reproduced before any patch was applied.
-
-## Reproduction
-
-Deterministic Playwright plan (base URL elided, replayed byte-identically after the patch):
-
-\`\`\`text
-${reproductionSteps}
-assertion: ${JSON.stringify(input.plan.assertion)}
-\`\`\`
-
-Original outcome: **reproduced**
-
-## Root Cause
-
-${attempt.rootCause ?? "(see fix-proposal.json)"}
-
-## Changes
-
-Changed files:
-${attempt.changedFiles.map((file) => `- \`${file}\``).join("\n")}
-
-The full diff is in this pull request; the pre-commit diff is stored as the \`git-diff.patch\` artifact.
-
-## Verification
-
-The exact saved reproduction plan was replayed after applying the patch and restarting the application.
-
-- Post-patch reproduction outcome: **${attempt.postPatchOutcome ?? "unknown"}**
-${verificationChecks}
-
-## Tests
-
-${testLines}
-
-## Evidence
-
-- Investigation: \`${input.investigationId}\`
-- Fix attempt: \`${attempt.fixAttemptId}\`
-- Stored artifacts (Sherlock server, under the investigation's fix attempt): \`fix-proposal.json\`, \`proposed.patch\`, \`patch-validation.json\`, \`git-diff.patch\`, \`build-result.json\`, \`post-patch-reproduction-result.json\`, \`test-results.json\`, \`verification-result.json\`
-- Post-patch screenshots:
-${screenshots}
-
-## Risk and Limitations
-
-- Risk and assumptions: ${assumptions}
-- Only the reproduction scenario above and the listed tests were exercised; adjacent behavior was not separately verified.
-- The patch was verified in an isolated Sherlock workspace, not in a production environment.
-
-## Sherlock Metadata
-
-\`\`\`text
-Investigation: ${input.investigationId}
-Fix attempt: ${attempt.fixAttemptId}
-Source commit: ${attempt.sourceCommit}
-Verification outcome: ${attempt.outcome}
-\`\`\`
-`;
-
-  return redactSecrets(body).slice(0, MAX_BODY_CHARS);
+  return renderPullRequestDescription(data);
 }
 
-function describeStep(step: ReproductionPlan["steps"][number]) {
-  switch (step.action) {
-    case "goto":
-      return `goto ${step.path}`;
-    case "click":
-      return `click ${describeStepTarget(step)}`;
-    case "fill":
-      return `fill ${describeStepTarget(step)}`;
-    case "waitForSelector":
-      return `wait for ${describeStepTarget(step)}`;
-    case "screenshot":
-      return "screenshot";
-    case "wait":
-      return `wait ${step.ms}ms`;
-    case "request":
-      return `${step.method} ${step.path}`;
+// Reads the persisted fix proposal's reporting fields (risk, assumptions,
+// relevant tests). Only a proposal that passes the structural validator is
+// trusted; anything else yields null and the description omits review focus
+// derived from it. Never throws: reporting must not fail PR delivery.
+async function readReportingProposal(
+  attemptDir: string,
+): Promise<PullRequestReportingProposal | null> {
+  try {
+    const artifact = (await readJsonArtifact(
+      path.join(attemptDir, "fix-proposal.json"),
+    )) as { proposal?: unknown };
+    const validation = validateFixProposalShape(artifact?.proposal);
+    if (!validation.ok) {
+      return null;
+    }
+    return {
+      risk: validation.proposal.risk,
+      assumptions: validation.proposal.assumptions,
+      relevantTests: validation.proposal.relevantTests,
+    };
+  } catch {
+    return null;
   }
-}
-
-// Steps identify their element by a raw selector or an intent target object.
-function describeStepTarget(
-  step: { selector: string } | { target: Record<string, string | undefined> },
-) {
-  if ("selector" in step) {
-    return step.selector;
-  }
-
-  return Object.entries(step.target)
-    .filter(([, value]) => typeof value === "string")
-    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
-    .join(" ");
 }
 
 async function readPreviousResult(
@@ -641,16 +589,6 @@ async function readPreviousResult(
     return (await readJsonArtifact(
       path.join(store.dir, PR_RESULT_FILE),
     )) as PullRequestResult;
-  } catch {
-    return null;
-  }
-}
-
-async function readPostPatchResult(attemptDir: string) {
-  try {
-    return (await readJsonArtifact(
-      path.join(attemptDir, "post-patch-reproduction-result.json"),
-    )) as { screenshots?: string[] };
   } catch {
     return null;
   }

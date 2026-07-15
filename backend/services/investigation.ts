@@ -31,11 +31,7 @@ import {
 import { createCostShapeTracker } from "./cost-shape.js";
 import type { FixAttemptResult, FixOutcome } from "./fix.js";
 import { getSandboxNetworkPolicy } from "./container.js";
-import { formatValidationLine } from "./repo-validation.js";
-import {
-  formatRegressionCommentLines,
-  type AppNetworkTarget,
-} from "./regression-test.js";
+import type { AppNetworkTarget } from "./regression-test.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
@@ -95,12 +91,15 @@ import {
   type ArtifactStore,
 } from "./artifacts.js";
 import {
-  formatFixComment,
-  formatAnalysisComment,
-  formatResultComment,
   redactSecrets,
   type InvestigationSummary,
 } from "./report.js";
+import {
+  buildInvestigationReportData,
+  renderIssueReport,
+  type InvestigationReportData,
+  type ReportPullRequest,
+} from "./issue-report-renderer.js";
 import {
   createNoopInvestigationStateStore,
   safeRepoUrl,
@@ -149,9 +148,13 @@ export type InvestigationPipelineResult = {
   claudeAnalysis?: unknown;
   fixAttempt?: FixAttemptResult | null;
   pullRequest?: PullRequestResult | null;
-  // The already-formatted comment sections behind githubComment, exposed
-  // separately so the delivery layer can rebuild a truthful terminal comment
-  // after a PR delivery retry changes the pull-request state.
+  // Structured report data behind githubComment, exposed separately so the
+  // delivery layer can rerender a truthful terminal comment after a PR
+  // delivery retry changes the pull-request state.
+  report?: InvestigationReportData | null;
+  // Legacy preformatted comment sections. The pipeline no longer produces
+  // them; the field remains so injected legacy adapters and pending v1
+  // terminal payloads keep working.
   commentSections?: { analysis: string | null; fix: string | null } | null;
   // Captured while the verified workspace still exists: everything a
   // workspace-less GitHub delivery retry needs (see delivery.ts). Null when
@@ -254,14 +257,14 @@ export async function runInvestigationPipeline(
   const finish = async (
     summary: InvestigationSummary,
     extra: Partial<InvestigationPipelineResult> = {},
-    extraComment: string | null = null,
+    report: InvestigationReportData | null = null,
   ): Promise<InvestigationPipelineResult> => {
     const finished = await finishInvestigation(
       store as ArtifactStore,
       investigationRecord,
       summary,
       extra,
-      extraComment,
+      report,
     );
 
     await recordState({
@@ -1377,39 +1380,6 @@ export async function runInvestigationPipeline(
       log(`Could not record memory entry: ${formatError(error)}`);
     }
 
-    const fixComment = fixAttempt
-      ? formatFixComment({
-          investigationId,
-          fixAttemptId: fixAttempt.fixAttemptId,
-          outcome: fixAttempt.outcome,
-          rootCause: fixAttempt.rootCause,
-          changedFiles: fixAttempt.changedFiles,
-          reason: fixAttempt.outcome === "verified" ? null : fixAttempt.reason,
-          verification: fixAttempt.checks
-            .filter((item) => item.status === "passed")
-            .map((item) => item.detail),
-          repositoryValidation: fixAttempt.repositoryValidation
-            ? fixAttempt.repositoryValidation.categories.map((item) =>
-                formatValidationLine(item),
-              )
-            : undefined,
-          regressionTest: fixAttempt.regressionTest
-            ? formatRegressionCommentLines(fixAttempt.regressionTest)
-            : undefined,
-        })
-      : null;
-
-    // GitHub delivery owns the PR section so it can render from the final
-    // created/reused/failed state. The execution result never posts this
-    // pre-delivery comment.
-    const pullRequestComment = null;
-
-    const analysisComment = !fixAttempt || fixAttempt.outcome !== "verified"
-      ? formatAnalysisComment(claudeAnalysis)
-      : null;
-    const extraComment =
-      [analysisComment, fixComment, pullRequestComment].filter(Boolean).join("\n\n---\n\n") || null;
-
     // Final outcome semantics: a reproduced bug whose patch was verified
     // finishes as verified_fix. The original reproduction outcome is
     // preserved in summary.originalOutcome and in the untouched
@@ -1429,22 +1399,34 @@ export async function runInvestigationPipeline(
       );
     }
 
+    const finalSummary: InvestigationSummary = {
+      ...summary,
+      ...(reproductionMode ? { reproductionMode } : {}),
+    };
+
+    // Structured report data replaces the old preformatted comment sections.
+    // GitHub delivery rerenders it against the final pull-request state; the
+    // diagnostic analysis is only ever surfaced when no fix was verified.
+    const report = buildInvestigationReportData({
+      summary: finalSummary,
+      fixAttempt,
+      analysis:
+        !fixAttempt || fixAttempt.outcome !== "verified" ? claudeAnalysis : null,
+    });
+
     return await finish(
-      {
-        ...summary,
-        ...(reproductionMode ? { reproductionMode } : {}),
-      },
+      finalSummary,
       {
         result,
         claudeAnalysis,
         fixAttempt,
         pullRequest,
-        commentSections: { analysis: analysisComment, fix: fixComment },
+        report,
         pullRequestRetryPlan,
         graphContextNotes: graphContext.notes,
         memoryMatches: pastEntries.length,
       },
-      extraComment,
+      report,
     );
   } catch (error) {
     // Typed transient repository errors propagate to the worker retry
@@ -1484,7 +1466,11 @@ export async function runInvestigationPipeline(
       investigationId,
       outcome: "execution_failed",
       summary,
-      githubComment: formatResultComment(summary),
+      githubComment: renderIssueReport(
+        buildInvestigationReportData({ summary }),
+        null,
+      ),
+      report: buildInvestigationReportData({ summary }),
     };
   } finally {
     if (sandboxSession) {
@@ -1663,16 +1649,34 @@ function buildExecutionSummary(
   }
 }
 
+// Pre-delivery pull-request view for the pipeline's own rendered comment
+// (server sync endpoint, artifacts). GitHub delivery rerenders from the
+// reconciled delivery state instead.
+function pipelineReportPullRequest(
+  summary: InvestigationSummary,
+): ReportPullRequest | null {
+  switch (summary.pullRequestStatus) {
+    case "delivery_pending":
+      return { status: "pending", url: null };
+    case "delivery_failed":
+      return { status: "failed", url: null };
+    default:
+      return null;
+  }
+}
+
 async function finishInvestigation(
   store: ArtifactStore,
   record: Record<string, unknown>,
   summary: InvestigationSummary,
   extra: Partial<InvestigationPipelineResult> = {},
-  extraComment: string | null = null,
+  report: InvestigationReportData | null = null,
 ): Promise<InvestigationPipelineResult> {
-  const githubComment = extraComment
-    ? `${formatResultComment(summary)}\n\n---\n\n${extraComment}`
-    : formatResultComment(summary);
+  const reportData = report ?? buildInvestigationReportData({ summary });
+  const githubComment = renderIssueReport(
+    reportData,
+    pipelineReportPullRequest(summary),
+  );
 
   await store.writeJson("investigation.json", {
     ...record,
@@ -1690,6 +1694,7 @@ async function finishInvestigation(
     summary,
     githubComment,
     artifactsDir: store.dir,
+    report: reportData,
     ...extra,
   };
 }

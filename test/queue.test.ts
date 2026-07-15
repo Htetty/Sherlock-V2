@@ -78,6 +78,10 @@ describe("investigation worker processing", () => {
           investigationId: payload.investigationId!,
           outcome: "verified_fix",
           summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
+          fixAttempt: {
+            outcome: "verified",
+            fixAttemptId: "fix_0TEST123ABC",
+          },
           githubComment: "RESULT COMMENT",
         };
       },
@@ -196,7 +200,7 @@ describe("investigation worker processing", () => {
     expect(comments).toHaveLength(1);
 
     // Non-transient failure: immediately permanent, failure comment posted
-    // with the investigation id and secrets redacted.
+    // with the investigation id in the hidden markers only, secrets redacted.
     const permanentError = new Error(
       "startup failed while DATABASE_URL=postgres://admin:hunter2@db/app was set",
     );
@@ -210,8 +214,15 @@ describe("investigation worker processing", () => {
 
     expect(comments).toHaveLength(2);
     const failureComment = comments[1];
-    expect(failureComment).toContain("Investigation: inv_0TEST123ABC");
-    expect(failureComment).toContain("Outcome: failed");
+    expect(failureComment).toContain("could not complete this investigation");
+    expect(failureComment).toContain(
+      "<!-- sherlock-terminal-comment:inv_0TEST123ABC -->",
+    );
+    expect(failureComment).toContain(
+      "<!-- sherlock-delivery-comment:inv_0TEST123ABC -->",
+    );
+    // No visible investigation id outside the hidden markers.
+    expect(failureComment).not.toMatch(/Investigation: inv_/);
     expect(failureComment).not.toContain("hunter2");
     expect(failureComment).toContain("worker failed permanently");
     expect(stages.filter((stage) => stage === "failed")).toHaveLength(2);
@@ -409,6 +420,10 @@ describe("worker-level state store writes", () => {
         investigationId: payload.investigationId!,
         outcome: "verified_fix",
         summary: { investigationId: payload.investigationId!, outcome: "verified_fix" },
+        fixAttempt: {
+          outcome: "verified",
+          fixAttemptId: "fix_0TEST123ABC",
+        },
         githubComment: "RESULT",
       }),
       getInstallationToken: async () => ({ token: "t", permissions: null }),

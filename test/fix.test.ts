@@ -33,7 +33,10 @@ import {
   type ReproductionPlan,
 } from "../backend/services/plan.js";
 import { executeReproductionPlan } from "../backend/services/playwright.js";
-import { formatFixComment } from "../backend/services/report.js";
+import {
+  buildInvestigationReportData,
+  renderIssueReport,
+} from "../backend/services/issue-report-renderer.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1231,42 +1234,74 @@ describe("fix proposal extraction and retry", () => {
 });
 
 describe("fix GitHub comments", () => {
-  test("a verified fix produces a concise accurate comment", () => {
-    const comment = formatFixComment({
-      investigationId: "inv_123ABC456DEF",
-      fixAttemptId: "fix_456DEF789GHJ",
-      outcome: "verified",
-      rootCause: "Missing user records were dereferenced in the login handler.",
-      changedFiles: ["src/auth/login.ts"],
-      verification: [
-        "Original reproduction no longer fails",
-        "Authentication tests passed",
-        "1 file changed",
-      ],
+  test("a verified fix produces a concise accurate report", () => {
+    const report = buildInvestigationReportData({
+      summary: {
+        investigationId: "inv_123ABC456DEF",
+        outcome: "verified_fix",
+        originalOutcome: "reproduced",
+      },
+      fixAttempt: {
+        outcome: "verified",
+        reason: "All verification checks passed.",
+        rootCause: "Missing user records were dereferenced in the login handler.",
+        summary: "Return 401 for unknown users.",
+        changedFiles: ["src/auth/login.ts"],
+        checks: [],
+        postPatchOutcome: "not_reproduced",
+        repositoryValidation: {
+          aggregate: "passed",
+          categories: [{ category: "test", status: "passed" }],
+        },
+        regressionTest: null,
+      },
     });
+    const comment = renderIssueReport(report, null);
 
-    expect(comment).toContain("Sherlock verified a local fix.");
-    expect(comment).toContain("Investigation: inv_123ABC456DEF");
-    expect(comment).toContain("Fix attempt: fix_456DEF789GHJ");
-    expect(comment).toContain("Outcome: verified");
-    expect(comment).toContain("Changed: src/auth/login.ts");
-    expect(comment).toContain("- Original reproduction no longer fails");
-    expect(comment).not.toContain("No pull request was opened.");
+    expect(comment).toContain(
+      "**Fix verified** — Sherlock reproduced the reported failure and verified a fix.",
+    );
+    expect(comment).toContain(
+      "Missing user records were dereferenced in the login handler.",
+    );
+    expect(comment).toContain("Return 401 for unknown users.");
+    expect(comment).toContain("`src/auth/login.ts`");
+    expect(comment).toContain("| Exact reproduction replay | Passed — failure no longer observed |");
+    // Internal identifiers never appear in the visible report.
+    expect(comment).not.toContain("inv_123ABC456DEF");
+    expect(comment).not.toContain("fix_456DEF789GHJ");
+    expect(comment).not.toContain("No pull request was opened");
   });
 
-  test("a rejected fix comment explains the reason and redacts secrets", () => {
-    const comment = formatFixComment({
-      investigationId: "inv_123ABC456DEF",
-      fixAttemptId: "fix_456DEF789GHJ",
-      outcome: "rejected_tests_failed",
-      reason:
-        "2 authentication tests failed while DATABASE_URL=postgres://admin:hunter2@db/app was set",
+  test("a rejected fix report explains the reason and redacts secrets", () => {
+    const report = buildInvestigationReportData({
+      summary: {
+        investigationId: "inv_123ABC456DEF",
+        outcome: "reproduced",
+      },
+      fixAttempt: {
+        outcome: "rejected_tests_failed",
+        reason:
+          "2 authentication tests failed while DATABASE_URL=postgres://admin:hunter2@db/app was set",
+        rootCause: "unverified guess",
+        summary: null,
+        changedFiles: ["src/auth/login.ts"],
+        checks: [],
+        postPatchOutcome: null,
+        repositoryValidation: null,
+        regressionTest: null,
+      },
     });
+    const comment = renderIssueReport(report, null);
 
-    expect(comment).toContain("Sherlock generated a fix, but verification failed.");
-    expect(comment).toContain("Outcome: rejected_tests_failed");
-    expect(comment).toContain("No pull request was opened.");
+    expect(comment).toContain(
+      "Sherlock generated a candidate fix, but verification failed.",
+    );
+    expect(comment).toContain("No pull request was opened for it.");
+    // An unverified root cause is never promoted as established.
+    expect(comment).toContain("Not established");
+    expect(comment).not.toContain("unverified guess");
     expect(comment).not.toContain("hunter2");
-    expect(comment).toContain("[REDACTED]");
+    expect(comment).toContain("REDACTED");
   });
 });
