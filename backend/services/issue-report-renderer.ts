@@ -1162,7 +1162,7 @@ export function renderIssueReport(
   report: InvestigationReportData,
   pullRequest: ReportPullRequest | null,
 ): string {
-  const sections: string[] = ["## Sherlock Investigation", outcomeCallout(report)];
+  const sections: string[] = [outcomeCallout(report)];
 
   const rootCause = inlineField(report.rootCause, MAX_ROOT_CAUSE_CHARS);
   if (rootCause) {
@@ -1240,12 +1240,30 @@ export function renderIssueReport(
 
 // Queued placeholder body. The caller appends the hidden delivery marker so
 // terminal delivery can find and update this exact comment.
+export const QUEUED_INVESTIGATION_ASCII_ART = `⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠤⠒⠋⠁⠑⠠⢄⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡊⠀⠀⡀⡀⡀⠀⠈⡆⠀
+⠀⠀⠀⢀⣰⣿⣿⣿⣿⣷⣆⠀⠀⠀⠑⢆⠀⠀⠀⠀⠀⡸⠀⠀
+⠀⠀⢰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⠀⣰⠏⠑⠂⠂⠒⠂⠀⠀⠀
+⠀⠀⣿⣿⣿⣿⣿⠿⢿⣛⣫⣭⣶⡶⠶⠤⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⢛⣻⣭⣽⡶⢞⣛⣯⣭⣷⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⢀⠴⠟⣫⠅⣤⣥⣿⣿⣿⣿⣿⣿⣇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠘⢷⣝⢻⣿⣿⣿⣿⣿⡏⣉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⣶⣬⣜⠻⠿⣿⠿⣿⡇⠈⡄⢠⣤⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⣰⣿⣿⣿⣿⣷⣶⣀⠀⠀⠀⠱⣿⠏⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⢰⣿⣿⣿⣿⣿⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⢀⣿⣿⣿⣿⣿⣿⣿⣿⣷⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠈⠉⠉⠉⠉⠉⠉⠉⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀`;
+
 export function renderQueuedIssueReport(): string {
   return [
-    "## Sherlock Investigation",
     "",
     "> [!NOTE]",
     "> **Investigation queued** — Sherlock will update this comment when the investigation is complete.",
+    "",
+    "```text",
+    QUEUED_INVESTIGATION_ASCII_ART,
+    "```",
   ].join("\n");
 }
 

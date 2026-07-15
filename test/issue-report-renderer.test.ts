@@ -8,12 +8,14 @@ import {
   canonicalGitHubPullRequestUrl,
   extractAnalysisText,
   normalizeInvestigationReportData,
+  QUEUED_INVESTIGATION_ASCII_ART,
   renderIssueReport,
   renderQueuedIssueReport,
   renderWorkerFailureIssueReport,
   type InvestigationReportData,
   type ReportPullRequest,
 } from "../backend/services/issue-report-renderer.js";
+import { deliveryCommentMarker } from "../backend/services/delivery.js";
 import type { InvestigationSummary } from "../backend/services/report.js";
 
 const INV = "inv_0RENDER12345";
@@ -141,7 +143,7 @@ function expectPrivateReport(rendered: string) {
 }
 
 describe("queued report", () => {
-  test("contains the queued status and no identifiers", () => {
+  test("contains the queued status, artwork, and unchanged delivery marker", () => {
     const rendered = renderQueuedIssueReport();
     expect(rendered).toBe(
       [
@@ -149,9 +151,46 @@ describe("queued report", () => {
         "",
         "> [!NOTE]",
         "> **Investigation queued** — Sherlock will update this comment when the investigation is complete.",
+        "",
+        "```text",
+        QUEUED_INVESTIGATION_ASCII_ART,
+        "```",
       ].join("\n"),
     );
+    expect(rendered).toContain(`\`\`\`text\n${QUEUED_INVESTIGATION_ASCII_ART}\n\`\`\``);
+    expect(rendered.split(QUEUED_INVESTIGATION_ASCII_ART)).toHaveLength(2);
+
+    const marker = deliveryCommentMarker(INV);
+    expect(marker).toBe(`<!-- sherlock-delivery-comment:${INV} -->`);
+    const queuedComment = [rendered, marker].join("\n\n");
+    expect(queuedComment).toContain(
+      `\n\n<!-- sherlock-delivery-comment:${INV} -->`,
+    );
+    expect(queuedComment).toContain(marker);
     expectPrivateReport(rendered);
+  });
+
+  test("does not appear in completed, failed, or reproduced-without-fix reports", () => {
+    const completed = renderIssueReport(verifiedReport(), {
+      status: "created",
+      url: "https://github.com/acme/app/pull/7",
+    });
+    const failed = renderWorkerFailureIssueReport({ error: "worker stopped" });
+    const reproducedWithoutFix = renderIssueReport(
+      buildInvestigationReportData({
+        summary: verifiedSummary({
+          outcome: "reproduced",
+          originalOutcome: null,
+          verification: null,
+          pullRequestStatus: null,
+        }),
+      }),
+      null,
+    );
+
+    for (const rendered of [completed, failed, reproducedWithoutFix]) {
+      expect(rendered).not.toContain(QUEUED_INVESTIGATION_ASCII_ART);
+    }
   });
 });
 
