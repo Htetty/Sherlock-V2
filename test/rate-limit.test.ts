@@ -25,6 +25,7 @@ import {
   type WorkerDeps,
 } from "../backend/queue/process-investigation.js";
 import type { InvestigationJobPayload } from "../backend/queue/investigation-queue.js";
+import { createInMemoryDeliveryStateStore } from "../backend/services/delivery.js";
 import type { InvestigationPipelineResult } from "../backend/services/investigation.js";
 
 const noLog = () => {};
@@ -390,6 +391,21 @@ describe("investigation concurrency gate", () => {
     ).toBe(false);
   });
 
+  test("owned lease members retain the investigation id for cleanup fencing", async () => {
+    const clock = { now: 1_000 };
+    const { gate, zsets } = buildGate(clock);
+    const slot = {
+      tenantKey: "tenant-gh-1",
+      repoKey: "o/r",
+      investigationId: "inv_A",
+      leaseId: "lease-owner",
+    };
+
+    expect((await gate.acquireInvestigationConcurrency(slot)).acquired).toBe(true);
+    const members = [...zsets.values()].flatMap((set) => [...set.keys()]);
+    expect(members).toEqual(["inv_A|lease-owner", "inv_A|lease-owner"]);
+  });
+
   test("limits of 0 disable the corresponding dimension", async () => {
     const clock = { now: 1_000 };
     const { gate } = buildGate(clock, { tenantLimit: 0, repoLimit: 0, slotTtlSeconds: 10 });
@@ -486,6 +502,14 @@ function buildWorkerDeps(
         }) as InvestigationPipelineResult),
     getInstallationToken: async () => null,
     postIssueComment: async () => {},
+    delivery: {
+      store: createInMemoryDeliveryStateStore(),
+      enqueue: async () => {},
+      createGitHubClient: () => {
+        throw new Error("The delivery GitHub client should not be used in this test.");
+      },
+      findTerminalComment: async () => false,
+    },
     log: noLog,
   };
 }

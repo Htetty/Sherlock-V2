@@ -9,6 +9,17 @@
 
 import { DelayedError, UnrecoverableError } from "bullmq";
 import { randomUUID } from "node:crypto";
+import {
+  buildDeliveryState,
+  runDeliveryFromState,
+  DeliveryRetryableError,
+  type DeliveryExecutorDeps,
+  type DeliveryGitHubClient,
+  type DeliveryState,
+  type DeliveryStateStore,
+  type TerminalFailureCategory,
+  type TerminalFailureRecord,
+} from "../services/delivery.js";
 import type {
   InvestigationPipelineInput,
   InvestigationPipelineResult,
@@ -26,7 +37,10 @@ import {
   type InvestigationStateEventInput,
   type InvestigationStateStore,
 } from "../services/investigation-state-store.js";
-import type { InvestigationJobPayload } from "./investigation-queue.js";
+import type {
+  DeliveryJobPayload,
+  InvestigationJobPayload,
+} from "./investigation-queue.js";
 
 export type InvestigationJobLike = {
   data: InvestigationJobPayload;
@@ -41,6 +55,9 @@ export type WorkerDeps = {
     options: {
       onStage?: (stage: InvestigationStage) => void | Promise<void>;
       signal?: AbortSignal;
+      onTerminalResult?: (
+        result: InvestigationPipelineResult,
+      ) => void | Promise<void>;
     },
   ) => Promise<InvestigationPipelineResult>;
   // Mints a short-lived installation token from the GitHub App credentials;
@@ -57,15 +74,66 @@ export type WorkerDeps = {
     repo: string;
     issueNumber: number;
     body: string;
+    assertOwnership?: () => Promise<void>;
   }) => Promise<void>;
+  updateIssueComment?: DeliveryExecutorDeps["updateIssueComment"];
   reportStage?: (stage: InvestigationStage) => void | Promise<void>;
   // Lifecycle state store. Worker-level writes (queued/running before the
   // pipeline runs, and a terminal failure when setup fails before the pipeline)
   // go through here so an investigation that dies during token/auth setup still
   // leaves a state record. Optional and best-effort: never fails the job.
   stateStore?: InvestigationStateStore;
+  // GitHub delivery: durable state store, delivery-only retry job producer,
+  // and the GitHub surfaces the idempotent delivery executor needs. See
+  // services/delivery.ts for the contract.
+  delivery: {
+    store: DeliveryStateStore;
+    enqueue: (payload: DeliveryJobPayload) => Promise<void>;
+    createGitHubClient: (input: {
+      token: string;
+      owner: string;
+      repo: string;
+    }) => DeliveryGitHubClient;
+    findTerminalComment: (input: {
+      installationId: number;
+      owner: string;
+      repo: string;
+      issueNumber: number;
+      marker: string;
+      reusableMarker: string;
+      assertOwnership: () => Promise<void>;
+    }) => ReturnType<DeliveryExecutorDeps["findTerminalComment"]>;
+  };
+  failedArtifactRetentionMs?: number;
   log?: (message: string) => void;
 };
+
+// Deliberately excludes runPipeline and every execution-stage adapter. A
+// delivery-only processor can be constructed and tested without clone,
+// Anthropic, reproduction, fixer, sandbox, or validation capabilities.
+export type DeliveryWorkerDeps = Pick<
+  WorkerDeps,
+  | "getInstallationToken"
+  | "postIssueComment"
+  | "updateIssueComment"
+  | "stateStore"
+  | "delivery"
+  | "log"
+>;
+
+function toDeliveryExecutorDeps(deps: DeliveryWorkerDeps): DeliveryExecutorDeps {
+  return {
+    deliveryStore: deps.delivery.store,
+    stateStore: deps.stateStore,
+    getInstallationToken: deps.getInstallationToken,
+    createGitHubClient: deps.delivery.createGitHubClient,
+    postIssueComment: deps.postIssueComment,
+    updateIssueComment: deps.updateIssueComment,
+    findTerminalComment: deps.delivery.findTerminalComment,
+    isRetryableError: isTransientInfrastructureError,
+    log: deps.log,
+  };
+}
 
 const TRANSIENT_ERROR_CODES = new Set([
   "ECONNRESET",
@@ -148,6 +216,42 @@ export function formatWorkerFailureComment(
       "Any artifacts collected before the failure were preserved on the Sherlock server.",
     ].join("\n"),
   );
+}
+
+function terminalFailureCategory(
+  error: unknown,
+  pipelineStarted: boolean,
+): TerminalFailureCategory {
+  return error instanceof RepositoryError
+    ? "repository"
+    : isTransientInfrastructureError(error)
+      ? "infrastructure"
+      : !pipelineStarted
+        ? "preflight"
+        : "worker";
+}
+
+function retryableWorkerFailureMessage(error: unknown): string {
+  if (error instanceof DeliveryRetryableError) {
+    return "Delivery reconciliation is temporarily unavailable.";
+  }
+  if (error instanceof RepositoryError) {
+    return "A repository operation is temporarily unavailable; the job will retry.";
+  }
+  return "An infrastructure operation is temporarily unavailable; the job will retry.";
+}
+
+function terminalWorkerFailureMessage(category: TerminalFailureCategory): string {
+  switch (category) {
+    case "repository":
+      return "Repository access failed after the configured attempts.";
+    case "infrastructure":
+      return "Infrastructure failed after the configured attempts.";
+    case "preflight":
+      return "Worker preflight failed permanently.";
+    case "worker":
+      return "The investigation worker failed permanently.";
+  }
 }
 
 // How long a concurrency-blocked job waits before the queue retries it.
@@ -256,6 +360,7 @@ export async function processInvestigationJob(
 ): Promise<{ investigationId: string; outcome: string }> {
   const payload = job.data;
   const log = deps.log ?? (() => {});
+  let latestStage: InvestigationStage = "queued";
 
   // Best-effort, non-fatal worker-level state writes. A failing store must
   // never fail the job (which would trigger a spurious retry).
@@ -274,6 +379,7 @@ export async function processInvestigationJob(
   };
 
   const reportStage = async (stage: InvestigationStage) => {
+    latestStage = stage;
     if (stage !== "failed") {
       signal?.throwIfAborted();
     }
@@ -287,10 +393,138 @@ export async function processInvestigationJob(
     }
   };
 
+  const attemptsAllowed = job.opts?.attempts ?? 1;
+  const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
+
+  // --- Delivery-only resume guard -------------------------------------------
+  // A persisted delivery state means execution already reached a terminal
+  // result on a previous attempt (or the worker crashed/stalled after it).
+  // Never rerun the pipeline: finish GitHub delivery from the durable state.
+  let existingDeliveryState: DeliveryState | null;
+  let existingTerminalFailure: TerminalFailureRecord | null;
+  try {
+    existingDeliveryState = await deps.delivery.store.load(
+      payload.investigationId,
+    );
+    existingTerminalFailure = await deps.delivery.store.loadTerminalFailure(
+      payload.investigationId,
+    );
+  } catch (error) {
+    const message = safeErrorMessage(error);
+    // An unreadable durable state is never equivalent to "execution has not
+    // happened". Retry the read, but never enter the pipeline on this attempt.
+    if (!isFinalAttempt) {
+      throw new Error(message);
+    }
+    throw new UnrecoverableError(`[${payload.investigationId}] ${message}`);
+  }
+
+  if (existingTerminalFailure) {
+    if (
+      existingTerminalFailure.tenantId !== payload.tenantId ||
+      existingTerminalFailure.repoOwner !== payload.repositoryOwner ||
+      existingTerminalFailure.repoName !== payload.repositoryName
+    ) {
+      throw new UnrecoverableError(
+        `[${payload.investigationId}] Terminal failure state does not match the investigation job.`,
+      );
+    }
+    log(
+      `[${payload.investigationId}] Terminal infrastructure failure already exists; the investigation pipeline will not rerun.`,
+    );
+    throw new UnrecoverableError(
+      `[${payload.investigationId}] Investigation already terminalized at ${existingTerminalFailure.stage}.`,
+    );
+  }
+
+  if (existingDeliveryState) {
+    if (
+      existingDeliveryState.tenantId !== payload.tenantId ||
+      existingDeliveryState.installationId !== payload.installationId ||
+      existingDeliveryState.repoOwner !== payload.repositoryOwner ||
+      existingDeliveryState.repoName !== payload.repositoryName ||
+      existingDeliveryState.issueNumber !== payload.issueNumber
+    ) {
+      throw new UnrecoverableError(
+        `[${payload.investigationId}] Delivery state does not match the investigation job; refusing to deliver.`,
+      );
+    }
+
+    log(
+      `[${payload.investigationId}] Terminal execution state already exists; resuming delivery only (no pipeline rerun).`,
+    );
+
+    try {
+      await reportStage("delivering");
+      const { state: delivered, complete } = await runDeliveryFromState(
+        existingDeliveryState,
+        toDeliveryExecutorDeps(deps),
+        { isFinalAttempt },
+      );
+
+      if (!complete) {
+        await reportStage("failed");
+        throw new UnrecoverableError(
+          `[${payload.investigationId}] Delivery incomplete: terminal comment ${delivered.terminalComment.status}${delivered.terminalComment.reason ? ` (${delivered.terminalComment.reason})` : ""}.`,
+        );
+      }
+
+      await reportStage("completed");
+      return {
+        investigationId: payload.investigationId,
+        outcome: delivered.executionOutcome,
+      };
+    } catch (error) {
+      if (error instanceof UnrecoverableError) {
+        throw error;
+      }
+
+      const message = safeErrorMessage(error);
+
+      if (error instanceof DeliveryRetryableError) {
+        log(
+          `[${payload.investigationId}] Delivery retry failed transiently; durable delivery remains pending: ${message}`,
+        );
+        await recordState({
+          type: "error",
+          stage: "delivery",
+          message,
+          retryable: true,
+        });
+        throw new Error(message);
+      }
+
+      await recordState({ type: "error", stage: "delivery", message });
+      throw new UnrecoverableError(`[${payload.investigationId}] ${message}`);
+    }
+  }
+
   // Set once the pipeline returns; distinguishes a pre-pipeline/worker-setup
   // failure (record a terminal worker outcome) from a post-pipeline failure
   // (the pipeline already recorded its own final outcome — do not overwrite).
   let pipelineResult: InvestigationPipelineResult | null = null;
+  let pipelineStarted = false;
+  let persistedDeliveryState: DeliveryState | null = null;
+  let deliveryPersistenceError: unknown = null;
+
+  const deliveryStateFor = (result: InvestigationPipelineResult) =>
+    buildDeliveryState({
+      investigationId: payload.investigationId,
+      tenantId: payload.tenantId,
+      installationId: payload.installationId,
+      repoOwner: payload.repositoryOwner,
+      repoName: payload.repositoryName,
+      issueNumber: payload.issueNumber,
+      issueTitle: payload.issueTitle,
+      outcome: result.outcome,
+      summary: result.summary,
+      fixVerified: result.fixAttempt?.outcome === "verified",
+      fixAttemptId: result.fixAttempt?.fixAttemptId ?? null,
+      analysisComment: result.commentSections?.analysis ?? null,
+      fixComment: result.commentSections?.fix ?? null,
+      pullRequest: result.pullRequest ?? null,
+      retryPlan: result.pullRequestRetryPlan ?? null,
+    }, deps.delivery.store);
 
   try {
     // Worker-level state before any setup runs, so an investigation that dies
@@ -298,6 +532,8 @@ export async function processInvestigationJob(
     // repo URL is derived from owner/name, never a caller-supplied URL.
     await recordState({
       type: "created",
+      tenantId: payload.tenantId,
+      installationId: payload.installationId,
       repoOwner: payload.repositoryOwner,
       repoName: payload.repositoryName,
       repoUrl: safeRepoUrl(payload.repositoryOwner, payload.repositoryName),
@@ -313,6 +549,7 @@ export async function processInvestigationJob(
 
     const installationAuth = await deps.getInstallationToken(payload.installationId);
 
+    pipelineStarted = true;
     const result = await deps.runPipeline(
       {
         investigationId: payload.investigationId,
@@ -329,29 +566,134 @@ export async function processInvestigationJob(
         installationToken: installationAuth?.token ?? null,
         installationPermissions: installationAuth?.permissions ?? null,
       },
-      { onStage: reportStage, signal },
+      {
+        onStage: reportStage,
+        signal,
+        onTerminalResult: async (terminalResult) => {
+          // Mark execution terminal before doing I/O so an error during this
+          // boundary can never trigger a contradictory worker-failure comment.
+          pipelineResult = terminalResult;
+          try {
+            const state = await deliveryStateFor(terminalResult);
+            await deps.delivery.store.save(state);
+            persistedDeliveryState = state;
+          } catch (error) {
+            deliveryPersistenceError = error;
+          }
+        },
+      },
     );
-    signal?.throwIfAborted();
     pipelineResult = result;
 
-    await deps.postIssueComment({
+    // --- Delivery phase ----------------------------------------------------
+    // Execution is terminal. Persist the durable delivery state first, so
+    // ANY later failure (comment post, worker crash, stalled-job recovery)
+    // retries GitHub delivery only and never the pipeline.
+    const deliveryPayload: DeliveryJobPayload = {
+      investigationId: payload.investigationId,
+      tenantId: payload.tenantId,
       installationId: payload.installationId,
-      owner: payload.repositoryOwner,
-      repo: payload.repositoryName,
+      repositoryOwner: payload.repositoryOwner,
+      repositoryName: payload.repositoryName,
       issueNumber: payload.issueNumber,
-      body: result.githubComment,
-    });
+    };
 
-    await reportStage("completed");
-    log(`[${payload.investigationId}] Job completed with outcome ${result.outcome}.`);
+    let deliveryState: DeliveryState;
+
+    try {
+      if (deliveryPersistenceError) {
+        throw deliveryPersistenceError;
+      }
+
+      // Injected/legacy pipeline adapters may not call onTerminalResult yet;
+      // keep the post-return save as a compatibility fallback. Production's
+      // real pipeline persists through the callback before workspace cleanup.
+      deliveryState =
+        persistedDeliveryState ?? (await deliveryStateFor(result));
+      if (!persistedDeliveryState) {
+        await deps.delivery.store.save(deliveryState);
+      }
+    } catch (stateError) {
+      const message = safeErrorMessage(stateError);
+      log(
+        `[${payload.investigationId}] Could not persist required delivery state; delivery is stopped without rerunning execution: ${message}`,
+      );
+      await recordState({
+        type: "error",
+        stage: "delivery",
+        message: `Durable delivery state could not be persisted: ${message}`,
+      });
+      throw new UnrecoverableError(
+        `[${payload.investigationId}] Durable delivery state could not be persisted: ${message}`,
+      );
+    }
+
+    await reportStage("delivering");
+    let deliveryDeferred = false;
+
+    // If a delivery-job enqueue fails, surface the original delivery error
+    // (or the enqueue error) as a normal retryable failure: the job then
+    // retries and the resume guard finishes delivery without the pipeline.
+    const enqueueDeliveryOrRethrow = async (cause: unknown) => {
+      try {
+        await deps.delivery.enqueue(deliveryPayload);
+        deliveryDeferred = true;
+        log(
+          `[${payload.investigationId}] Delivery-only retry job queued for unfinished GitHub delivery.`,
+        );
+      } catch (enqueueError) {
+        throw cause ?? enqueueError;
+      }
+    };
+
+    if (deliveryState.pullRequest.status === "pending") {
+      // Verified execution is complete. Branch, PR, and terminal-comment
+      // work starts only in the isolated delivery job.
+      log(
+        `[${payload.investigationId}] Verified execution is complete; deferring branch, pull-request, and terminal-comment delivery.`,
+      );
+      await enqueueDeliveryOrRethrow(null);
+    } else {
+      try {
+        const { state: delivered, complete } = await runDeliveryFromState(
+          deliveryState,
+          toDeliveryExecutorDeps(deps),
+          { isFinalAttempt: false },
+        );
+
+        if (!complete) {
+          // Permanent comment failure, already recorded truthfully; fail
+          // the job without posting any second, contradictory comment.
+          throw new UnrecoverableError(
+            `[${payload.investigationId}] Terminal comment delivery failed permanently: ${delivered.terminalComment.reason ?? "unknown"}.`,
+          );
+        }
+      } catch (error) {
+        if (error instanceof UnrecoverableError) {
+          throw error;
+        }
+
+        log(
+          `[${payload.investigationId}] Delivery failed transiently; deferring to the delivery-only retry job: ${safeErrorMessage(error)}`,
+        );
+        await enqueueDeliveryOrRethrow(error);
+      }
+    }
+    if (!deliveryDeferred) {
+      await reportStage("completed");
+    }
+    log(
+      `[${payload.investigationId}] Execution completed with outcome ${result.outcome}${deliveryDeferred ? "; delivery is queued" : " and delivery completed"}.`,
+    );
 
     return { investigationId: payload.investigationId, outcome: result.outcome };
   } catch (error) {
-    const attemptsAllowed = job.opts?.attempts ?? 1;
-    const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
-
-    if (isTransientInfrastructureError(error) && !isFinalAttempt) {
-      const transientMessage = safeErrorMessage(error);
+    if (
+      (isTransientInfrastructureError(error) ||
+        error instanceof DeliveryRetryableError) &&
+      !isFinalAttempt
+    ) {
+      const transientMessage = retryableWorkerFailureMessage(error);
       log(
         `[${payload.investigationId}] Transient failure (attempt ${job.attemptsMade + 1}/${attemptsAllowed}), will retry: ${transientMessage}`,
       );
@@ -372,13 +714,41 @@ export async function processInvestigationJob(
     // Final failure: preserve the investigation id and artifacts (the
     // pipeline's own cleanup already stopped sandboxes and containers),
     // report to GitHub, and stop retrying.
+    const terminalFailureStage = latestStage;
     await reportStage("failed");
 
     // Record a terminal worker-level state. Always append the error; only own
     // the final outcome when the pipeline never produced one (a pre-pipeline
     // or worker-setup failure), so a post-pipeline failure — e.g. GitHub
     // comment posting — cannot overwrite the pipeline's real outcome.
-    const failureMessage = safeErrorMessage(error);
+    const failureCategory = terminalFailureCategory(error, pipelineStarted);
+    const failureMessage = terminalWorkerFailureMessage(failureCategory);
+    if (!pipelineResult) {
+      const terminalAt = new Date();
+      const failedRetentionMs = Math.max(
+        0,
+        deps.failedArtifactRetentionMs ?? 7 * 24 * 60 * 60_000,
+      );
+      try {
+        await deps.delivery.store.saveTerminalFailure({
+          version: 1,
+          investigationId: payload.investigationId,
+          tenantId: payload.tenantId,
+          repoOwner: payload.repositoryOwner,
+          repoName: payload.repositoryName,
+          category: failureCategory,
+          stage: terminalFailureStage,
+          terminalAt: terminalAt.toISOString(),
+          retentionEligibleAt: new Date(
+            terminalAt.getTime() + failedRetentionMs,
+          ).toISOString(),
+        });
+      } catch {
+        throw new UnrecoverableError(
+          `[${payload.investigationId}] Durable terminal failure state could not be persisted.`,
+        );
+      }
+    }
     await recordState({ type: "error", stage: "worker", message: failureMessage });
     if (!pipelineResult) {
       await recordState({
@@ -388,21 +758,144 @@ export async function processInvestigationJob(
       });
     }
 
-    await deps
-      .postIssueComment({
-        installationId: payload.installationId,
-        owner: payload.repositoryOwner,
-        repo: payload.repositoryName,
-        issueNumber: payload.issueNumber,
-        body: formatWorkerFailureComment(payload.investigationId, error),
-      })
-      .catch((commentError: unknown) => {
-        log(
-          `[${payload.investigationId}] Could not post failure comment: ${safeErrorMessage(commentError)}`,
-        );
-      });
+    // The failure comment is only for runs whose pipeline never completed.
+    // Once execution is terminal, all issue messaging belongs to the delivery
+    // layer — a worker failure comment here would be a second, contradictory
+    // terminal message.
+    if (!pipelineResult) {
+      await deps
+        .postIssueComment({
+          installationId: payload.installationId,
+          owner: payload.repositoryOwner,
+          repo: payload.repositoryName,
+          issueNumber: payload.issueNumber,
+          body: formatWorkerFailureComment(
+            payload.investigationId,
+            new Error(failureMessage),
+          ),
+        })
+        .catch((commentError: unknown) => {
+          log(
+            `[${payload.investigationId}] Could not post failure comment: ${safeErrorMessage(commentError)}`,
+          );
+        });
+    }
 
     // The message becomes the job's stored BullMQ failed reason; redacted.
     throw new UnrecoverableError(`[${payload.investigationId}] ${failureMessage}`);
+  }
+}
+
+// --- Delivery-only job processing -------------------------------------------
+
+export type DeliveryJobLike = {
+  data: DeliveryJobPayload;
+  attemptsMade: number;
+  opts?: { attempts?: number };
+};
+
+// Finishes GitHub delivery for an investigation whose execution already
+// produced a terminal result. Loads the durable delivery state and runs the
+// idempotent executor; the investigation pipeline (clone, reproduction,
+// model calls, fixing, validation) is deliberately unreachable from here.
+export async function processDeliveryJob(
+  job: DeliveryJobLike,
+  deps: DeliveryWorkerDeps,
+): Promise<{ investigationId: string; outcome: string }> {
+  const payload = job.data;
+  const log = deps.log ?? (() => {});
+  const attemptsAllowed = job.opts?.attempts ?? 1;
+  const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
+
+  const recordState = async (event: InvestigationStateEventInput) => {
+    try {
+      await deps.stateStore?.record({
+        ...event,
+        investigationId: payload.investigationId,
+        at: new Date().toISOString(),
+      } as InvestigationStateEvent);
+    } catch (stateError) {
+      log(
+        `[${payload.investigationId}] Delivery-job state write failed ("${event.type}"); continuing: ${safeErrorMessage(stateError)}`,
+      );
+    }
+  };
+
+  let state: DeliveryState | null;
+
+  try {
+    state = await deps.delivery.store.load(payload.investigationId);
+  } catch (error) {
+    const message = safeErrorMessage(error);
+
+    if (!isFinalAttempt) {
+      throw new Error(message);
+    }
+
+    throw new UnrecoverableError(`[${payload.investigationId}] ${message}`);
+  }
+
+  if (!state) {
+    throw new UnrecoverableError(
+      `[${payload.investigationId}] No delivery state was found; nothing can be delivered.`,
+    );
+  }
+
+  // Defensive identity check: the job must only ever act on the repository
+  // and issue the persisted state belongs to.
+  if (
+    state.tenantId !== payload.tenantId ||
+    state.installationId !== payload.installationId ||
+    state.repoOwner !== payload.repositoryOwner ||
+    state.repoName !== payload.repositoryName ||
+    state.issueNumber !== payload.issueNumber
+  ) {
+    throw new UnrecoverableError(
+      `[${payload.investigationId}] Delivery state does not match the job payload; refusing to deliver.`,
+    );
+  }
+
+  try {
+    const { state: delivered, complete } = await runDeliveryFromState(
+      state,
+      toDeliveryExecutorDeps(deps),
+      { isFinalAttempt },
+    );
+
+    if (!complete) {
+      throw new UnrecoverableError(
+        `[${payload.investigationId}] Delivery incomplete: terminal comment ${delivered.terminalComment.status}${delivered.terminalComment.reason ? ` (${delivered.terminalComment.reason})` : ""}.`,
+      );
+    }
+
+    log(
+      `[${payload.investigationId}] Delivery completed (pull request: ${delivered.pullRequest.status}, comment: ${delivered.terminalComment.status}).`,
+    );
+    return {
+      investigationId: payload.investigationId,
+      outcome: delivered.executionOutcome,
+    };
+  } catch (error) {
+    if (error instanceof UnrecoverableError) {
+      throw error;
+    }
+
+    const message = safeErrorMessage(error);
+
+    if (error instanceof DeliveryRetryableError) {
+      log(
+        `[${payload.investigationId}] Delivery attempt ${job.attemptsMade + 1}/${attemptsAllowed} failed transiently; durable delivery remains pending: ${message}`,
+      );
+      await recordState({
+        type: "error",
+        stage: "delivery",
+        message,
+        retryable: true,
+      });
+      throw new Error(message);
+    }
+
+    await recordState({ type: "error", stage: "delivery", message });
+    throw new UnrecoverableError(`[${payload.investigationId}] ${message}`);
   }
 }

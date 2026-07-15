@@ -16,7 +16,7 @@ host with `npm run worker:check`.
 | Target image (`SHERLOCK_TARGET_IMAGE`, default `node:20-slim`) | base image for target containers | mandatory (pullable is enough) |
 | Redis (`REDIS_URL`, default `redis://localhost:6379`) | BullMQ queue | mandatory |
 | Playwright Chromium + native libs | reproduction browser (runs on the worker itself) | mandatory |
-| Writable `ARTIFACTS_DIR` (default `./artifacts`) | investigation evidence | mandatory |
+| Writable `ARTIFACTS_DIR` (default `./artifacts`) | investigation evidence and durable delivery state; every worker replica must mount the same shared POSIX volume | mandatory |
 | Writable `SHERLOCK_DATA_DIR` (default `~/.sherlock`) | repo memory | mandatory |
 | Writable temp dir | clone workspaces | mandatory |
 | `graphify` on PATH (`uv tool install "graphifyy[anthropic]"`) | graph repository context | optional — the pipeline degrades to heuristic context without it (WARN, not FAIL) |
@@ -30,6 +30,27 @@ Required environment variables (values are never printed by any check):
   (`claude-sonnet-5`) used for all model calls
 - `REDIS_URL` — optional; the default is reported explicitly when unset
 - `SHERLOCK_TARGET_IMAGE`, `ARTIFACTS_DIR`, `SHERLOCK_DATA_DIR` — optional overrides
+- `SHERLOCK_SUCCESSFUL_ARTIFACT_RETENTION_HOURS` — raw-artifact retention
+  after a verified fix, pull request, and terminal comment are fully delivered
+  (default `0`, immediate)
+- `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` — raw-artifact retention for
+  terminal non-success investigations, measured from confirmed terminal
+  comment delivery (default `168`, seven days)
+- `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` — periodic bounded scan
+  interval (default `60`; `0` disables periodic scans)
+- `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` — run a detached bounded scan when
+  the worker starts (default `true`)
+- `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` — maximum artifact-root entries
+  and pending queue jobs considered by one scan (default `250`; excess queue
+  state makes cleanup retain everything)
+- `SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS`,
+  `SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS`, and
+  `SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS` — shared Redis heartbeat timing
+  (defaults `15`, `45`, and `60`; interval must remain below max age below TTL)
+- `SHERLOCK_QUEUE_MAX_WAIT_AGE_SECONDS` — oldest-waiting warning threshold
+  used by the production ops check (default `600`)
+- `SHERLOCK_DISK_WARNING_PERCENT` and `SHERLOCK_DISK_CRITICAL_PERCENT` —
+  filesystem thresholds (defaults `80` and `90`)
 - `SHERLOCK_STATE_STORE` — optional; `file` or `supabase` enables durable
   investigation-state persistence (see "Investigation state store" below).
   When `supabase`, also set `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`
@@ -51,6 +72,28 @@ default) runs the preflight before the BullMQ worker is created; if a
 mandatory check fails, the process exits nonzero **before consuming any
 job**. Asynchronous Redis/worker errors are logged through a redacting
 error handler instead of failing silently.
+
+## Runtime health and production checks
+
+Every worker writes a small per-instance heartbeat to shared Redis with a TTL.
+The Compose healthcheck runs `npm run worker:health`, which requires the
+current container's own heartbeat to be fresh; a live-but-stuck process or a
+worker that cannot update Redis therefore does not stay healthy forever.
+Graceful shutdown removes only the record owned by that process, and a crash
+leaves a record that expires. Replica hostnames keep scaled workers separate.
+
+Run `npm run ops:check:prod` inside the worker container for a safe combined
+report covering API liveness, Redis, all worker heartbeats, queue counts and
+oldest waiting/delayed ages, artifact/data/temp/root filesystem capacity, and
+the most recent Phase 2 cleanup counters. A critical required filesystem,
+missing fresh heartbeat, unreachable API/Redis, or unavailable queue fails
+nonzero. Optional host Docker storage is reported unavailable unless a
+trustworthy host path is mounted and configured with
+`SHERLOCK_DOCKER_STORAGE_PATH`.
+
+These checks do not call GitHub or Anthropic, start Docker workloads, read job
+payloads/artifact contents, or prove a full investigation can succeed. Use the
+deployment runbook's controlled end-to-end investigation for that evidence.
 
 ## Building and running the production image
 
@@ -148,6 +191,45 @@ Security:
   `SUPABASE_SERVICE_ROLE_KEY` is missing, runtime writes stay non-fatal
   (swallowed by the pipeline) and `npm run worker:check` fails clearly
   (`state-store:supabase`).
+
+## Investigation artifact retention
+
+The worker treats raw investigation artifacts as a separate storage class
+from repository memory, graph caches, Redis queue state, and Supabase rows.
+Cleanup only targets a validated `ARTIFACTS_DIR/inv_*` directory. It never
+targets `SHERLOCK_DATA_DIR`, Redis, or Supabase.
+
+Deletion eligibility is proved from the local `delivery-state.json`. A
+verified fix is eligible only after its branch is pushed, its pull request is
+created or safely reused, and its terminal issue comment is confirmed posted.
+Non-success outcomes begin their retention clock only after the terminal
+comment is posted. A permanently failed terminal comment, or a posted terminal
+comment that truthfully records blocked/failed PR delivery, uses
+`SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` (default seven days); it is not kept
+forever. Pending delivery, missing or malformed delivery state,
+active/delayed/waiting BullMQ work, and a live investigation concurrency lease
+all retain artifacts.
+
+Delivery retries and cleanup coordinate through a short ownership-token lease
+on that shared POSIX artifact volume. This is local mutual exclusion and crash
+recovery, not an atomic fence around GitHub. Branches, pull requests, and owned
+comments are reconciled before creation and after ambiguous responses. A
+terminal-comment create with a lost acknowledgement is not blindly repeated;
+an operator may need to resolve a still-ambiguous pending delivery.
+
+The local delivery-state format remains version 2. Version-2 files written by
+commit `ea99a10` are compatible: their two bounded protected-payload references
+are integrity-checked and renamed to `protected-delivery/<sha256>` on first
+load. Older/unknown state versions fail closed; finish or explicitly migrate
+their pending deliveries with the version that created them before upgrading.
+
+The worker checks eligibility after BullMQ emits a completed event, starts one
+bounded scan without delaying worker startup, and repeats the scan at the
+configured interval. Cleanup is idempotent and best-effort: filesystem or
+Redis uncertainty retains artifacts and does not change the investigation
+result. Deleting raw artifacts removes manual replay/debug evidence, but does
+not delete repository memory under `SHERLOCK_DATA_DIR/memory`, graph caches,
+structured Supabase state, or queue records.
 
 ## Not included (deliberately, for now)
 

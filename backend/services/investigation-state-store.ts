@@ -38,6 +38,8 @@ export type InvestigationStateEvent =
       type: "created";
       investigationId: string;
       at: string;
+      tenantId?: string;
+      installationId?: number;
       repoOwner?: string;
       repoName?: string;
       repoUrl?: string;
@@ -107,6 +109,16 @@ export type InvestigationStateEvent =
       error?: string | null;
     }
   | {
+      // Terminal-issue-comment delivery status: the comment on the GitHub
+      // issue is a separately retried delivery step, so its outcome is
+      // recorded independently of the pipeline's execution outcome.
+      type: "terminal_comment";
+      investigationId: string;
+      at: string;
+      status: "posted" | "failed";
+      error?: string | null;
+    }
+  | {
       type: "error";
       investigationId: string;
       at: string;
@@ -134,6 +146,8 @@ export type InvestigationStateRecord = {
   updatedAt: string;
   status: "running" | "finished";
   stage: InvestigationStage | null;
+  tenantId?: string;
+  installationId?: number;
   repoOwner?: string;
   repoName?: string;
   repoUrl?: string;
@@ -171,7 +185,20 @@ export type InvestigationStateRecord = {
     url: string | null;
     branch: string | null;
   } | null;
+  // Delivery status of the terminal issue comment, recorded separately from
+  // the execution outcome so "verified fix" can never silently imply "the
+  // user was told about it".
+  terminalComment: {
+    status: "posted" | "failed";
+    at: string;
+    error?: string | null;
+  } | null;
   outcome: string | null;
+  // Original execution outcome (e.g. the reproduction outcome behind a
+  // verified_fix) and the pull-request status at the time the final outcome
+  // was recorded — previously carried on the event but dropped by the reducer.
+  originalOutcome?: string | null;
+  pullRequestStatus?: string | null;
   finishedAt: string | null;
   errors: {
     at: string;
@@ -208,6 +235,7 @@ function emptyRecord(
     repositoryValidation: null,
     regressionProof: null,
     pullRequest: null,
+    terminalComment: null,
     outcome: null,
     finishedAt: null,
     errors: [],
@@ -218,8 +246,19 @@ function emptyRecord(
 // redactSecrets scrubs tokens/credentials/secret-shaped assignments; anything
 // stored from user- or webhook-controlled text passes through here so no store
 // can persist a secret regardless of backend.
-function safeText(value: string): string {
-  return redactSecrets(value);
+const MAX_STATE_TEXT_CHARS = 2_000;
+const MAX_STATE_ERRORS = 20;
+const MAX_STATE_FILES = 50;
+
+function safeText(value: string, maxChars = MAX_STATE_TEXT_CHARS): string {
+  return redactSecrets(value).slice(0, maxChars);
+}
+
+function appendBoundedError(
+  errors: InvestigationStateRecord["errors"],
+  error: InvestigationStateRecord["errors"][number],
+): InvestigationStateRecord["errors"] {
+  return [...errors, error].slice(-MAX_STATE_ERRORS);
 }
 
 // Pure reducer shared by every implementation: fold one event into the
@@ -237,7 +276,12 @@ export function applyEvent(
 
   switch (event.type) {
     case "created":
-      record.createdAt = event.at;
+      // Idempotent: a delivery retry re-records identity to heal a state
+      // backend that was unavailable during execution, without shifting the
+      // original creation time.
+      record.createdAt = record.createdAt ?? event.at;
+      if (event.tenantId !== undefined) record.tenantId = safeText(event.tenantId);
+      if (event.installationId !== undefined) record.installationId = event.installationId;
       if (event.repoOwner !== undefined) record.repoOwner = safeText(event.repoOwner);
       if (event.repoName !== undefined) record.repoName = safeText(event.repoName);
       if (event.repoUrl !== undefined) record.repoUrl = safeText(event.repoUrl);
@@ -259,11 +303,15 @@ export function applyEvent(
       break;
     case "fixer_attempts":
       record.fixer = {
-        status: event.status,
+        status: event.status ? safeText(event.status, 200) : null,
         attempts: event.attempts,
-        outcome: event.outcome,
-        changedFiles: event.changedFiles,
-        verifiedFixAttemptId: event.verifiedFixAttemptId,
+        outcome: event.outcome ? safeText(event.outcome, 200) : null,
+        changedFiles: event.changedFiles
+          .slice(0, MAX_STATE_FILES)
+          .map((file) => safeText(file, 500)),
+        verifiedFixAttemptId: event.verifiedFixAttemptId
+          ? safeText(event.verifiedFixAttemptId, 200)
+          : null,
       };
       break;
     case "repository_validation":
@@ -291,25 +339,38 @@ export function applyEvent(
       break;
     case "final_outcome":
       record.status = "finished";
-      record.finishedAt = event.at;
+      // Keep the first terminal timestamp; delivery-retry heals re-record the
+      // outcome without pretending the investigation finished later.
+      record.finishedAt = record.finishedAt ?? event.at;
       record.outcome = event.outcome;
+      if (event.originalOutcome !== undefined) {
+        record.originalOutcome = event.originalOutcome;
+      }
+      if (event.pullRequestStatus !== undefined) {
+        record.pullRequestStatus = event.pullRequestStatus;
+      }
       if (event.error != null) {
-        record.errors = [
-          ...record.errors,
-          { at: event.at, stage: "final", message: redactSecrets(event.error) },
-        ];
+        record.errors = appendBoundedError(record.errors, {
+          at: event.at,
+          stage: "final",
+          message: safeText(event.error),
+        });
       }
       break;
+    case "terminal_comment":
+      record.terminalComment = {
+        status: event.status,
+        at: event.at,
+        ...(event.error != null ? { error: safeText(event.error) } : {}),
+      };
+      break;
     case "error":
-      record.errors = [
-        ...record.errors,
-        {
-          at: event.at,
-          stage: event.stage,
-          message: redactSecrets(event.message),
-          ...(event.retryable !== undefined ? { retryable: event.retryable } : {}),
-        },
-      ];
+      record.errors = appendBoundedError(record.errors, {
+        at: event.at,
+        stage: event.stage ? safeText(event.stage, 200) : null,
+        message: safeText(event.message),
+        ...(event.retryable !== undefined ? { retryable: event.retryable } : {}),
+      });
       break;
   }
 
@@ -502,15 +563,14 @@ export interface SupabaseStateStoreClient {
   listByUpdatedAtDesc(): Promise<InvestigationStateRecord[]>;
 }
 
-// Map a folded record to the persisted row. Only safe scalars are lifted out;
-// tenant/installation are not part of the record yet and are stored as null.
+// Map a folded record to the persisted row. Only safe scalars are lifted out.
 function investigationStateRecordToRow(
   record: InvestigationStateRecord,
 ): InvestigationStateRow {
   return {
     investigation_id: record.investigationId,
-    tenant_id: null,
-    installation_id: null,
+    tenant_id: record.tenantId ?? null,
+    installation_id: record.installationId ?? null,
     repo_owner: record.repoOwner ?? null,
     repo_name: record.repoName ?? null,
     issue_number: record.issueNumber ?? null,

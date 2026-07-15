@@ -15,21 +15,47 @@ import "dotenv/config";
 import { Worker, type Job } from "bullmq";
 import { createProbot } from "probot";
 import {
+  DELIVERY_JOB_NAME,
   INVESTIGATION_QUEUE_NAME,
+  createInvestigationQueue,
   createRedisConnection,
+  enqueueDeliveryJob,
+  type DeliveryJobPayload,
   type InvestigationJobPayload,
 } from "./queue/investigation-queue.js";
 import {
+  processDeliveryJob,
   processInvestigationJobWithConcurrency,
   type WorkerDeps,
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
+import {
+  createArtifactCleanupService,
+  createRedisArtifactCleanupProtection,
+  evaluateTerminalJobArtifactRetention,
+  getArtifactRetentionConfig,
+  startArtifactCleanupScheduler,
+} from "./services/artifact-retention.js";
+import {
+  createDeliveryGitHubRestClient,
+  createFileDeliveryStateStore,
+  reconcileTerminalCommentPaginated,
+} from "./services/delivery.js";
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
 import {
   asScriptRunner,
   createInvestigationConcurrencyGate,
 } from "./services/rate-limit.js";
+import {
+  asOperationalRedis,
+  cleanupResultOperationalRecord,
+  cleanupScanOperationalRecord,
+  createWorkerHeartbeat,
+  getProductionMonitoringConfig,
+  getWorkerId,
+  writeArtifactCleanupStatus,
+} from "./services/production-monitoring.js";
 import {
   describeWorkerError,
   enforceStartupChecks,
@@ -41,7 +67,11 @@ const concurrency = Math.max(
   Number(process.env.INVESTIGATION_WORKER_CONCURRENCY ?? 1) || 1,
 );
 
+const monitoringConfig = getProductionMonitoringConfig();
+const workerId = getWorkerId();
+
 const connection = createRedisConnection();
+const operationalRedis = asOperationalRedis(connection);
 
 // Reuses the GitHub App credentials (APP_ID / PRIVATE_KEY) already required
 // by the bot to mint short-lived installation tokens; secrets never travel
@@ -52,14 +82,60 @@ async function getInstallationOctokit(installationId: number) {
   return probot.auth(installationId);
 }
 
-// Lifecycle state store (no-op unless SHERLOCK_STATE_STORE=file); shared
-// across jobs. Never carries secrets and never fails an investigation.
+// Lifecycle state store (selected by SHERLOCK_STATE_STORE; no-op default);
+// shared across jobs. Never carries secrets and never fails an investigation.
 const stateStore = createInvestigationStateStoreFromEnv();
+
+// Durable delivery state under the artifacts volume, plus a queue producer
+// used to enqueue delivery-only retry jobs. The producer gets its own Redis
+// connection: the worker connection is reserved for blocking commands.
+const deliveryStore = createFileDeliveryStateStore();
+const deliveryQueueConnection = createRedisConnection();
+const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
+const artifactRetentionConfig = getArtifactRetentionConfig();
 
 const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
+  failedArtifactRetentionMs: artifactRetentionConfig.failedRetentionMs,
+  delivery: {
+    store: deliveryStore,
+    enqueue: (payload: DeliveryJobPayload) =>
+      enqueueDeliveryJob(deliveryQueue, payload),
+    createGitHubClient: createDeliveryGitHubRestClient,
+    findTerminalComment: async ({
+      installationId,
+      owner,
+      repo,
+      issueNumber,
+      marker,
+      reusableMarker,
+      assertOwnership,
+    }) => {
+      const octokit = await getInstallationOctokit(installationId);
+      return reconcileTerminalCommentPaginated({
+        terminalMarker: marker,
+        reusableMarker,
+        appId: Number(process.env.APP_ID),
+        assertOwnership,
+        listPage: async (page, perPage) => {
+          const { data } = await octokit.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: perPage,
+            page,
+          });
+          return data;
+        },
+      });
+    },
+  },
   runPipeline: (payload, pipelineOptions) =>
-    runInvestigationPipeline(payload, { ...pipelineOptions, stateStore }),
+    runInvestigationPipeline(payload, {
+      ...pipelineOptions,
+      stateStore,
+      deliveryPayloadStore: deliveryStore,
+    }),
   getInstallationToken: async (installationId) => {
     const octokit = await getInstallationOctokit(installationId);
     // Single token request: @octokit/auth-app's installation auth result
@@ -76,12 +152,37 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
 
     return { token: auth.token, permissions: auth.permissions ?? null };
   },
-  postIssueComment: async ({ installationId, owner, repo, issueNumber, body }) => {
+  postIssueComment: async ({
+    installationId,
+    owner,
+    repo,
+    issueNumber,
+    body,
+    assertOwnership,
+  }) => {
     const octokit = await getInstallationOctokit(installationId);
+    await assertOwnership?.();
     await octokit.rest.issues.createComment({
       owner,
       repo,
       issue_number: issueNumber,
+      body,
+    });
+  },
+  updateIssueComment: async ({
+    installationId,
+    owner,
+    repo,
+    commentId,
+    body,
+    assertOwnership,
+  }) => {
+    const octokit = await getInstallationOctokit(installationId);
+    await assertOwnership();
+    await octokit.rest.issues.updateComment({
+      owner,
+      repo,
+      comment_id: commentId,
       body,
     });
   },
@@ -101,6 +202,8 @@ const proceed = await enforceStartupChecks(
 
 if (!proceed) {
   await connection.quit().catch(() => {});
+  await deliveryQueue.close().catch(() => {});
+  await deliveryQueueConnection.quit().catch(() => {});
   process.exit(1);
 }
 
@@ -111,34 +214,88 @@ const concurrencyGate = createInvestigationConcurrencyGate(() =>
   asScriptRunner(connection),
 );
 
-const worker = new Worker<InvestigationJobPayload>(
+const artifactCleanup = createArtifactCleanupService({
+  deliveryStore,
+  protection: createRedisArtifactCleanupProtection({
+    queue: deliveryQueue,
+    redis: asScriptRunner(connection),
+  }),
+  config: artifactRetentionConfig,
+  log: (message) => console.log(message),
+});
+
+const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
   INVESTIGATION_QUEUE_NAME,
-  async (job: Job<InvestigationJobPayload>, token?: string) =>
-    processInvestigationJobWithConcurrency(
-      job,
+  async (job: Job<InvestigationJobPayload | DeliveryJobPayload>, token?: string) => {
+    // Delivery-only jobs finish GitHub delivery from durable state. They are
+    // cheap API work: no pipeline, and no tenant/repo concurrency slot.
+    if (job.name === DELIVERY_JOB_NAME) {
+      return processDeliveryJob(job as Job<DeliveryJobPayload>, deps);
+    }
+
+    const investigationJob = job as Job<InvestigationJobPayload>;
+
+    return processInvestigationJobWithConcurrency(
+      investigationJob,
       {
         ...deps,
         reportStage: async (stage) => {
-          console.log(`[${job.data.investigationId}] Stage: ${stage}`);
-          await job.updateProgress({ stage });
+          console.log(`[${investigationJob.data.investigationId}] Stage: ${stage}`);
+          await investigationJob.updateProgress({ stage });
         },
       },
       {
         gate: concurrencyGate,
         delayJob: async (delayMs) => {
-          await job.moveToDelayed(Date.now() + delayMs, token);
+          await investigationJob.moveToDelayed(Date.now() + delayMs, token);
         },
       },
-    ),
+    );
+  },
   { connection, concurrency },
 );
 
+const workerHeartbeat = createWorkerHeartbeat({
+  redis: operationalRedis,
+  workerId,
+  intervalMs: monitoringConfig.heartbeatIntervalMs,
+  ttlMs: monitoringConfig.heartbeatTtlMs,
+  log: (message) => console.error(message),
+});
+workerHeartbeat.start();
+
+async function publishCleanupStatus(
+  record: Parameters<typeof writeArtifactCleanupStatus>[1],
+) {
+  try {
+    await writeArtifactCleanupStatus(operationalRedis, record);
+  } catch {
+    console.error("[artifact-cleanup] Redis status update failed.");
+  }
+}
+
+function evaluateArtifactRetention(investigationId: string) {
+  // BullMQ has moved the job to its terminal set before this event. Cleanup
+  // remains detached and non-fatal; a delivery job that is still waiting,
+  // delayed, or active protects the artifacts through the activity probe.
+  void evaluateTerminalJobArtifactRetention({
+    cleanup: artifactCleanup,
+    investigationId,
+    onResult: (result) =>
+      publishCleanupStatus(cleanupResultOperationalRecord(workerId, result)),
+  });
+}
+
 worker.on("completed", (job) => {
   console.log(`[queue] Job ${job.id} completed.`);
+  evaluateArtifactRetention(job.data.investigationId);
 });
 
 worker.on("failed", (job, error) => {
   console.error(`[queue] Job ${job?.id} failed: ${describeWorkerError(error)}`);
+  if (job?.data.investigationId) {
+    evaluateArtifactRetention(job.data.investigationId);
+  }
 });
 
 // Redis/worker infrastructure errors surface asynchronously; log them
@@ -151,6 +308,16 @@ console.log(
   `Sherlock investigation worker started (queue "${INVESTIGATION_QUEUE_NAME}", concurrency ${concurrency}).`,
 );
 
+const stopArtifactCleanup = startArtifactCleanupScheduler({
+  cleanup: artifactCleanup,
+  config: artifactRetentionConfig,
+  onScanComplete: (result) => {
+    // Visibility is best-effort and must not hold the retention scheduler open
+    // during a Redis interruption.
+    void publishCleanupStatus(cleanupScanOperationalRecord(workerId, result));
+  },
+});
+
 // Graceful shutdown: worker.close() waits for active jobs, whose pipeline
 // finally-blocks stop sandbox processes/containers and clean workspaces.
 let shuttingDown = false;
@@ -161,11 +328,15 @@ async function shutdown(signal: string) {
   }
 
   shuttingDown = true;
+  stopArtifactCleanup();
   console.log(`Received ${signal}; closing worker, queue connection, and sandboxes...`);
 
   try {
     await worker.close();
+    await workerHeartbeat.stop();
+    await deliveryQueue.close();
     await connection.quit();
+    await deliveryQueueConnection.quit();
   } catch (error) {
     console.error("Error during shutdown:", error);
   }

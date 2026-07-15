@@ -108,6 +108,16 @@ Both services load this one file (`env_file`). Names by service:
 | `SUPABASE_SERVICE_ROLE_KEY` | ✓ | ✓ | **backend-only** secret; never ship to clients |
 | `SHERLOCK_SANDBOX_NETWORK_POLICY` | | ✓ | `strict` (default) or `permissive` |
 | `SHERLOCK_RUN_STARTUP_CHECKS` | | ✓ | set to `true` (compose does this) to fail fast |
+| `SHERLOCK_SUCCESSFUL_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `0` after fully delivered verified fix |
+| `SHERLOCK_FAILED_ARTIFACT_RETENTION_HOURS` | | ✓ | optional; default `168`, measured after terminal delivery is posted or permanently fails |
+| `SHERLOCK_ARTIFACT_CLEANUP_INTERVAL_MINUTES` | | ✓ | optional bounded scan interval; default `60` |
+| `SHERLOCK_ARTIFACT_CLEANUP_ON_STARTUP` | | ✓ | optional detached startup scan; default `true` |
+| `SHERLOCK_ARTIFACT_CLEANUP_MAX_DIRECTORIES` | | ✓ | optional scan bound; default `250` |
+| `SHERLOCK_WORKER_HEARTBEAT_INTERVAL_SECONDS` | | ✓ | optional Redis heartbeat interval; default `15` |
+| `SHERLOCK_WORKER_HEARTBEAT_MAX_AGE_SECONDS` | | ✓ | optional freshness limit; default `45` |
+| `SHERLOCK_WORKER_HEARTBEAT_TTL_SECONDS` | | ✓ | optional Redis expiry; default `60` |
+| `SHERLOCK_QUEUE_MAX_WAIT_AGE_SECONDS` | | ✓ | optional queue backlog warning age; default `600` |
+| `SHERLOCK_DISK_WARNING_PERCENT` / `SHERLOCK_DISK_CRITICAL_PERCENT` | | ✓ | optional filesystem thresholds; defaults `80` / `90` |
 | `WEBHOOK_PROXY_URL` | ✓ | | smee relay for non-public hosts; blank in prod |
 
 `NODE_ENV`, `SHERLOCK_RUN_STARTUP_CHECKS`, `TMPDIR`, and
@@ -316,6 +326,8 @@ doctor/smoke steps before anything goes live.
      node -e "fetch('http://127.0.0.1:4000/readyz').then(r=>r.text()).then(console.log)"
    # deep worker host check
    docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run worker:check
+   # concise API/Redis/worker/queue/storage/cleanup state
+   docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run ops:check:prod
    # redis health
    docker compose --env-file .env.production -f docker-compose.prod.yml exec redis redis-cli ping
    # recent logs (see Operating below for follow mode)
@@ -323,7 +335,7 @@ doctor/smoke steps before anything goes live.
    docker compose --env-file .env.production -f docker-compose.prod.yml logs --tail=100 worker
    ```
 
-   Expected: `ps` shows redis/api `healthy` and the worker running, `/readyz`
+   Expected: `ps` shows redis/api/worker `healthy`, `/readyz`
    returns ready, redis answers `PONG`, api logs show webhook deliveries once
    the App is pointed at the host, and worker logs show
    `PASS worker preflight`.
@@ -365,6 +377,47 @@ All commands below use the production env file; on a staging host substitute
 `--env-file .env.staging` (or use the `sherlock-compose` alias from
 [Required environment variables](#required-environment-variables)).
 
+**Production state check**
+
+```sh
+docker compose --env-file .env.production -f docker-compose.prod.yml exec worker npm run ops:check:prod
+```
+
+Run this after every deploy and on a five-minute schedule from the host. It
+prints only fixed labels, counts, ages, percentages, and PASS/WARN/FAIL. FAIL
+exits nonzero; WARN stays zero so an operator can distinguish urgent outages
+from capacity and backlog signals. It never reads queue payloads, artifact
+contents, environment values, or API response bodies.
+
+The signals answer different questions: `/healthz` proves the API process is
+serving; Redis PING proves the shared queue store responds; the expiring
+per-worker heartbeat proves a worker recently reached Redis; queue age and
+disk/cleanup status expose accumulating operational risk. None proves GitHub,
+Anthropic, Docker, a customer repository, and its tests can complete an
+investigation. Keep a controlled end-to-end investigation in the release
+procedure.
+
+Operator response:
+
+- **Missing/stale heartbeat:** inspect `docker compose ... ps worker` and the
+  worker's recent logs. Check Redis reachability and startup preflight before
+  restarting it. A stopped worker's record expires automatically.
+- **Old waiting work:** first verify a fresh heartbeat and active count, then
+  inspect worker capacity and delayed jobs. Scale only after ruling out a
+  repeatedly failing dependency or intentionally delayed retries.
+- **Disk warning/critical:** stop adding load at critical usage, inspect the
+  named volume/host filesystem and cleanup counters, and add capacity or fix
+  cleanup failures. Do not bulk-delete artifact directories; retention
+  protects active and incompletely delivered investigations.
+- **Cleanup warning:** use the last-run age, scanned/deleted/retained/protected/
+  failure counts, and oldest retained failure age to distinguish an idle
+  system from a failed or bounded scan. Cleanup uncertainty retains data.
+
+Docker Compose rotates each service's local `json-file` logs at 10 MB with
+three files by default. `SHERLOCK_DOCKER_LOG_MAX_SIZE` and
+`SHERLOCK_DOCKER_LOG_MAX_FILES` tune those bounds through `--env-file`; remote
+log shipping and host capacity alerts remain operator responsibilities.
+
 **Logs**
 
 ```sh
@@ -385,6 +438,13 @@ docker compose --env-file .env.production -f docker-compose.prod.yml restart wor
 
 The worker has a 120s stop grace period so an in-flight investigation can
 drain and its sibling containers are swept before exit; avoid `-t 0`.
+
+Do not run mixed old/new binaries during the opaque queue-ID upgrade. The
+normal single-host Compose recreate stops the old processes first and requires
+no queue drain: already-queued legacy IDs remain consumable, retained legacy
+webhook claims are checked during enqueue, and legacy delivery IDs remain
+protected from artifact cleanup. If a platform performs rolling replacement,
+stop webhook ingestion before replacing all api/worker replicas together.
 
 **Redeploy after a code change:**
 
@@ -425,8 +485,9 @@ docker compose --env-file .env.production -f docker-compose.prod.yml down
 
 ## Scaling workers
 
-The worker holds no ports and no per-replica state, so scale it horizontally
-on the host:
+The worker holds no ports, but delivery state and protected retry payloads are
+filesystem-coordinated. Scale it horizontally only when every replica mounts
+the same shared POSIX `ARTIFACTS_DIR` volume:
 
 ```sh
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d --scale worker=3
@@ -434,12 +495,14 @@ docker compose --env-file .env.production -f docker-compose.prod.yml up -d --sca
 
 Each replica pulls from the same queue; BullMQ distributes jobs. Total
 concurrency ≈ `replicas × INVESTIGATION_WORKER_CONCURRENCY`. Replicas share the
-host Docker daemon and the `/var/tmp/sherlock` root (each job clones into its
-own subdirectory, so this is safe). Size to host CPU/RAM and Docker capacity;
-past a single host, run worker replicas on additional hosts pointed at the same
-managed Redis. Do **not** `--scale api` on a single host without changing the
-published port mapping (a fixed host port cannot be shared by replicas) — put
-api replicas behind the reverse proxy instead.
+host Docker daemon, the shared artifacts volume, and the `/var/tmp/sherlock`
+root (each job clones into its own subdirectory, so this is safe). Size to host
+CPU/RAM and Docker capacity. Managed Redis alone is not enough for multi-host
+workers: the current architecture requires one shared POSIX artifact volume
+with correct directory-rename, mode, and mtime semantics on every worker. Do **not**
+`--scale api` on a single host without changing the published port mapping (a
+fixed host port cannot be shared by replicas) — put api replicas behind the
+reverse proxy instead.
 
 ## Using managed Redis instead of the bundled service
 
@@ -478,9 +541,10 @@ internet without TLS in front.
 
 ## Known limitations of this first deployment
 
-- **Single host.** api, worker, and (bundled) Redis co-locate. Multi-host is
-  supported by pointing workers at managed Redis, but there is no orchestrator
-  manifest (Kubernetes/Nomad) yet.
+- **Single host.** api, worker, and (bundled) Redis co-locate. Multi-host workers
+  are not supported by Redis alone; all workers currently require the same
+  shared POSIX artifact volume, and there is no orchestrator manifest
+  (Kubernetes/Nomad) yet.
 - **Bundled Redis is a convenience, not production-grade.** It is single-node,
   unauthenticated (reachable only on the compose-internal network), and its
   durability is one append-only volume on the same host — a host loss loses

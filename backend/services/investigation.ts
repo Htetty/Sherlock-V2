@@ -58,8 +58,12 @@ import {
 } from "./memory.js";
 import { truncateUtf8Bytes } from "./reproduction-evidence.js";
 import {
-  createFixPullRequest,
-  createGitHubRestClient,
+  capturePullRequestRetryPlan,
+  type DeliveryStateStore,
+  type PullRequestRetryPlan,
+} from "./delivery.js";
+import {
+  type PullRequestInput,
   type PullRequestResult,
 } from "./pull-request.js";
 import {
@@ -93,7 +97,6 @@ import {
 import {
   formatFixComment,
   formatAnalysisComment,
-  formatPullRequestComment,
   formatResultComment,
   redactSecrets,
   type InvestigationSummary,
@@ -112,7 +115,8 @@ export type InvestigationStage =
   | "reproducing"
   | "fixing"
   | "verifying"
-  | "opening_pull_request"
+  | "preparing_delivery"
+  | "delivering"
   | "completed"
   | "failed";
 
@@ -145,12 +149,27 @@ export type InvestigationPipelineResult = {
   claudeAnalysis?: unknown;
   fixAttempt?: FixAttemptResult | null;
   pullRequest?: PullRequestResult | null;
+  // The already-formatted comment sections behind githubComment, exposed
+  // separately so the delivery layer can rebuild a truthful terminal comment
+  // after a PR delivery retry changes the pull-request state.
+  commentSections?: { analysis: string | null; fix: string | null } | null;
+  // Captured while the verified workspace still exists: everything a
+  // workspace-less GitHub delivery retry needs (see delivery.ts). Null when
+  // there is no verified fix or capture was not possible.
+  pullRequestRetryPlan?: PullRequestRetryPlan | null;
   graphContextNotes?: string;
   memoryMatches?: number;
 };
 
 export type PipelineOptions = {
   onStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Called after a terminal result and lifecycle outcome are written, but
+  // before the pipeline returns and its workspace cleanup completes. The
+  // worker uses this boundary to durably persist delivery state, closing the
+  // restart window between terminal execution and delivery-job creation.
+  onTerminalResult?: (
+    result: InvestigationPipelineResult,
+  ) => void | Promise<void>;
   // Cooperative cancellation used by the worker's concurrency lease fence.
   signal?: AbortSignal;
   // Injectable for tests; production always uses the real authenticated
@@ -160,6 +179,7 @@ export type PipelineOptions = {
   // Defaults to the no-op store, so leaving this unset preserves behavior.
   // Writes are best-effort: a failing store never fails the investigation.
   stateStore?: InvestigationStateStore;
+  deliveryPayloadStore?: Pick<DeliveryStateStore, "persistPayload">;
 };
 
 export type ReproducerFallbackCase =
@@ -251,6 +271,8 @@ export async function runInvestigationPipeline(
       pullRequestStatus: summary.pullRequestStatus ?? null,
       error: summary.error ?? null,
     });
+
+    await options.onTerminalResult?.(finished);
 
     return finished;
   };
@@ -1117,23 +1139,23 @@ export async function runInvestigationPipeline(
       log("Fix verified; skipping analyzeIssue (fix attempt carries root cause and verification detail).");
     }
 
-    // Verified fix -> GitHub pull request. Only verified fixes may push.
+    // Verified fix -> capture a durable, credential-free delivery plan while
+    // the verified workspace still exists. Branch push and PR creation happen
+    // only after the pipeline returns, in the separately retried delivery
+    // stage. The execution pipeline never calls GitHub delivery APIs.
     let pullRequest: PullRequestResult | null = null;
+    let pullRequestRetryPlan: PullRequestRetryPlan | null = null;
 
     if (fixAttempt?.outcome === "verified") {
       try {
-        await reportStage("opening_pull_request");
+        await reportStage("preparing_delivery");
 
-        const token =
-          typeof payload.installationToken === "string" && payload.installationToken
-            ? payload.installationToken
-            : null;
         const attemptStore = await createArtifactStore(
           investigationId,
           fixAttempt.attemptDir,
         );
 
-        pullRequest = await createFixPullRequest({
+        const pullRequestInput: PullRequestInput = {
           investigationId,
           fixAttempt,
           store: attemptStore,
@@ -1144,37 +1166,39 @@ export async function runInvestigationPipeline(
           issueNumber: payload.issueNumber,
           issueTitle: payload.issueTitle,
           plan,
-          github: token
-            ? createGitHubRestClient({
-                token,
-                owner: payload.repoOwner,
-                repo: payload.repoName,
-              })
-            : null,
-          pushUrl: token
-            ? `https://x-access-token:${token}@github.com/${payload.repoOwner}/${payload.repoName}.git`
-            : null,
+          github: null,
+          pushUrl: null,
           abortSignal: options.signal,
+        };
+
+        pullRequestRetryPlan = await capturePullRequestRetryPlan(
+          pullRequestInput,
+          options.deliveryPayloadStore,
+        ).catch((error: unknown) => {
+          log(`Could not capture the pull-request retry plan: ${formatError(error)}`);
+          return null;
         });
         options.signal?.throwIfAborted();
 
         log(
-          `Pull request flow finished: ${pullRequest.status}${pullRequest.pullRequestUrl ? ` (${pullRequest.pullRequestUrl})` : ""}`,
+          pullRequestRetryPlan
+            ? "Verified fix delivery plan captured; branch and pull request work is deferred to the delivery job."
+            : "Verified fix delivery plan could not be captured; pull-request delivery will be reported as failed.",
         );
 
         await recordState({
           type: "pull_request",
-          status: pullRequest.status,
-          number: pullRequest.pullRequestNumber,
-          url: pullRequest.pullRequestUrl,
-          branch: pullRequest.branch,
+          status: pullRequestRetryPlan ? "pending" : "failed",
+          number: null,
+          url: null,
+          branch: null,
         });
       } catch (error) {
         options.signal?.throwIfAborted();
-        log(`Pull request flow failed unexpectedly: ${formatError(error)}`);
+        log(`Delivery-plan capture failed unexpectedly: ${formatError(error)}`);
         await recordState({
           type: "error",
-          stage: "opening_pull_request",
+          stage: "preparing_delivery",
           message: formatError(error),
         });
       }
@@ -1375,18 +1399,10 @@ export async function runInvestigationPipeline(
         })
       : null;
 
-    const pullRequestComment =
-      pullRequest && fixAttempt
-        ? formatPullRequestComment({
-            investigationId,
-            fixAttemptId: fixAttempt.fixAttemptId,
-            status: pullRequest.status,
-            pullRequestNumber: pullRequest.pullRequestNumber,
-            pullRequestUrl: pullRequest.pullRequestUrl,
-            branch: pullRequest.branch,
-            reason: pullRequest.reason,
-          })
-        : null;
+    // GitHub delivery owns the PR section so it can render from the final
+    // created/reused/failed state. The execution result never posts this
+    // pre-delivery comment.
+    const pullRequestComment = null;
 
     const analysisComment = !fixAttempt || fixAttempt.outcome !== "verified"
       ? formatAnalysisComment(claudeAnalysis)
@@ -1405,7 +1421,9 @@ export async function runInvestigationPipeline(
       summary.outcome = "verified_fix";
       summary.originalOutcome = result.outcome;
       summary.verification = "verified";
-      summary.pullRequestStatus = pullRequest?.status ?? "not_attempted";
+      summary.pullRequestStatus = pullRequestRetryPlan
+        ? "delivery_pending"
+        : "delivery_failed";
       log(
         `Final outcome: verified_fix (original reproduction: ${result.outcome}, pull request: ${summary.pullRequestStatus})`,
       );
@@ -1421,6 +1439,8 @@ export async function runInvestigationPipeline(
         claudeAnalysis,
         fixAttempt,
         pullRequest,
+        commentSections: { analysis: analysisComment, fix: fixComment },
+        pullRequestRetryPlan,
         graphContextNotes: graphContext.notes,
         memoryMatches: pastEntries.length,
       },
