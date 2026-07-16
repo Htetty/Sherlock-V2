@@ -1,5 +1,5 @@
 import "dotenv/config";
-import Anthropic from "@anthropic-ai/sdk";
+import { runInference, type InferenceTelemetry } from "./inference.js";
 import { REPRODUCTION_PLAN_VERSION } from "./plan.js";
 import {
   extractFixProposalJson,
@@ -12,15 +12,6 @@ import {
   buildRegressionTestPrompt,
   type RegressionGenerationInput,
 } from "./regression-test.js";
-
-// Lazy so importing this module (e.g. from the fixer agent or tests with
-// injected model calls) never requires ANTHROPIC_API_KEY.
-let client: Anthropic | null = null;
-
-function getClient(): Anthropic {
-  client ??= new Anthropic();
-  return client;
-}
 
 // Centralized Anthropic model selection. Every model call in the codebase
 // resolves through this — do not hardcode model IDs elsewhere. Override with
@@ -37,19 +28,13 @@ const MAX_PROMPT_LOG_CHARS = 8_000;
 const MAX_PROMPT_HTML_CHARS = 8_000;
 const MAX_PROMPT_API_BODY_CHARS = 4_000;
 
-// Low-level model call shared by this module and the fixer agent.
-export function createModelMessage(
-  params: Anthropic.Messages.MessageCreateParamsNonStreaming,
-): Promise<Anthropic.Messages.Message> {
-  // Sonnet 5 turns on adaptive thinking whenever `thinking` is omitted (Sonnet
-  // 4.6 ran with thinking off). These prompts expect direct, deterministic
-  // output and parse the response text directly, so keep thinking disabled
-  // unless a caller opts in. Callers may still override by passing `thinking`.
-  return getClient().messages.create({
-    thinking: { type: "disabled" },
-    ...params,
-  });
-}
+// All model calls now flow through the inference gateway
+// (backend/services/inference.ts), which preserves the previous defaults —
+// thinking disabled unless a caller opts in (Sonnet 5 turns on adaptive
+// thinking when `thinking` is omitted; these prompts expect direct,
+// deterministic output) — and adds per-call telemetry. The old low-level
+// createModelMessage() wrapper was removed; agents bind runInference() with
+// their phase directly.
 
 export type AnalyzeIssueInput = {
   issueTitle: string;
@@ -94,6 +79,7 @@ export type PlanGenerationInput = RepoEvidenceInput & {
 
 export async function generateReproductionPlan(
   input: PlanGenerationInput,
+  telemetry: InferenceTelemetry | null = null,
 ): Promise<GeneratedPlan> {
   const prompt = `
 You are creating a deterministic browser reproduction plan for a GitHub issue.
@@ -174,16 +160,19 @@ Your previous response was rejected because it was not a valid reproduction plan
 
 Respond again with ONLY the JSON object matching the exact shape shown above. Do not include markdown, code fences, reasoning, or any text before or after the JSON object.`;
 
-    const message = await createModelMessage({
-      model: MODEL,
-      max_tokens: 2_500,
-      messages: [
-        {
-          role: "user",
-          content: finalPrompt,
-        },
-      ],
-    });
+    const message = await runInference(
+      { phase: "plan", telemetry },
+      {
+        model: MODEL,
+        max_tokens: 2_500,
+        messages: [
+          {
+            role: "user",
+            content: finalPrompt,
+          },
+        ],
+      },
+    );
 
     return getTextContent(message.content);
   });
@@ -211,19 +200,26 @@ export type RegressionTestInput = RegressionGenerationInput;
 export async function generateRegressionTestProposal(
   input: RegressionTestInput,
   feedback: string | null,
+  telemetry: InferenceTelemetry | null = null,
 ): Promise<unknown> {
-  const message = await createModelMessage({
-    model: MODEL,
-    max_tokens: 3_000,
-    messages: [{ role: "user", content: buildRegressionTestPrompt(input, feedback) }],
-  });
+  const message = await runInference(
+    { phase: "regression_test", telemetry },
+    {
+      model: MODEL,
+      max_tokens: 3_000,
+      messages: [{ role: "user", content: buildRegressionTestPrompt(input, feedback) }],
+    },
+  );
 
   const extracted = extractFixProposalJson(getTextContent(message.content));
 
   return extracted.ok ? extracted.value : null;
 }
 
-export async function analyzeIssue(input: AnalyzeIssueInput) {
+export async function analyzeIssue(
+  input: AnalyzeIssueInput,
+  telemetry: InferenceTelemetry | null = null,
+) {
   const prompt = `
 You are analyzing a GitHub issue against the actual repository context.
 
@@ -261,16 +257,19 @@ Provide:
 - Evidence from source code and sandbox logs that supports the root cause
 `;
 
-  const message = await createModelMessage({
-    model: MODEL,
-    max_tokens: 900,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
+  const message = await runInference(
+    { phase: "analysis", telemetry },
+    {
+      model: MODEL,
+      max_tokens: 900,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    },
+  );
 
   return message.content[0];
 }
@@ -323,6 +322,7 @@ function boundLines(lines: string[], maxLines = REFLECTION_MAX_EVIDENCE_LINES): 
 
 export async function generateMemoryReflection(
   input: MemoryReflectionInput,
+  telemetry: InferenceTelemetry | null = null,
 ): Promise<MemoryReflection> {
   const prompt = `You are recording the outcome of an automated bug investigation so future
 investigations of this repository start smarter.
@@ -363,16 +363,19 @@ Patched files (if any): ${input.changedFiles.join(", ") || "(none)"}
   "whatFailed": "actionable lesson, or empty string"
 }`;
 
-  const message = await createModelMessage({
-    model: MODEL,
-    max_tokens: 400,
-    messages: [
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
+  const message = await runInference(
+    { phase: "memory_reflection", telemetry },
+    {
+      model: MODEL,
+      max_tokens: 400,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    },
+  );
 
   const extracted = extractFixProposalJson(getTextContent(message.content));
 

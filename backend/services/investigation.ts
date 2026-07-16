@@ -18,6 +18,10 @@ import {
   generateReproductionPlan,
 } from "./claude.js";
 import {
+  createInferenceRecorder,
+  type InferenceTelemetry,
+} from "./inference.js";
+import {
   runFixerAgent,
   type FixerAgentAttempt,
   type FixerAgentStatus,
@@ -285,6 +289,15 @@ export async function runInvestigationPipeline(
     await reportStage("reproducing");
 
     store = await createArtifactStore(investigationId);
+
+    // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1): one
+    // recorder per investigation, appending inference-records.jsonl next to
+    // the other artifacts. Recorder failures are counted internally and never
+    // fail the investigation.
+    const inferenceTelemetry: InferenceTelemetry = {
+      investigationId,
+      recorder: createInferenceRecorder(store.dir),
+    };
 
     // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
     // incrementally so a crash still leaves a partial record.
@@ -565,6 +578,7 @@ export async function runInvestigationPipeline(
           // is commit-scoped inside the agent. Omitted when empty.
           ...(knownFailedPlans.length > 0 ? { knownFailedPlans } : {}),
           restart,
+          telemetry: inferenceTelemetry,
         });
 
         await costShape.update({
@@ -702,19 +716,22 @@ export async function runInvestigationPipeline(
     if (!result) {
       await costShape.update({ oneShotPlanTried: true });
 
-      const generated = await generateReproductionPlan({
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        repoUrl: payload.repoUrl,
-        defaultBranch: payload.defaultBranch,
-        fileTree: repoContext.fileTree,
-        packageJson: repoContext.packageJson,
-        readme: repoContext.readme,
-        sourceFiles: oneShotSourceFiles,
-        sandboxResult: sandboxSession.result,
-        graphContext,
-        pastInvestigations,
-      });
+      const generated = await generateReproductionPlan(
+        {
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext.fileTree,
+          packageJson: repoContext.packageJson,
+          readme: repoContext.readme,
+          sourceFiles: oneShotSourceFiles,
+          sandboxResult: sandboxSession.result,
+          graphContext,
+          pastInvestigations,
+        },
+        inferenceTelemetry,
+      );
 
       await store.writeJson("reproduction-plan-raw.json", {
         rawText: generated.rawText,
@@ -980,7 +997,9 @@ export async function runInvestigationPipeline(
                 sourceFiles: regressionSourceFiles,
               },
               feedback,
+              inferenceTelemetry,
             ),
+          telemetry: inferenceTelemetry,
         });
 
         fixAttempt = agentResult.fixAttempt;
@@ -1121,18 +1140,21 @@ export async function runInvestigationPipeline(
     ) {
       await costShape.update({ analyzeIssueCalled: true });
 
-      claudeAnalysis = await analyzeIssue({
-        issueTitle: payload.issueTitle,
-        issueBody: payload.issueBody ?? "",
-        repoUrl: payload.repoUrl,
-        defaultBranch: payload.defaultBranch,
-        fileTree: repoContext.fileTree,
-        packageJson: repoContext.packageJson,
-        readme: repoContext.readme,
-        sourceFiles: contextSourceFiles,
-        sandboxResult: sandboxSession.result,
-        browserResult: result,
-      }).catch((error: unknown) => {
+      claudeAnalysis = await analyzeIssue(
+        {
+          issueTitle: payload.issueTitle,
+          issueBody: payload.issueBody ?? "",
+          repoUrl: payload.repoUrl,
+          defaultBranch: payload.defaultBranch,
+          fileTree: repoContext.fileTree,
+          packageJson: repoContext.packageJson,
+          readme: repoContext.readme,
+          sourceFiles: contextSourceFiles,
+          sandboxResult: sandboxSession.result,
+          browserResult: result,
+        },
+        inferenceTelemetry,
+      ).catch((error: unknown) => {
         log(`Claude analysis failed: ${formatError(error)}`);
         return null;
       });
@@ -1243,20 +1265,23 @@ export async function runInvestigationPipeline(
       } else {
         await costShape.update({ memoryReflectionCalled: true });
 
-        const reflection = await generateMemoryReflection({
-          issueTitle: payload.issueTitle,
-          outcome,
-          planSummary,
-          assertionDetail: result.assertion?.detail ?? "",
-          browserErrors: [
-            result.outcomeReason,
-            ...(result.assertion ? [result.assertion.detail] : []),
-          ],
-          fixRootCause: fixAttempt?.rootCause ?? "",
-          fixSummary: fixAttempt?.summary ?? "",
-          changedFiles: patchedFiles,
-          failedChecks,
-        });
+        const reflection = await generateMemoryReflection(
+          {
+            issueTitle: payload.issueTitle,
+            outcome,
+            planSummary,
+            assertionDetail: result.assertion?.detail ?? "",
+            browserErrors: [
+              result.outcomeReason,
+              ...(result.assertion ? [result.assertion.detail] : []),
+            ],
+            fixRootCause: fixAttempt?.rootCause ?? "",
+            fixSummary: fixAttempt?.summary ?? "",
+            changedFiles: patchedFiles,
+            failedChecks,
+          },
+          inferenceTelemetry,
+        );
         memoryFields = {
           issueTerms: reflection.issueTerms,
           rootCause: fixAttempt?.rootCause ?? reflection.rootCause,

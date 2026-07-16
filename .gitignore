@@ -20,6 +20,8 @@ dist
 
 # Local tool output
 fable
+docs
+evals
 
 # OS files
 .DS_Store

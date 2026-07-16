@@ -25,10 +25,10 @@ import {
 } from "../services/artifacts.js";
 import {
   MODEL,
-  createModelMessage,
   formatGraphSection,
   formatPastSection,
 } from "../services/claude.js";
+import { runInference, type InferenceTelemetry } from "../services/inference.js";
 import type { RestartResult } from "../services/fix.js";
 import type { GraphContext } from "../services/graphContext.js";
 import {
@@ -147,6 +147,9 @@ export type ReproducerAgentInput = {
   }>;
   // Restart the sandbox (fresh container) and return the new base URL.
   restart: () => Promise<RestartResult>;
+  // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
+  // absent means calls run untelemetered, exactly as before the gateway.
+  telemetry?: InferenceTelemetry | null;
 };
 
 export type ReproducerAgentStatus =
@@ -474,7 +477,10 @@ export async function runReproducerAgent(
   input: ReproducerAgentInput,
   deps: Partial<ReproducerAgentDeps> = {},
 ): Promise<ReproducerAgentResult> {
-  const createMessage = deps.createMessage ?? createModelMessage;
+  const createMessage =
+    deps.createMessage ??
+    ((params) =>
+      runInference({ phase: "reproduce", telemetry: input.telemetry ?? null }, params));
   const openSession = deps.openLiveSession ?? openLiveSession;
   const replayPlan = deps.executeReproductionPlan ?? executeReproductionPlan;
 

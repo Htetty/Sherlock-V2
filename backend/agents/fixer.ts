@@ -21,10 +21,10 @@ import { createArtifactStore } from "../services/artifacts.js";
 import { truncateWithMarker } from "../services/bounded-text.js";
 import {
   MODEL,
-  createModelMessage,
   formatGraphSection,
   formatRepoEvidence,
 } from "../services/claude.js";
+import { runInference, type InferenceTelemetry } from "../services/inference.js";
 import {
   runFixAttempt,
   type FixAttemptResult,
@@ -152,6 +152,9 @@ export type FixerAgentInput = {
   // path — memory replay and one-shot plans must not fabricate findings.
   reproducerFindings?: ReproducerFinding[];
   restart: () => Promise<RestartResult>;
+  // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
+  // absent means calls run untelemetered, exactly as before the gateway.
+  telemetry?: InferenceTelemetry | null;
   // --- Verification extras (dev: repo validation + regression tests) ------
   // "owner/name" used in validation artifacts; never a URL or secret.
   repositoryLabel?: string;
@@ -333,7 +336,9 @@ export async function runFixerAgent(
   input: FixerAgentInput,
   deps: Partial<FixerAgentDeps> = {},
 ): Promise<FixerAgentResult> {
-  const createMessage = deps.createMessage ?? createModelMessage;
+  const createMessage =
+    deps.createMessage ??
+    ((params) => runInference({ phase: "fix", telemetry: input.telemetry ?? null }, params));
   const verify = deps.runFixAttempt ?? runFixAttempt;
 
   // Budget profile is selected once at run start and used for the whole run.
