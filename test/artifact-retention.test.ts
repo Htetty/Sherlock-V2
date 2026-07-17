@@ -275,6 +275,7 @@ describe("terminal delivery gates", () => {
     state.retryPlan = pendingRetryPlan(state);
     state.terminalComment = { status: "pending", postedAt: null, reason: null };
     const store = await persistState(root, state);
+    const lock = vi.spyOn(store, "withLock");
     const cleanup = createArtifactCleanupService({
       rootDir: root,
       deliveryStore: store,
@@ -290,6 +291,7 @@ describe("terminal delivery gates", () => {
     expect(
       await exists(path.join(root, investigationId, DELIVERY_STATE_FILE)),
     ).toBe(true);
+    expect(lock).not.toHaveBeenCalled();
   });
 
   test("created PR with terminal comment pending is retained", async () => {

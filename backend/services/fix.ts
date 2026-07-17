@@ -25,6 +25,7 @@ import {
   type FixProposal,
 } from "./fix-proposal.js";
 import { parseGitStatusPorcelainZ } from "./git-status.js";
+import { analyzePatchRisk, patchRiskEnabled } from "./patch-risk.js";
 import { hashPlanBehavior, type ReproductionPlan } from "./plan.js";
 import { executeReproductionPlan } from "./playwright.js";
 import {
@@ -454,6 +455,24 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
   result.changedFiles = changedFiles;
   await writeFile(path.join(store.dir, "git-diff.patch"), diff, "utf8");
   await store.writeJson("workspace-after.json", { changedFiles, diffStat });
+
+  // Diff-risk heuristics (Phase 3.1), flag-gated OFF by default
+  // (SHERLOCK_PATCH_RISK_CHECKS=true). Advisory-only: these signals are
+  // review flags for humans and the eval harness; they never change the
+  // verification outcome, and a clean scan is never a security claim.
+  if (patchRiskEnabled()) {
+    const riskVerdicts = analyzePatchRisk(diff, changedFiles);
+    await store.writeJson("patch-risk.json", riskVerdicts);
+
+    for (const verdict of riskVerdicts) {
+      advisory(
+        verdict.matched
+          ? `diff-risk heuristic ${verdict.rule} (requires review)`
+          : "diff-risk heuristic scan",
+        verdict.detail,
+      );
+    }
+  }
 
   const approvedPaths = new Set(proposal.files.map((file) => path.normalize(file.path)));
   const unexpectedFiles = changedFiles.filter(

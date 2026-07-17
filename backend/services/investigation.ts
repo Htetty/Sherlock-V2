@@ -19,6 +19,7 @@ import {
 } from "./claude.js";
 import {
   createInferenceRecorder,
+  type InferenceBudgetGuard,
   type InferenceTelemetry,
 } from "./inference.js";
 import {
@@ -131,6 +132,7 @@ export type InvestigationPipelineInput = {
   repoName: string;
   repoUrl: string;
   defaultBranch: string;
+  targetCommitSha?: string;
   issueNumber: number;
   issueTitle: string;
   issueBody?: string;
@@ -168,8 +170,22 @@ export type InvestigationPipelineResult = {
   memoryMatches?: number;
 };
 
+// Per-task quality/cost policy (FABLE_IMPLEMENTATION_PROMPT.md Phase 2.5).
+// Every field is optional; absent fields fall back to the existing env-flag
+// defaults, so leaving `policy` unset preserves current behavior exactly.
+export type InvestigationPolicy = {
+  budgetProfile?: "standard" | "deep";
+  escalateNotReproduced?: boolean;
+  compaction?: boolean;
+  parallelReads?: boolean;
+  inference?: InferenceTelemetry["policies"];
+  inferenceBudgetGuard?: InferenceBudgetGuard;
+};
+
 export type PipelineOptions = {
   onStage?: (stage: InvestigationStage) => void | Promise<void>;
+  // Per-task policy overrides (default: env-flag behavior, unchanged).
+  policy?: InvestigationPolicy;
   // Called after a terminal result and lifecycle outcome are written, but
   // before the pipeline returns and its workspace cleanup completes. The
   // worker uses this boundary to durably persist delivery state, closing the
@@ -297,11 +313,19 @@ export async function runInvestigationPipeline(
     const inferenceTelemetry: InferenceTelemetry = {
       investigationId,
       recorder: createInferenceRecorder(store.dir),
+      ...(options.policy?.inference ? { policies: options.policy.inference } : {}),
+      ...(options.policy?.inferenceBudgetGuard
+        ? { budgetGuard: options.policy.inferenceBudgetGuard }
+        : {}),
     };
+
+    // Per-task budget profile (Phase 2.5): policy override first, env default
+    // second — leaving policy unset preserves worker-global behavior.
+    const budgetProfile = options.policy?.budgetProfile ?? getBudgetProfileName();
 
     // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
     // incrementally so a crash still leaves a partial record.
-    const costShape = createCostShapeTracker(store, getBudgetProfileName());
+    const costShape = createCostShapeTracker(store, budgetProfile);
     await costShape.update({});
 
     investigationRecord = {
@@ -337,6 +361,7 @@ export async function runInvestigationPipeline(
         repoOwner: payload.repoOwner,
         repoName: payload.repoName,
         defaultBranch: payload.defaultBranch,
+        targetCommitSha: payload.targetCommitSha,
         installationToken: payload.installationToken ?? null,
         installationPermissions: payload.installationPermissions ?? null,
       });
@@ -460,6 +485,7 @@ export async function runInvestigationPipeline(
     // Only executeReproductionPlan() can mark reproduced — memory is never
     // trusted without replay.
     const escalateNotReproduced =
+      options.policy?.escalateNotReproduced ??
       process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
 
     let plan: ReproductionPlan | null = null;
@@ -579,6 +605,10 @@ export async function runInvestigationPipeline(
           ...(knownFailedPlans.length > 0 ? { knownFailedPlans } : {}),
           restart,
           telemetry: inferenceTelemetry,
+          budgetProfile,
+          ...(options.policy?.compaction !== undefined
+            ? { compaction: options.policy.compaction }
+            : {}),
         });
 
         await costShape.update({
@@ -1000,6 +1030,11 @@ export async function runInvestigationPipeline(
               inferenceTelemetry,
             ),
           telemetry: inferenceTelemetry,
+          budgetProfile,
+          parallelReads: options.policy?.parallelReads,
+          ...(options.policy?.compaction !== undefined
+            ? { compaction: options.policy.compaction }
+            : {}),
         });
 
         fixAttempt = agentResult.fixAttempt;

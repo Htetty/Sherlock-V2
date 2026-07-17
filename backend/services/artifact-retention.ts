@@ -16,6 +16,7 @@ import {
 } from "../queue/investigation-queue.js";
 import { getArtifactsRoot, isInvestigationId } from "./artifacts.js";
 import {
+  isDeliveryTerminal,
   isFixFullyDelivered,
   type DeliveryState,
   type DeliveryStateStore,
@@ -327,6 +328,22 @@ export function createArtifactCleanupService(
     }
 
     try {
+      // Yield before taking the delivery lease when publishing is unfinished
+      // or the queue/concurrency snapshot already protects this investigation.
+      // Returning early can only retain data longer; it can never delete data
+      // that delivery still needs. A later cleanup pass re-evaluates it.
+      const preflightState = await options.deliveryStore.load(investigationId);
+      const preflightTerminalFailure = preflightState
+        ? null
+        : await options.deliveryStore.loadTerminalFailure(investigationId);
+      const preflightRecord = preflightState ?? preflightTerminalFailure;
+      if (preflightState && !isDeliveryTerminal(preflightState)) {
+        return { investigationId, status: "not_terminal" };
+      }
+      if (preflightRecord && await snapshot.isProtected(preflightRecord)) {
+        return { investigationId, status: "protected" };
+      }
+
       return await options.deliveryStore.withLock(investigationId, async () => {
         // Revalidate after acquiring the same lock used by delivery. This
         // makes deletion and delivery-state reconciliation mutually exclusive.

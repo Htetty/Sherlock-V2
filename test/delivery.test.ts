@@ -31,6 +31,7 @@ import {
   runDeliveryFromState,
   terminalCommentMarker,
   validateDeliveryConsistency,
+  DeliveryLockBusyError,
   DeliveryRetryableError,
   type DeliveryExecutorDeps,
   type DeliveryGitHubClient,
@@ -251,6 +252,39 @@ function makeExecutorDeps(options: {
 // --- Delivery executor: per-stage failure injection --------------------------
 
 describe("delivery executor", () => {
+  test("brief lock contention is absorbed inside one delivery attempt", async () => {
+    const state = await verifiedDeliveryState({
+      pullRequest: pullRequestResult("push_failed"),
+    });
+    const baseStore = createInMemoryDeliveryStateStore();
+    await baseStore.save(state);
+    let claims = 0;
+    const store: DeliveryStateStore = {
+      ...baseStore,
+      async withLock<T>(investigationId: string, operation: Parameters<DeliveryStateStore["withLock"]>[1]) {
+        claims += 1;
+        if (claims <= 2) {
+          throw new DeliveryLockBusyError("cleanup briefly owns the lease");
+        }
+        return baseStore.withLock(investigationId, operation) as Promise<T>;
+      },
+    };
+    const waits: number[] = [];
+    const github = mockGitHub();
+    const { deps } = makeExecutorDeps({ github: github.client, deliveryStore: store });
+    deps.waitForDeliveryLock = async (delayMs) => {
+      waits.push(delayMs);
+    };
+
+    const result = await runDeliveryFromState(state, deps, {
+      isFinalAttempt: false,
+    });
+
+    expect(result.complete).toBe(true);
+    expect(claims).toBe(3);
+    expect(waits).toEqual([250, 500]);
+  });
+
   test("branch push failure: retry recreates the branch through the API, then one PR and one comment", async () => {
     const state = await verifiedDeliveryState({
       pullRequest: pullRequestResult("push_failed"),
@@ -845,9 +879,11 @@ describe("worker delivery decoupling", () => {
 
   test("unfinished PR delivery defers to the delivery job, which pushes, opens the PR, and comments once", async () => {
     const github = mockGitHub();
+    const stateStore = createInMemoryInvestigationStateStore();
     const fixture = makeWorkerDeps({
       pipelineResult: verifiedPipelineResult(pullRequestResult("push_failed")),
       github: github.client,
+      stateStore,
     });
 
     const outcome = await processInvestigationJob(
@@ -871,6 +907,8 @@ describe("worker delivery decoupling", () => {
     expect(github.calls.createPullRequest).toBe(1);
     expect(fixture.comments).toHaveLength(1);
     expect(fixture.comments[0]).toContain("opened a pull request");
+    expect(stateStore.snapshot().find((record) => record.investigationId === INV)?.stage)
+      .toBe("completed");
 
     // Running the delivery job again is a no-op: no duplicates anywhere.
     await processDeliveryJob(

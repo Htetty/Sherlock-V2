@@ -15,12 +15,9 @@
 // - Costs come from a versioned pricing file keyed by exact model id. An
 //   unknown model/tier yields estimatedCostUsd: null — never a guessed cost.
 //
-// Retry semantics (documented, not invented): the SDK performs internal HTTP
-// retries that are not observable per-attempt from the response. attemptCount
-// counts GATEWAY-level attempts only. The default policy performs exactly one
-// gateway attempt (attemptCount: 1) and leaves SDK-internal retry behavior
-// unchanged. When policy.maxAttempts > 1, the gateway owns retries and turns
-// SDK-internal retries off for those calls so attempts are not multiplied.
+// Retry semantics: the gateway owns every retry and always disables SDK
+// retries. This keeps attemptCount accurate and lets eval budget guards stop
+// work before an HTTP request is made.
 
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
@@ -51,7 +48,7 @@ export interface InferencePolicy {
   maxTokens?: number;
   thinking?: { type: "enabled"; budgetTokens: number };
   cacheMode?: "off" | "system_and_tools";
-  serviceTier?: string;
+  serviceTier?: "auto" | "standard_only";
   maxAttempts?: number;
   timeoutMs?: number;
   tags?: Record<string, string>;
@@ -92,10 +89,30 @@ export type InferenceRecorder = {
 
 // Threaded from the orchestrator to every call site. `recorder: null` means
 // telemetry is unavailable (e.g. before an artifact store exists); the call
-// itself is unaffected.
+// itself is unaffected. `policies` carries optional per-phase inference
+// policies (Phase 2 experiments): a call site's phase selects its policy, so
+// per-task policy flows through the existing threading with no signature
+// churn. Absent phases keep default behavior.
 export type InferenceTelemetry = {
   investigationId: string;
   recorder: InferenceRecorder | null;
+  policies?: Partial<Record<AgentPhase, InferencePolicy>>;
+  budgetGuard?: InferenceBudgetGuard;
+};
+
+export type InferenceBudgetReservation = {
+  model: string;
+  estimatedInputTokens: number;
+  maxOutputTokens: number;
+  estimatedCostUsd: number | null;
+  maxAttempts: number;
+};
+
+export type InferenceBudgetGuard = {
+  beforeLogicalCall: (
+    reservation: InferenceBudgetReservation,
+  ) => void | Promise<void>;
+  beforeHttpAttempt: () => void | Promise<void>;
 };
 
 export type InferenceContext = {
@@ -237,6 +254,20 @@ async function loadPricing(): Promise<PricingTable | null> {
   return pricingCache;
 }
 
+export async function estimateRequestCostUsd(
+  model: string,
+  estimatedInputTokens: number,
+  maxOutputTokens: number,
+): Promise<number | null> {
+  return estimateCostUsd(await loadPricing(), model, {
+    inputTokens: estimatedInputTokens,
+    outputTokens: maxOutputTokens,
+    cacheReadTokens: 0,
+    cacheCreation5mTokens: 0,
+    cacheCreation1hTokens: 0,
+  });
+}
+
 // Test seam: reset the memoized pricing table.
 export function resetPricingCacheForTests(): void {
   pricingCache = undefined;
@@ -341,10 +372,30 @@ export function classifyError(error: unknown): string {
   return "unknown";
 }
 
+export function isRetryableInferenceError(error: unknown): boolean {
+  const category = classifyError(error);
+  if (category === "timeout" || category === "network") return true;
+  if (!category.startsWith("api_")) return false;
+  const status = Number(category.slice(4));
+  return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+function estimateInputTokens(
+  params: Anthropic.Messages.MessageCreateParamsNonStreaming,
+): number {
+  // A conservative, deterministic reservation. Actual usage is still
+  // recorded from the provider response.
+  return Math.ceil(Buffer.byteLength(JSON.stringify({
+    system: params.system,
+    tools: params.tools,
+    messages: params.messages,
+  }), "utf8") / 3);
+}
+
 // The single production entry point for model calls. Default behavior is
 // semantically identical to the previous createModelMessage(): thinking
-// disabled unless the caller opts in, no cache markers, SDK-default retries
-// and timeout.
+// disabled unless the caller opts in, no cache markers, and gateway-owned
+// retry accounting.
 export async function runInference(
   context: InferenceContext,
   params: Anthropic.Messages.MessageCreateParamsNonStreaming,
@@ -353,7 +404,8 @@ export async function runInference(
   const create: CreateFn =
     deps.create ?? ((finalParams, options) => getClient().messages.create(finalParams, options));
   const now = deps.now ?? Date.now;
-  const policy = context.policy ?? {};
+  const policy =
+    context.policy ?? context.telemetry?.policies?.[context.phase] ?? {};
 
   // Assemble final params. Preserved default: thinking disabled unless the
   // caller's params or the policy explicitly enable it (claude.ts:44-51).
@@ -364,16 +416,28 @@ export async function runInference(
     ...params,
     ...(policy.model ? { model: policy.model } : {}),
     ...(policy.maxTokens ? { max_tokens: policy.maxTokens } : {}),
+    ...(policy.serviceTier ? { service_tier: policy.serviceTier } : {}),
   };
   finalParams = applyCacheMode(finalParams, policy.cacheMode ?? "off");
 
-  const maxAttempts = Math.max(1, policy.maxAttempts ?? 1);
-  // With gateway-owned retries, disable SDK-internal retries so attemptCount
-  // reflects reality. With the default single attempt, leave the SDK alone.
+  const maxAttempts = Math.max(1, policy.maxAttempts ?? 3);
   const requestOptions: { timeout?: number; maxRetries?: number } = {
     ...(policy.timeoutMs ? { timeout: policy.timeoutMs } : {}),
-    ...(maxAttempts > 1 ? { maxRetries: 0 } : {}),
+    maxRetries: 0,
   };
+
+  const estimatedInputTokens = estimateInputTokens(finalParams);
+  await context.telemetry?.budgetGuard?.beforeLogicalCall({
+    model: finalParams.model,
+    estimatedInputTokens,
+    maxOutputTokens: finalParams.max_tokens,
+    estimatedCostUsd: await estimateRequestCostUsd(
+      finalParams.model,
+      estimatedInputTokens,
+      finalParams.max_tokens,
+    ),
+    maxAttempts,
+  });
 
   const startedAtMs = now();
   const startedAt = new Date(startedAtMs).toISOString();
@@ -382,6 +446,7 @@ export async function runInference(
   let message: Anthropic.Messages.Message | null = null;
 
   while (attemptCount < maxAttempts) {
+    await context.telemetry?.budgetGuard?.beforeHttpAttempt();
     attemptCount += 1;
 
     try {
@@ -391,8 +456,8 @@ export async function runInference(
     } catch (error) {
       lastError = error;
 
-      if (classifyError(error) === "aborted") {
-        break; // Never retry an intentional abort.
+      if (!isRetryableInferenceError(error)) {
+        break;
       }
     }
   }
@@ -418,7 +483,9 @@ export async function runInference(
     investigationId: context.telemetry?.investigationId ?? "(unattributed)",
     phase: context.phase,
     model: message?.model ?? finalParams.model,
-    ...(policy.serviceTier ? { serviceTier: policy.serviceTier } : {}),
+    ...((usage as { service_tier?: string } | null)?.service_tier || policy.serviceTier
+      ? { serviceTier: (usage as { service_tier?: string } | null)?.service_tier ?? policy.serviceTier }
+      : {}),
     status: message ? "succeeded" : "failed",
     startedAt,
     finishedAt: new Date(finishedAtMs).toISOString(),
@@ -438,7 +505,13 @@ export async function runInference(
   // Never log prompt bodies, tool payloads, or response bodies: the record
   // contains only identifiers, counters, and enums by construction.
   if (context.telemetry?.recorder) {
+    const failuresBefore = context.telemetry.recorder.failures;
     await context.telemetry.recorder.record(record);
+    if (context.telemetry.recorder.failures > failuresBefore) {
+      console.warn(
+        `Inference telemetry write failed: ${context.telemetry.recorder.lastError ?? "unknown recorder error"}`,
+      );
+    }
   }
 
   if (!message) {

@@ -112,6 +112,7 @@ export async function cloneRepoForInvestigation(input: {
   repoOwner: string;
   repoName: string;
   defaultBranch?: string;
+  targetCommitSha?: string;
   installationToken?: string | null;
   // Permission metadata from the token-minting response (authoritative for
   // the token's Contents access).
@@ -158,12 +159,30 @@ export async function cloneRepoForInvestigation(input: {
       );
     }
 
+    const commit = await getHeadCommit(repoPath);
+    if (input.targetCommitSha) {
+      if (!/^[0-9a-f]{40}$/i.test(input.targetCommitSha)) {
+        throw new RepositoryError(
+          "invalid_identity",
+          "The requested target commit must be a full 40-character Git SHA.",
+          false,
+        );
+      }
+      if (commit.toLowerCase() !== input.targetCommitSha.toLowerCase()) {
+        throw new RepositoryError(
+          "invalid_identity",
+          `The cloned branch resolved to ${commit}, not the pinned eval commit ${input.targetCommitSha}. Refusing to evaluate a different revision.`,
+          false,
+        );
+      }
+    }
+
     await writeRepoExcludes(repoPath);
 
     return {
       workspacePath,
       repoPath,
-      commit: await getHeadCommit(repoPath),
+      commit,
       fileTree: await collectFileTree(repoPath),
       packageJson: await safeRead(path.join(repoPath, "package.json")),
       readme: await readFirstExisting(repoPath, [

@@ -7,7 +7,7 @@ import { mkdtemp, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import {
   INFERENCE_RECORDS_FILE,
   applyCacheMode,
@@ -234,7 +234,57 @@ describe("runInference", () => {
     expect(abortCalls).toBe(1);
   });
 
-  test("default single attempt leaves SDK retry/timeout options untouched", async () => {
+  test("permanent API errors are not retried", async () => {
+    let calls = 0;
+    const error = new Anthropic.BadRequestError(
+      400,
+      { type: "error", error: { type: "invalid_request_error", message: "bad" } },
+      "bad request",
+      new Headers(),
+    );
+    await expect(
+      runInference(
+        { phase: "fix", policy: { maxAttempts: 3 } },
+        BASE_PARAMS,
+        {
+          create: async () => {
+            calls += 1;
+            throw error;
+          },
+        },
+      ),
+    ).rejects.toThrow();
+    expect(calls).toBe(1);
+  });
+
+  test("service tier is sent and actual response tier is recorded", async () => {
+    const dir = await makeRecorderDir();
+    const recorder = createInferenceRecorder(dir);
+    let seen: Anthropic.Messages.MessageCreateParamsNonStreaming | null = null;
+    await runInference(
+      {
+        phase: "fix",
+        policy: { serviceTier: "standard_only" },
+        telemetry: { investigationId: "inv_TEST", recorder },
+      },
+      BASE_PARAMS,
+      {
+        create: async (params) => {
+          seen = params;
+          return fakeMessage({
+            usage: {
+              ...fakeMessage().usage,
+              service_tier: "standard",
+            } as Anthropic.Messages.Usage,
+          });
+        },
+      },
+    );
+    expect(seen!.service_tier).toBe("standard_only");
+    expect((await readRecords(dir))[0].serviceTier).toBe("standard");
+  });
+
+  test("default retries are gateway-owned and SDK retries are disabled", async () => {
     let seenOptions: unknown = "sentinel";
     await runInference({ phase: "plan" }, BASE_PARAMS, {
       create: async (_params, options) => {
@@ -243,7 +293,7 @@ describe("runInference", () => {
       },
     });
 
-    expect(seenOptions).toEqual({});
+    expect(seenOptions).toEqual({ maxRetries: 0 });
   });
 
   test("concurrent calls append every record without corruption", async () => {

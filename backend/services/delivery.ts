@@ -231,6 +231,10 @@ const MAX_DELIVERY_STATE_BYTES = 128 * 1024;
 const MAX_DELIVERY_PAYLOAD_BYTES = 3 * 1024 * 1024;
 export const DELIVERY_LOCK_TTL_MS = 20_000;
 export const DELIVERY_LOCK_HEARTBEAT_MS = 5_000;
+// A cleanup pass or another delivery can hold the per-investigation lease for
+// a few milliseconds. Absorb that local scheduling collision inside one queue
+// attempt instead of immediately paying the queue's 30-second backoff.
+export const DELIVERY_LOCK_WAIT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 const execFileAsync = promisify(execFile);
 const DELIVERY_OUTCOMES = new Set([
   "failed",
@@ -2643,6 +2647,9 @@ export type DeliveryExecutorDeps = {
   // Retry classifier injected by the queue layer (kept out of this module so
   // services never depend on queue code).
   isRetryableError: (error: unknown) => boolean;
+  // Test seam for the bounded lock wait. Production uses a jittered timer so
+  // competing workers do not wake in lockstep.
+  waitForDeliveryLock?: (delayMs: number) => Promise<void>;
   log?: (message: string) => void;
 };
 
@@ -2663,28 +2670,49 @@ export async function runDeliveryFromState(
   // Queue exhaustion controls scheduling, not truth: a retryable GitHub or
   // lock ambiguity must never be converted into a permanent delivery result.
   void options.isFinalAttempt;
-  try {
-    return await deps.deliveryStore.withLock(
-      initial.investigationId,
-      async (lease) => {
-        let latest: DeliveryState | null;
-        try {
-          latest = await deps.deliveryStore.load(initial.investigationId);
-        } catch (error) {
-          throw new DeliveryRetryableError(retryableDeliveryMessage(error));
-        }
+  const waitForLock =
+    deps.waitForDeliveryLock ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => {
+        const jitterMs = Math.floor(Math.random() * Math.max(1, delayMs / 4));
+        setTimeout(resolve, delayMs + jitterMs);
+      }));
 
-        return runDeliveryUnlocked(latest ?? initial, deps, lease);
-      },
-    );
-  } catch (error) {
-    if (
-      error instanceof DeliveryLockBusyError ||
-      error instanceof DeliveryLockLostError
-    ) {
-      throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await deps.deliveryStore.withLock(
+        initial.investigationId,
+        async (lease) => {
+          let latest: DeliveryState | null;
+          try {
+            latest = await deps.deliveryStore.load(initial.investigationId);
+          } catch (error) {
+            throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+          }
+
+          return runDeliveryUnlocked(latest ?? initial, deps, lease);
+        },
+      );
+    } catch (error) {
+      if (
+        error instanceof DeliveryLockBusyError &&
+        attempt < DELIVERY_LOCK_WAIT_DELAYS_MS.length
+      ) {
+        const delayMs = DELIVERY_LOCK_WAIT_DELAYS_MS[attempt];
+        deps.log?.(
+          `[${initial.investigationId}] Delivery ownership is briefly busy; waiting ${delayMs}ms before retrying locally.`,
+        );
+        await waitForLock(delayMs);
+        continue;
+      }
+      if (
+        error instanceof DeliveryLockBusyError ||
+        error instanceof DeliveryLockLostError
+      ) {
+        throw new DeliveryRetryableError(retryableDeliveryMessage(error));
+      }
+      throw error;
     }
-    throw error;
   }
 }
 

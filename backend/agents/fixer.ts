@@ -26,6 +26,11 @@ import {
 } from "../services/claude.js";
 import { runInference, type InferenceTelemetry } from "../services/inference.js";
 import {
+  assembleBatchResults,
+  parallelReadsEnabled,
+  planToolBatch,
+} from "./tool-batch.js";
+import {
   runFixAttempt,
   type FixAttemptResult,
   type RestartResult,
@@ -155,6 +160,12 @@ export type FixerAgentInput = {
   // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
   // absent means calls run untelemetered, exactly as before the gateway.
   telemetry?: InferenceTelemetry | null;
+  // Per-task policy overrides (Phase 2.5). Absent: env-flag defaults.
+  budgetProfile?: "standard" | "deep";
+  compaction?: boolean;
+  // Parallel read-only tool calls (Phase 2 tool-batch contract). Default:
+  // SHERLOCK_FIXER_PARALLEL_READS env flag, which defaults to off.
+  parallelReads?: boolean;
   // --- Verification extras (dev: repo validation + regression tests) ------
   // "owner/name" used in validation artifacts; never a URL or secret.
   repositoryLabel?: string;
@@ -342,9 +353,12 @@ export async function runFixerAgent(
   const verify = deps.runFixAttempt ?? runFixAttempt;
 
   // Budget profile is selected once at run start and used for the whole run.
+  // Per-task policy override first (Phase 2.5), env default second.
   const budgetProfile =
-    process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard";
-  const budgets = getFixerBudgets();
+    input.budgetProfile ??
+    (process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard");
+  const budgets = budgetProfile === "deep" ? DEEP_FIXER_BUDGETS : STANDARD_FIXER_BUDGETS;
+  const parallelReads = parallelReadsEnabled(input.parallelReads);
 
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Fixer: ${message}`);
@@ -400,9 +414,12 @@ export async function runFixerAgent(
   let lastAttempt: FixAttemptResult | null = null;
   let nudged = false;
 
-  // Compaction (SHERLOCK_COMPACTION=true): locally tracked state used to
-  // rebuild a compact summary when old history is spliced out.
-  const compactor = createCompactor();
+  // Compaction (SHERLOCK_COMPACTION=true, or per-task policy override):
+  // locally tracked state used to rebuild a compact summary when old history
+  // is spliced out.
+  const compactor = createCompactor(
+    input.compaction === undefined ? {} : { enabled: input.compaction },
+  );
   const factLog: string[] = [];
   let lastVerifierFeedback = "";
   let lastAssistantText = "";
@@ -431,6 +448,122 @@ export async function runFixerAgent(
     ];
 
     return sections.filter(Boolean).join("\n\n");
+  };
+
+  // Executes one read-only inspection tool (read_file / grep /
+  // get_graph_neighbors) with all existing gates and budget accounting.
+  // Shared by the single-call path and the parallel-reads batch path so the
+  // two paths can never drift.
+  const executeInspectionTool = async (
+    block: Anthropic.Messages.ToolUseBlock,
+    accountEvidence = true,
+  ): Promise<{ resultText: string; isError: boolean }> => {
+    const inspectionGate = shouldBlockInspectionTool(block.name, counters, budgets);
+
+    if (inspectionGate.blocked) {
+      return { resultText: inspectionGate.reason, isError: true };
+    }
+
+    if (block.name === "read_file") {
+      const requestedRaw = (block.input as { path?: unknown })?.path;
+      const requestedNormalized =
+        typeof requestedRaw === "string" && requestedRaw
+          ? path.normalize(requestedRaw).split(path.sep).join("/")
+          : null;
+
+      if (requestedNormalized && hydratedFullFiles.has(requestedNormalized)) {
+        // Deterministic redundancy gate: the full file is in the initial
+        // context. Reject without consuming the read_file budget.
+        return {
+          resultText: `REDUNDANT read_file rejected: ${requestedNormalized} is already provided IN FULL in the initial context under "Selected source/config files with contents", and every non-verified patch is rolled back, so that content is still exact. Use it directly (including for verbatim oldText). If the evidence is sufficient, call propose_patch now.`,
+          isError: true,
+        };
+      }
+
+      counters.readFile += 1;
+      if (counters.readFile > budgets.maxReadFileCalls) {
+        return {
+          resultText: "read_file budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const readInput = block.input as {
+        path?: unknown;
+        startLine?: unknown;
+        endLine?: unknown;
+      };
+      const lineRange = parseReadLineRange(readInput?.startLine, readInput?.endLine);
+      const outcome = lineRange.ok
+        ? await execReadFile(input.repoPath, readInput?.path, lineRange.range)
+        : { ok: false, text: lineRange.error };
+      if (outcome.ok && accountEvidence) {
+        counters.evidenceBytes += outcome.text.length;
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    if (block.name === "get_graph_neighbors") {
+      counters.graph += 1;
+      if (counters.graph > budgets.maxGraphCalls) {
+        return {
+          resultText:
+            "get_graph_neighbors budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const nodeRef = (block.input as { node?: unknown })?.node;
+      const outcome =
+        typeof nodeRef === "string"
+          ? await queryGraphNeighbors(input.repoPath, nodeRef)
+          : { ok: false, text: "get_graph_neighbors requires a string node reference." };
+      if (outcome.ok && accountEvidence) {
+        counters.evidenceBytes += outcome.text.length;
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    if (block.name === "grep") {
+      counters.grep += 1;
+      if (counters.grep > budgets.maxGrepCalls) {
+        return {
+          resultText: "grep budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const grepInput = block.input as { query?: unknown; glob?: unknown };
+      const outcome = await execGrep(
+        input.repoPath,
+        grepInput?.query,
+        typeof grepInput?.glob === "string" ? grepInput.glob : undefined,
+      );
+      if (outcome.ok && accountEvidence) {
+        counters.evidenceBytes += outcome.text.length;
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    return { resultText: `Unknown tool "${block.name}".`, isError: true };
   };
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -517,13 +650,17 @@ export async function runFixerAgent(
           hasMemory: Boolean(input.pastInvestigations?.trim()),
         }),
         tools: TOOLS,
-        tool_choice: { type: "any", disable_parallel_tool_use: true },
+        // Parallel reads (Phase 2, default OFF): when enabled, the model may
+        // emit several READ-ONLY calls per turn under the tool-batch
+        // contract; terminal/mutation tools must still be called alone.
+        tool_choice: { type: "any", disable_parallel_tool_use: !parallelReads },
         messages: [...messages],
       });
 
-      const toolUse = message.content.find(
+      const toolUses = message.content.filter(
         (block): block is Anthropic.Messages.ToolUseBlock => block.type === "tool_use",
       );
+      const toolUse = toolUses[0];
 
       if (!toolUse) {
         transcript.push({
@@ -554,6 +691,94 @@ export async function runFixerAgent(
 
       if (textBlock?.text.trim()) {
         lastAssistantText = textBlock.text.trim();
+      }
+
+      // --- Parallel-reads batch path (Phase 2, flag-gated) -----------------
+      // Multiple tool_use blocks reach here only when parallelReads is on
+      // (disable_parallel_tool_use is set otherwise). Contract: every block
+      // gets exactly one result in model order; only read-only tools execute,
+      // concurrently; terminal/mutation calls in a batch are rejected
+      // unexecuted with structured errors.
+      if (toolUses.length > 1) {
+        const plan = planToolBatch(toolUses);
+        if (plan.fatalReason) {
+          return await finish("failed", plan.fatalReason, lastAttempt);
+        }
+        const resultsById = new Map<string, { content: string; isError: boolean }>();
+
+        transcript.push({
+          type: "model_action_batch",
+          turn: counters.turns,
+          tools: toolUses.map((block) => block.name),
+          rejected: plan.rejected.map((entry) => entry.block.name),
+        });
+        log(
+          `turn ${counters.turns}: parallel batch [${toolUses.map((block) => block.name).join(", ")}]`,
+        );
+
+        await Promise.all(
+          plan.execute.map(async (block) => {
+            const outcome = await executeInspectionTool(block, false);
+            resultsById.set(block.id, {
+              content: outcome.resultText,
+              isError: outcome.isError,
+            });
+            await recordToolCall(block.name, block.input, outcome.resultText);
+            factLog.push(
+              `${block.name} ${JSON.stringify(block.input).slice(0, 160)} -> ${outcome.isError ? `error: ${firstLine(outcome.resultText)}` : `ok (${outcome.resultText.length} bytes)`}`,
+            );
+          }),
+        );
+
+        // Apply the shared evidence cap after concurrent reads complete, in
+        // model order. No sibling can race past the global byte budget.
+        for (const block of plan.execute) {
+          const outcome = resultsById.get(block.id);
+          if (!outcome || outcome.isError) continue;
+          const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
+          if (remaining === 0) {
+            resultsById.set(block.id, {
+              content: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+              isError: true,
+            });
+            continue;
+          }
+          const bounded = truncateUtf8Bytes(outcome.content, remaining);
+          counters.evidenceBytes += Buffer.byteLength(bounded, "utf8");
+          resultsById.set(block.id, {
+            content: bounded,
+            isError: bounded !== outcome.content,
+          });
+        }
+
+        for (const entry of plan.rejected) {
+          if (!resultsById.has(entry.block.id)) {
+            resultsById.set(entry.block.id, { content: entry.reason, isError: true });
+          } else {
+            resultsById.set(`${entry.block.id}#dup`, { content: entry.reason, isError: true });
+          }
+          await recordToolCall(entry.block.name, entry.block.input, entry.reason);
+        }
+
+        const batchResults = assembleBatchResults(toolUses, resultsById);
+
+        messages.push(
+          { role: "assistant", content: message.content },
+          { role: "user", content: batchResults },
+        );
+
+        const batchBytes = batchResults.reduce(
+          (total, block) => total + (typeof block.content === "string" ? block.content.length : 0),
+          0,
+        );
+        compactor.record(batchBytes);
+
+        if (compactor.maybeCompact(messages, buildStateSummary)) {
+          transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+          log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+        }
+
+        continue;
       }
 
       transcript.push({
@@ -780,93 +1005,9 @@ export async function runFixerAgent(
       // Inspection tools: read_file / grep.
       let resultText: string;
       let isError = false;
-      const inspectionGate = shouldBlockInspectionTool(toolUse.name, counters, budgets);
-
-      if (inspectionGate.blocked) {
-        resultText = inspectionGate.reason;
-        isError = true;
-      } else if (toolUse.name === "read_file") {
-        const requestedRaw = (toolUse.input as { path?: unknown })?.path;
-        const requestedNormalized =
-          typeof requestedRaw === "string" && requestedRaw
-            ? path.normalize(requestedRaw).split(path.sep).join("/")
-            : null;
-
-        if (requestedNormalized && hydratedFullFiles.has(requestedNormalized)) {
-          // Deterministic redundancy gate: the full file is in the initial
-          // context. Reject without consuming the read_file budget.
-          resultText = `REDUNDANT read_file rejected: ${requestedNormalized} is already provided IN FULL in the initial context under "Selected source/config files with contents", and every non-verified patch is rolled back, so that content is still exact. Use it directly (including for verbatim oldText). If the evidence is sufficient, call propose_patch now.`;
-          isError = true;
-        } else {
-          counters.readFile += 1;
-          if (counters.readFile > budgets.maxReadFileCalls) {
-            resultText = "read_file budget exhausted — propose a patch or call submit_blocked.";
-            isError = true;
-          } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-            resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-            isError = true;
-          } else {
-            const readInput = toolUse.input as {
-              path?: unknown;
-              startLine?: unknown;
-              endLine?: unknown;
-            };
-            const lineRange = parseReadLineRange(readInput?.startLine, readInput?.endLine);
-            const outcome = lineRange.ok
-              ? await execReadFile(input.repoPath, readInput?.path, lineRange.range)
-              : { ok: false, text: lineRange.error };
-            resultText = outcome.text;
-            isError = !outcome.ok;
-            if (outcome.ok) {
-              counters.evidenceBytes += resultText.length;
-            }
-          }
-        }
-      } else if (toolUse.name === "get_graph_neighbors") {
-        counters.graph += 1;
-        if (counters.graph > budgets.maxGraphCalls) {
-          resultText = "get_graph_neighbors budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-          resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else {
-          const nodeRef = (toolUse.input as { node?: unknown })?.node;
-          const outcome =
-            typeof nodeRef === "string"
-              ? await queryGraphNeighbors(input.repoPath, nodeRef)
-              : { ok: false, text: "get_graph_neighbors requires a string node reference." };
-          resultText = outcome.text;
-          isError = !outcome.ok;
-          if (outcome.ok) {
-            counters.evidenceBytes += resultText.length;
-          }
-        }
-      } else if (toolUse.name === "grep") {
-        counters.grep += 1;
-        if (counters.grep > budgets.maxGrepCalls) {
-          resultText = "grep budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-          resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else {
-          const grepInput = toolUse.input as { query?: unknown; glob?: unknown };
-          const outcome = await execGrep(
-            input.repoPath,
-            grepInput?.query,
-            typeof grepInput?.glob === "string" ? grepInput.glob : undefined,
-          );
-          resultText = outcome.text;
-          isError = !outcome.ok;
-          if (outcome.ok) {
-            counters.evidenceBytes += resultText.length;
-          }
-        }
-      } else {
-        resultText = `Unknown tool "${toolUse.name}".`;
-        isError = true;
-      }
+      const executed = await executeInspectionTool(toolUse);
+      resultText = executed.resultText;
+      isError = executed.isError;
 
       await recordToolCall(toolUse.name, toolUse.input, resultText);
       transcript.push({

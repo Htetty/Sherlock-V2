@@ -150,6 +150,9 @@ export type ReproducerAgentInput = {
   // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
   // absent means calls run untelemetered, exactly as before the gateway.
   telemetry?: InferenceTelemetry | null;
+  // Per-task policy overrides (Phase 2.5). Absent: env-flag defaults.
+  budgetProfile?: "standard" | "deep";
+  compaction?: boolean;
 };
 
 export type ReproducerAgentStatus =
@@ -485,8 +488,10 @@ export async function runReproducerAgent(
   const replayPlan = deps.executeReproductionPlan ?? executeReproductionPlan;
 
   // Budget profile is selected once at run start and used for the whole run.
-  const budgetProfile = getBudgetProfileName();
-  const budgets = getReproducerBudgets();
+  // Per-task policy override first (Phase 2.5), env default second.
+  const budgetProfile = input.budgetProfile ?? getBudgetProfileName();
+  const budgets =
+    budgetProfile === "deep" ? DEEP_REPRODUCER_BUDGETS : STANDARD_REPRODUCER_BUDGETS;
 
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Reproducer: ${message}`);
@@ -589,7 +594,9 @@ export async function runReproducerAgent(
 
   // Compaction (SHERLOCK_COMPACTION=true): locally tracked state used to
   // rebuild a compact summary when old history is spliced out.
-  const compactor = createCompactor();
+  const compactor = createCompactor(
+    input.compaction === undefined ? {} : { enabled: input.compaction },
+  );
   const factLog: string[] = [];
   let lastReplayFeedback = "";
 
