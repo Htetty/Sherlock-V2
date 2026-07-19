@@ -1,7 +1,7 @@
 // Parallel tool-use contract (FABLE_IMPLEMENTATION_PROMPT.md Phase 2,
-// "Parallel tool-use contract"). Default OFF: SHERLOCK_FIXER_PARALLEL_READS
-// must be "true" (or the agent input must opt in) before the fixer allows the
-// model to emit multiple tool calls per turn.
+// "Parallel tool-use contract"). Default ON (fable/16):
+// SHERLOCK_FIXER_PARALLEL_READS=false (or an explicit agent-input opt-out)
+// disables the fixer's ability to emit multiple tool calls per turn.
 //
 // Guarantees when enabled:
 // - Every tool_use block receives exactly one tool_result, in deterministic
@@ -17,8 +17,12 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 
+// NOTE: run_code is deliberately NOT read-only for batching purposes — it
+// holds the workspace (a Docker container with the repo mounted) and must
+// never run concurrently with other tools. read_many is read-only and safe.
 export const READ_ONLY_FIXER_TOOLS: ReadonlySet<string> = new Set([
   "read_file",
+  "read_many",
   "grep",
   "get_graph_neighbors",
 ]);
@@ -28,7 +32,7 @@ export function parallelReadsEnabled(
   override?: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return override ?? env.SHERLOCK_FIXER_PARALLEL_READS === "true";
+  return override ?? env.SHERLOCK_FIXER_PARALLEL_READS !== "false";
 }
 
 export type ToolBatchPlan = {

@@ -47,11 +47,39 @@ export interface InferencePolicy {
   model?: string;
   maxTokens?: number;
   thinking?: { type: "enabled"; budgetTokens: number };
-  cacheMode?: "off" | "system_and_tools";
+  // "system_and_tools": cache breakpoints on the system prompt and tool list.
+  // "conversation": system_and_tools PLUS a moving breakpoint on the last
+  // message, so the whole append-only conversation prefix is billed at the
+  // provider's cache-read rate on subsequent turns (fable/16).
+  cacheMode?: "off" | "system_and_tools" | "conversation";
   serviceTier?: "auto" | "standard_only";
   maxAttempts?: number;
   timeoutMs?: number;
   tags?: Record<string, string>;
+}
+
+// Merge a base policy (e.g. the telemetry phase policy) with an override
+// (context.policy). Explicitly supplied override fields win; fields the
+// override leaves undefined survive from the base, so wiring one field (like
+// cacheMode) can never discard a configured model, timeout, retry policy,
+// max output, service tier, tags, or thinking policy. Tags merge key-wise.
+export function mergeInferencePolicies(
+  base: InferencePolicy | undefined,
+  override: InferencePolicy | undefined,
+): InferencePolicy {
+  const merged: InferencePolicy = { ...(base ?? {}) };
+
+  for (const [key, value] of Object.entries(override ?? {})) {
+    if (value !== undefined) {
+      (merged as Record<string, unknown>)[key] = value;
+    }
+  }
+
+  if (base?.tags && override?.tags) {
+    merged.tags = { ...base.tags, ...override.tags };
+  }
+
+  return merged;
 }
 
 export interface InferenceRecord {
@@ -202,18 +230,21 @@ function sanitizeRecord(record: InferenceRecord): InferenceRecord {
 //   "models": {
 //     "<exact-model-id>": {
 //       "effectiveDate": "YYYY-MM-DD",
+//       "validThrough": "YYYY-MM-DD",
 //       "perMTok": { "input": n, "output": n, "cacheRead": n,
 //                     "cacheWrite5m": n, "cacheWrite1h": n }
 //     }
 //   }
 // }
-// Rates must be filled in by an operator from the provider's current price
-// sheet. This repository intentionally ships an EMPTY models map: an unknown
-// model produces estimatedCostUsd: null and a report-level warning downstream
-// — never a guessed cost.
+// Rates are effective-dated. Unknown, future, or expired prices produce
+// estimatedCostUsd: null and a report-level warning downstream — never a
+// guessed or stale cost.
 
 type ModelPricing = {
   effectiveDate: string;
+  validThrough: string;
+  source?: string;
+  retrievedAt?: string;
   perMTok: {
     input: number;
     output: number;
@@ -286,7 +317,12 @@ export function estimateCostUsd(
 ): number | null {
   const rates = pricing?.models[model];
 
-  if (!rates || usage.inputTokens === null || usage.outputTokens === null) {
+  if (
+    !rates ||
+    !isCurrentPricing(rates) ||
+    usage.inputTokens === null ||
+    usage.outputTokens === null
+  ) {
     return null;
   }
 
@@ -302,17 +338,42 @@ export function estimateCostUsd(
   return Number.isFinite(cost) ? cost : null;
 }
 
+function isCurrentPricing(rates: ModelPricing, now = new Date()): boolean {
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+  if (
+    !datePattern.test(rates.effectiveDate) ||
+    !datePattern.test(rates.validThrough)
+  ) {
+    return false;
+  }
+
+  const effective = Date.parse(`${rates.effectiveDate}T00:00:00.000Z`);
+  const validThrough = Date.parse(`${rates.validThrough}T23:59:59.999Z`);
+  const current = now.getTime();
+  return Number.isFinite(effective) && Number.isFinite(validThrough) &&
+    current >= effective && current <= validThrough;
+}
+
 // --- Cache markers (default off) ----------------------------------------------
 
+// Content block types that reject cache_control. A conversation breakpoint is
+// placed on the LAST cacheable block of the last message; thinking blocks are
+// skipped (the marker moves to the nearest earlier cacheable block).
+const NON_CACHEABLE_BLOCK_TYPES = new Set(["thinking", "redacted_thinking"]);
+
 // "system_and_tools": mark the end of the system prompt and the last tool
-// definition as cache breakpoints. Only structural wrapping is performed; text
-// content is never modified. With cacheMode "off" (the default), params are
-// returned unchanged (same object), preserving pre-gateway request bytes.
+// definition as cache breakpoints. "conversation": system_and_tools PLUS a
+// breakpoint on the last cacheable content block of the last message, so the
+// entire append-only history becomes a reusable cache prefix (max provider
+// breakpoints per request: 4; this uses at most 3). Only structural wrapping
+// is performed; text content is never modified, and the caller's params are
+// never mutated (copy-on-write). With cacheMode "off" (the default), params
+// are returned unchanged (same object), preserving pre-gateway request bytes.
 export function applyCacheMode(
   params: Anthropic.Messages.MessageCreateParamsNonStreaming,
   cacheMode: InferencePolicy["cacheMode"],
 ): Anthropic.Messages.MessageCreateParamsNonStreaming {
-  if (cacheMode !== "system_and_tools") {
+  if (cacheMode !== "system_and_tools" && cacheMode !== "conversation") {
     return params;
   }
 
@@ -338,7 +399,51 @@ export function applyCacheMode(
     );
   }
 
+  if (cacheMode === "conversation" && next.messages.length > 0) {
+    next.messages = markLastMessageForCache(next.messages);
+  }
+
   return next;
+}
+
+// Copy-on-write: returns a new messages array whose LAST message carries a
+// cache breakpoint on its last cacheable content block. Every other element
+// is the caller's original object. If no block of the last message accepts
+// cache_control, the array is returned with the last message unchanged.
+function markLastMessageForCache(
+  messages: Anthropic.Messages.MessageParam[],
+): Anthropic.Messages.MessageParam[] {
+  const last = messages[messages.length - 1];
+  let markedContent: Anthropic.Messages.MessageParam["content"] | null = null;
+
+  if (typeof last.content === "string") {
+    markedContent = [
+      { type: "text", text: last.content, cache_control: { type: "ephemeral" } },
+    ];
+  } else if (Array.isArray(last.content) && last.content.length > 0) {
+    let markIndex = -1;
+
+    for (let index = last.content.length - 1; index >= 0; index -= 1) {
+      if (!NON_CACHEABLE_BLOCK_TYPES.has(last.content[index].type)) {
+        markIndex = index;
+        break;
+      }
+    }
+
+    if (markIndex >= 0) {
+      markedContent = last.content.map((block, index) =>
+        index === markIndex
+          ? ({ ...block, cache_control: { type: "ephemeral" } } as typeof block)
+          : block,
+      );
+    }
+  }
+
+  if (markedContent === null) {
+    return messages;
+  }
+
+  return [...messages.slice(0, -1), { ...last, content: markedContent }];
 }
 
 // --- Gateway -------------------------------------------------------------------
@@ -404,8 +509,14 @@ export async function runInference(
   const create: CreateFn =
     deps.create ?? ((finalParams, options) => getClient().messages.create(finalParams, options));
   const now = deps.now ?? Date.now;
-  const policy =
-    context.policy ?? context.telemetry?.policies?.[context.phase] ?? {};
+  // Policy composition (fable/16): the telemetry phase policy is the base and
+  // explicitly supplied context.policy fields override it field-wise, so a
+  // caller wiring one field (e.g. cacheMode) cannot discard the phase
+  // policy's model, timeout, retries, max output, tier, tags, or thinking.
+  const policy = mergeInferencePolicies(
+    context.telemetry?.policies?.[context.phase],
+    context.policy,
+  );
 
   // Assemble final params. Preserved default: thinking disabled unless the
   // caller's params or the policy explicitly enable it (claude.ts:44-51).
@@ -519,4 +630,92 @@ export async function runInference(
   }
 
   return message;
+}
+
+// --- Per-investigation usage totals (fable/16) ---------------------------------
+//
+// Derived from the append-only JSONL, which holds exactly ONE record per
+// logical call (retries are folded into attemptCount), so summing records
+// never double counts a retried call. The JSONL stays the source record;
+// these totals are a convenience projection for cost-shape.json.
+
+export type InferenceUsageTotals = {
+  records: number;
+  inputTokensTotal: number;
+  outputTokensTotal: number;
+  cacheReadTokensTotal: number;
+  cacheWriteTokensTotal: number;
+  // Null when pricing was unknown for ANY successful record — a partial sum
+  // would be a silent guess.
+  estimatedInferenceCostUsd: number | null;
+  cacheHitTurns: number;
+  cacheMissTurns: number;
+};
+
+export async function summarizeInferenceRecords(
+  dir: string,
+): Promise<InferenceUsageTotals | null> {
+  let raw: string;
+
+  try {
+    raw = await readFile(path.join(dir, INFERENCE_RECORDS_FILE), "utf8");
+  } catch {
+    return null;
+  }
+
+  const totals: InferenceUsageTotals = {
+    records: 0,
+    inputTokensTotal: 0,
+    outputTokensTotal: 0,
+    cacheReadTokensTotal: 0,
+    cacheWriteTokensTotal: 0,
+    estimatedInferenceCostUsd: 0,
+    cacheHitTurns: 0,
+    cacheMissTurns: 0,
+  };
+  let pricingComplete = true;
+
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) {
+      continue;
+    }
+
+    let record: InferenceRecord;
+
+    try {
+      record = JSON.parse(line) as InferenceRecord;
+    } catch {
+      continue; // A torn trailing line (crash mid-append) is not an error.
+    }
+
+    totals.records += 1;
+    totals.inputTokensTotal += record.inputTokens ?? 0;
+    totals.outputTokensTotal += record.outputTokens ?? 0;
+    totals.cacheReadTokensTotal += record.cacheReadTokens ?? 0;
+    totals.cacheWriteTokensTotal += record.cacheCreationTokens ?? 0;
+
+    if ((record.cacheReadTokens ?? 0) > 0) {
+      totals.cacheHitTurns += 1;
+    } else if (record.status === "succeeded") {
+      totals.cacheMissTurns += 1;
+    }
+
+    if (record.status === "succeeded") {
+      if (record.estimatedCostUsd === null) {
+        pricingComplete = false;
+      } else {
+        totals.estimatedInferenceCostUsd =
+          (totals.estimatedInferenceCostUsd ?? 0) + record.estimatedCostUsd;
+      }
+    }
+  }
+
+  if (!pricingComplete) {
+    console.warn(
+      "Inference pricing unknown for at least one record; estimatedInferenceCostUsd stays null (see evals/pricing.v1.json).",
+    );
+    totals.estimatedInferenceCostUsd = null;
+  }
+
+  return totals;
 }

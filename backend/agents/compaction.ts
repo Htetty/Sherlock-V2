@@ -43,12 +43,18 @@ export type Compactor = {
 };
 
 export function createCompactor(
-  options: Partial<typeof COMPACTION_DEFAULTS> & { enabled?: boolean } = {},
+  options: Partial<typeof COMPACTION_DEFAULTS> & {
+    enabled?: boolean;
+    allowParallelToolCalls?: boolean;
+  } = {},
 ): Compactor {
   const enabled = options.enabled ?? compactionEnabled();
   const everyToolCalls = options.everyToolCalls ?? COMPACTION_DEFAULTS.everyToolCalls;
   const byteThreshold = options.byteThreshold ?? COMPACTION_DEFAULTS.byteThreshold;
   const keepLastPairs = options.keepLastPairs ?? COMPACTION_DEFAULTS.keepLastPairs;
+  const continuationInstruction = options.allowParallelToolCalls
+    ? "Continue from this state. Respond with tool calls only; independent read-only inspections may be called in parallel, while mutation or terminal tools must be called alone."
+    : "Continue from this state. Respond with exactly one tool call.";
 
   let toolCallsSinceCompaction = 0;
   let bytesSinceCompaction = 0;
@@ -97,7 +103,7 @@ export function createCompactor(
         },
         {
           role: "user",
-          content: `SESSION STATE SUMMARY (earlier turns compacted; full raw tool results are preserved on disk):\n\n${buildSummary()}\n\nContinue from this state. Respond with exactly one tool call.`,
+          content: `SESSION STATE SUMMARY (earlier turns compacted; full raw tool results are preserved on disk):\n\n${buildSummary()}\n\n${continuationInstruction}`,
         },
       ];
 

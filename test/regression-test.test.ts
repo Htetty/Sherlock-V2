@@ -138,9 +138,23 @@ describe("regression generation prompt", () => {
         reproductionResult: {
           outcomeReason: "reproduced",
           assertion: null,
+          apiResponses: [
+            {
+              method: "POST",
+              url: "http://localhost:51234/tasks/archive-completed",
+              status: 202,
+              statusText: "Accepted",
+              body: '{"jobId":17,"accessToken":"do-not-leak"}',
+            },
+          ],
         } as unknown as ReproductionResult,
-        fixProposal: { summary: "fix" },
-        sourceFiles: [{ path: "server.mjs", contents: "// src" }],
+        fixProposal: { summary: "fix", files: [{ path: "server.mjs", edits: [] }] },
+        sourceFiles: [
+          {
+            path: "server.mjs",
+            contents: `${Array.from({ length: 1_500 }, (_, index) => `// filler ${index}`).join("\n")}\nrouter.post("/tasks/archive-completed", archiveCompleted);`,
+          },
+        ],
       },
       null,
     );
@@ -154,6 +168,12 @@ describe("regression generation prompt", () => {
     expect(prompt).toContain("REGRESSION_EXPECTED_FAILURE:");
     expect(prompt).toContain("exactly ONE assertion");
     expect(prompt).toContain("Capture IDs from the resources the test itself creates");
+    expect(prompt).toContain("FINAL observable resource or user-visible state");
+    expect(prompt).toContain("Never guess a JSON response shape");
+    expect(prompt).toContain('"jobId":17');
+    expect(prompt).toContain("[REDACTED]");
+    expect(prompt).not.toContain("do-not-leak");
+    expect(prompt).toContain('router.post("/tasks/archive-completed"');
     expect(prompt).toContain("Test ONLY the reproduced behavioral assertion");
     expect(prompt).toContain("ACTUAL behavioral completion condition");
     expect(prompt).toContain("must not stop merely because a response exists");

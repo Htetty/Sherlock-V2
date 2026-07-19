@@ -3,7 +3,7 @@
 // All model calls are injected; no test here talks to the network or needs
 // ANTHROPIC_API_KEY.
 
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -69,6 +69,29 @@ describe("runInference", () => {
   test("success writes one schema-valid record with mapped usage", async () => {
     const dir = await makeRecorderDir();
     const recorder = createInferenceRecorder(dir);
+    const pricingFile = path.join(dir, "pricing.json");
+    await writeFile(
+      pricingFile,
+      JSON.stringify({
+        schemaVersion: 1,
+        currency: "USD",
+        models: {
+          "claude-sonnet-5": {
+            effectiveDate: "2020-01-01",
+            validThrough: "2099-12-31",
+            perMTok: {
+              input: 2,
+              output: 10,
+              cacheRead: 0.2,
+              cacheWrite5m: 2.5,
+              cacheWrite1h: 4,
+            },
+          },
+        },
+      }),
+      "utf8",
+    );
+    process.env.SHERLOCK_PRICING_FILE = pricingFile;
 
     const message = await runInference(
       { phase: "fix", telemetry: { investigationId: "inv_TEST", recorder } },
@@ -95,9 +118,11 @@ describe("runInference", () => {
       cacheCreation1hTokens: 0,
       thinkingTokens: null,
       stopReason: "end_turn",
-      // Pricing table ships empty: unknown model => null, never a guess.
-      estimatedCostUsd: null,
     });
+    // fable/16: the pricing table now ships claude-sonnet-5 rates (provider
+    // sheet, introductory pricing effective 2026-07-17), so a known model
+    // computes a real cost: 1200×$2 + 80×$10 + 900×$0.20 + 300×$2.50 per MTok.
+    expect(records[0].estimatedCostUsd).toBeCloseTo(0.00413, 6);
     expect(records[0].latencyMs).toBeGreaterThanOrEqual(0);
     expect(recorder.failures).toBe(0);
   });
@@ -322,6 +347,7 @@ describe("runInference", () => {
       models: {
         "claude-sonnet-5": {
           effectiveDate: "2026-01-01",
+          validThrough: "2099-12-31",
           perMTok: { input: 3, output: 15, cacheRead: 0.3, cacheWrite5m: 3.75, cacheWrite1h: 6 },
         },
       },
@@ -339,6 +365,22 @@ describe("runInference", () => {
     expect(estimateCostUsd(null, "claude-sonnet-5", usage)).toBeNull();
     expect(
       estimateCostUsd(pricing, "claude-sonnet-5", { ...usage, inputTokens: null }),
+    ).toBeNull();
+
+    expect(
+      estimateCostUsd(
+        {
+          ...pricing,
+          models: {
+            "claude-sonnet-5": {
+              ...pricing.models["claude-sonnet-5"],
+              validThrough: "2026-01-01",
+            },
+          },
+        },
+        "claude-sonnet-5",
+        usage,
+      ),
     ).toBeNull();
   });
 });

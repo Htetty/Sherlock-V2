@@ -90,6 +90,18 @@ services:
       retries: 3
       start_period: 20s
 
+  # Build/pin the fixer's read-only programmatic explorer before the worker
+  # starts. This one-shot service exists to make the image an explicit
+  # deployment dependency rather than an undocumented manual build step.
+  explorer-image:
+    image: ${SHERLOCK_EXPLORER_IMAGE:-sherlock-explorer:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.explorer
+    command: ["/bin/true"]
+    restart: "no"
+    network_mode: "none"
+
   worker:
     build:
       context: .
@@ -123,6 +135,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      explorer-image:
+        condition: service_completed_successfully
     volumes:
       # Control the host Docker daemon (target apps + validation/regression
       # containers). This grants host-level privileges: keep the worker host

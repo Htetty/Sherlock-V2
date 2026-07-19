@@ -19,9 +19,11 @@ import {
 } from "./claude.js";
 import {
   createInferenceRecorder,
+  summarizeInferenceRecords,
   type InferenceBudgetGuard,
   type InferenceTelemetry,
 } from "./inference.js";
+import { resolveEfficiencyPolicy } from "./efficiency-policy.js";
 import {
   runFixerAgent,
   type FixerAgentAttempt,
@@ -30,6 +32,8 @@ import {
 import {
   getBudgetProfileName,
   runReproducerAgent,
+  type PriorAttemptStep,
+  type PriorReproductionAttempt,
   type ReproducerAgentResult,
   type ReproducerFinding,
 } from "../agents/reproducer.js";
@@ -176,6 +180,9 @@ export type InvestigationPipelineResult = {
 export type InvestigationPolicy = {
   budgetProfile?: "standard" | "deep";
   escalateNotReproduced?: boolean;
+  // Test/debug routing: skip memory replay and one-shot planning so the
+  // bounded reproducer agent handles the issue from its first observation.
+  forceReproducerAgent?: boolean;
   compaction?: boolean;
   parallelReads?: boolean;
   inference?: InferenceTelemetry["policies"];
@@ -204,6 +211,13 @@ export type PipelineOptions = {
   stateStore?: InvestigationStateStore;
   deliveryPayloadStore?: Pick<DeliveryStateStore, "persistPayload">;
 };
+
+export function shouldForceReproducerAgent(
+  policyValue: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return policyValue ?? env.SHERLOCK_FORCE_REPRODUCER_AGENT === "true";
+}
 
 export type ReproducerFallbackCase =
   | "memory_reproduced"
@@ -270,6 +284,8 @@ export async function runInvestigationPipeline(
   let sandboxSession: SandboxSession | null = null;
   let store: ArtifactStore | null = null;
   let investigationRecord: Record<string, unknown> = { investigationId };
+  // Set once cost-shape exists; called from finish() on every terminal path.
+  let deriveUsageTotals: (() => Promise<void>) | null = null;
 
   // Wraps finishInvestigation so every terminal path — success or early
   // failure return — records the final outcome (and any error) into the state
@@ -279,6 +295,15 @@ export async function runInvestigationPipeline(
     extra: Partial<InvestigationPipelineResult> = {},
     report: InvestigationReportData | null = null,
   ): Promise<InvestigationPipelineResult> => {
+    // fable/16: derive per-run token/cost totals from the append-only
+    // inference JSONL into cost-shape.json on EVERY terminal path.
+    // Best-effort telemetry — never fails the investigation.
+    try {
+      await deriveUsageTotals?.();
+    } catch (error) {
+      log(`Could not derive inference usage totals: ${formatError(error)}`);
+    }
+
     const finished = await finishInvestigation(
       store as ArtifactStore,
       investigationRecord,
@@ -323,10 +348,34 @@ export async function runInvestigationPipeline(
     // second — leaving policy unset preserves worker-global behavior.
     const budgetProfile = options.policy?.budgetProfile ?? getBudgetProfileName();
 
+    // Efficiency policy (fable/16): resolved ONCE here from environment
+    // defaults/kill switches, passed explicitly to both agents as an
+    // immutable value, and persisted with the artifacts. Nothing re-reads
+    // these environment variables mid-run.
+    const efficiency = resolveEfficiencyPolicy();
+    await store.writeJson("efficiency-policy.json", efficiency);
+    log(`Efficiency policy: ${JSON.stringify(efficiency)}`);
+
     // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
     // incrementally so a crash still leaves a partial record.
     const costShape = createCostShapeTracker(store, budgetProfile);
-    await costShape.update({});
+    await costShape.update({ resolvedEfficiencyPolicy: efficiency });
+
+    deriveUsageTotals = async () => {
+      const totals = await summarizeInferenceRecords(store!.dir);
+
+      if (totals && totals.records > 0) {
+        await costShape.update({
+          inputTokensTotal: totals.inputTokensTotal,
+          outputTokensTotal: totals.outputTokensTotal,
+          cacheReadTokensTotal: totals.cacheReadTokensTotal,
+          cacheWriteTokensTotal: totals.cacheWriteTokensTotal,
+          estimatedInferenceCostUsd: totals.estimatedInferenceCostUsd,
+          cacheHitTurns: totals.cacheHitTurns,
+          cacheMissTurns: totals.cacheMissTurns,
+        });
+      }
+    };
 
     investigationRecord = {
       investigationId,
@@ -487,6 +536,15 @@ export async function runInvestigationPipeline(
     const escalateNotReproduced =
       options.policy?.escalateNotReproduced ??
       process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
+    const forceReproducerAgent = shouldForceReproducerAgent(
+      options.policy?.forceReproducerAgent,
+    );
+
+    if (forceReproducerAgent) {
+      log(
+        "Forced reproducer-agent mode enabled: memory replay and one-shot reproduction are skipped.",
+      );
+    }
 
     let plan: ReproductionPlan | null = null;
     let result: ReproductionResult | null = null;
@@ -575,12 +633,27 @@ export async function runInvestigationPipeline(
       }
     };
 
+    // Warm start (fable/16): the structured trace of the last scripted
+    // reproduction attempt (memory replay or one-shot) that EXECUTED but did
+    // not reproduce. Handed to the reproducer agent so it continues from the
+    // point of divergence instead of exploring from scratch. Never fabricated
+    // for plan-generation or validation failures.
+    let priorAttempt: PriorReproductionAttempt | null = null;
+
     // Runs the reproducer agent fallback. Returns a finished pipeline result
     // on a terminal failure, or null when a plan/result was accepted (stored
     // into the outer plan/result variables).
     const runReproducerAgentFallback =
       async (): Promise<InvestigationPipelineResult | null> => {
-        await costShape.update({ reproducerAgentUsed: true });
+        const warmStart = efficiency.reproducerWarmStart && priorAttempt !== null;
+        await costShape.update({
+          reproducerAgentUsed: true,
+          warmStartUsed: warmStart,
+        });
+
+        if (priorAttempt) {
+          await store!.writeJson("prior-attempt.json", priorAttempt);
+        }
 
         const reproResult = await runReproducerAgent({
           investigationId,
@@ -606,6 +679,8 @@ export async function runInvestigationPipeline(
           restart,
           telemetry: inferenceTelemetry,
           budgetProfile,
+          efficiency,
+          ...(efficiency.reproducerWarmStart && priorAttempt ? { priorAttempt } : {}),
           ...(options.policy?.compaction !== undefined
             ? { compaction: options.policy.compaction }
             : {}),
@@ -616,6 +691,10 @@ export async function runInvestigationPipeline(
           reproducerFailureCode: reproResult.failureCode,
           compactionEvents:
             costShape.shape.compactionEvents + reproResult.compactionEvents,
+          reproducerRunStepsCalls: reproResult.efficiencyCounters.runStepsCalls,
+          reproducerBatchedActions: reproResult.efficiencyCounters.batchedActions,
+          reproducerActionDeltaBytes: reproResult.efficiencyCounters.actionDeltaBytes,
+          reproducerReadPageCalls: reproResult.efficiencyCounters.readPageCalls,
         });
 
         log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
@@ -684,7 +763,7 @@ export async function runInvestigationPipeline(
     // falls through); the hash check only skips obviously wasteful attempts.
     const replayCandidate = pastEntries.find((entry) => entry.reproductionPlan);
 
-    if (replayCandidate?.reproductionPlan) {
+    if (!forceReproducerAgent && replayCandidate?.reproductionPlan) {
       log("Memory replay candidate found.");
 
       const staleFile = await findStaleFile(
@@ -737,13 +816,19 @@ export async function runInvestigationPipeline(
             await store.writeJson("reproduction-plan.json", plan);
           } else {
             log("Memory replay did not reproduce; falling through to one-shot reproduction.");
+            // Warm start (fable/16): the replay EXECUTED — keep its trace.
+            priorAttempt = buildPriorReproductionAttempt(
+              "memory_replay",
+              replayValidation.plan,
+              replayResult,
+            );
           }
         }
       }
     }
 
     // --- 2. One-shot reproduction plan ------------------------------------
-    if (!result) {
+    if (!result && !forceReproducerAgent) {
       await costShape.update({ oneShotPlanTried: true });
 
       const generated = await generateReproductionPlan(
@@ -837,6 +922,14 @@ export async function runInvestigationPipeline(
               "One-shot reproduction execution failed; falling back to reproducer agent.",
             );
           }
+
+          // Warm start (fable/16): the one-shot plan EXECUTED — hand its
+          // trace to the agent (a fresher lead than any earlier memory
+          // replay trace).
+          priorAttempt =
+            buildPriorReproductionAttempt("one_shot", oneShotPlan, oneShotResult) ??
+            priorAttempt;
+
           const terminal = await runReproducerAgentFallback();
 
           if (terminal) {
@@ -851,6 +944,14 @@ export async function runInvestigationPipeline(
           result = oneShotResult;
           reproductionPath = "one_shot";
         }
+      }
+    }
+
+    if (!result && forceReproducerAgent) {
+      const terminal = await runReproducerAgentFallback();
+
+      if (terminal) {
+        return terminal;
       }
     }
 
@@ -1031,6 +1132,7 @@ export async function runInvestigationPipeline(
             ),
           telemetry: inferenceTelemetry,
           budgetProfile,
+          efficiency,
           parallelReads: options.policy?.parallelReads,
           ...(options.policy?.compaction !== undefined
             ? { compaction: options.policy.compaction }
@@ -1048,6 +1150,17 @@ export async function runInvestigationPipeline(
           fixerFailureCode: agentResult.failureCode,
           compactionEvents:
             costShape.shape.compactionEvents + agentResult.compactionEvents,
+          fixerParallelBatches: agentResult.efficiencyCounters.parallelBatches,
+          fixerBatchedReads: agentResult.efficiencyCounters.batchedReads,
+          fixerReadManyCalls: agentResult.efficiencyCounters.readManyCalls,
+          fixerFilesReadThroughReadMany:
+            agentResult.efficiencyCounters.filesReadThroughReadMany,
+          fixerRunCodeCalls: agentResult.efficiencyCounters.runCodeCalls,
+          fixerRunCodeTimeouts: agentResult.efficiencyCounters.runCodeTimeouts,
+          fixerRunCodeInvalidResults:
+            agentResult.efficiencyCounters.runCodeInvalidResults,
+          fixerSuccessfulInspections:
+            agentResult.efficiencyCounters.successfulInspections,
         });
         log(`Fixer agent finished: ${agentResult.status} — ${agentResult.reason}`);
         if (agentResult.failureCode) {
@@ -1081,7 +1194,7 @@ export async function runInvestigationPipeline(
             }
 
             if (regression.testName) {
-              log(`Regression test generated: ${regression.testName}`);
+              log(`Regression test proposal generated: ${regression.testName}`);
             }
             if (regression.prePatch) {
               log(`Pre-patch regression result: ${regression.prePatch}`);
@@ -1765,4 +1878,50 @@ function formatError(error: unknown) {
   }
 
   return String(error);
+}
+
+// --- Warm start (fable/16) ------------------------------------------------------
+// Builds the structured prior-attempt trace from a scripted reproduction that
+// EXECUTED but did not reproduce. Returns null when nothing actually ran, so
+// plan-generation and validation failures can never fabricate a warm start.
+export function buildPriorReproductionAttempt(
+  source: "one_shot" | "memory_replay",
+  plan: ReproductionPlan,
+  result: ReproductionResult,
+): PriorReproductionAttempt | null {
+  const executedSteps: PriorAttemptStep[] = (result.steps ?? [])
+    .filter((step) => step.startedAt !== null)
+    .map((step) => ({
+      id: step.id,
+      action: step.action,
+      outcome: step.outcome,
+      error: step.error ?? null,
+    }));
+
+  if (executedSteps.length === 0) {
+    return null;
+  }
+
+  const failedStep = executedSteps.find((step) => step.outcome === "failed") ?? null;
+  const evidenceSummary = truncateUtf8Bytes(
+    [
+      `Replay outcome: ${result.outcome} — ${result.outcomeReason}`,
+      result.assertion
+        ? `Assertion: matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected} — ${result.assertion.detail}`
+        : "Assertion: (not evaluated)",
+      `Console errors: ${result.consoleErrors.join(" | ") || "(none)"}`,
+      `Page errors: ${result.pageErrors.join(" | ") || "(none)"}`,
+      `Network failures: ${result.networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join(" | ") || "(none)"}`,
+      `API responses: ${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status}`).join(" | ") || "(none)"}`,
+    ].join("\n"),
+    2_000,
+  );
+
+  return {
+    source,
+    planSteps: plan.steps,
+    executedSteps,
+    failedStep,
+    evidenceSummary,
+  };
 }

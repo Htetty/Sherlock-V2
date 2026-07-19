@@ -13,8 +13,11 @@ function block(id: string, name: string): Anthropic.Messages.ToolUseBlock {
 }
 
 describe("parallelReadsEnabled", () => {
-  test("defaults off; env and override control it", () => {
-    expect(parallelReadsEnabled(undefined, {} as NodeJS.ProcessEnv)).toBe(false);
+  test("defaults on (fable/16); env kill switch and override control it", () => {
+    expect(parallelReadsEnabled(undefined, {} as NodeJS.ProcessEnv)).toBe(true);
+    expect(
+      parallelReadsEnabled(undefined, { SHERLOCK_FIXER_PARALLEL_READS: "false" } as unknown as NodeJS.ProcessEnv),
+    ).toBe(false);
     expect(
       parallelReadsEnabled(undefined, { SHERLOCK_FIXER_PARALLEL_READS: "true" } as unknown as NodeJS.ProcessEnv),
     ).toBe(true);

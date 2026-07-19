@@ -234,6 +234,45 @@ export async function runWorkerPreflight(
     add("docker:target-image", "FAIL", "Skipped: Docker daemon is not reachable.");
   }
 
+  const runCodeEnabled = env.SHERLOCK_FIXER_RUN_CODE !== "false";
+  const explorerImage = env.SHERLOCK_EXPLORER_IMAGE?.trim() || "sherlock-explorer:latest";
+
+  if (!runCodeEnabled) {
+    add(
+      "docker:explorer-image",
+      "PASS",
+      "run_code is disabled; no explorer image is required.",
+    );
+  } else if (!dockerDaemonReachable) {
+    add("docker:explorer-image", "FAIL", "Skipped: Docker daemon is not reachable.");
+  } else {
+    try {
+      await runCommand("docker", ["image", "inspect", explorerImage]);
+      add(
+        "docker:explorer-image",
+        "PASS",
+        `Explorer image ${explorerImage} is available locally.`,
+      );
+    } catch (error) {
+      add(
+        "docker:explorer-image",
+        "FAIL",
+        `run_code is enabled but explorer image ${explorerImage} is unavailable: ${message(error)}. Build Dockerfile.explorer or set SHERLOCK_FIXER_RUN_CODE=false.`,
+      );
+    }
+  }
+
+  const pricingFile = env.SHERLOCK_PRICING_FILE?.trim() || path.resolve("evals", "pricing.v1.json");
+  if (fileExists(pricingFile)) {
+    add("pricing:file", "PASS", `Pricing file ${pricingFile} exists.`);
+  } else {
+    add(
+      "pricing:file",
+      "FAIL",
+      `Pricing file ${pricingFile} is missing; inference costs cannot be measured.`,
+    );
+  }
+
   // --- Sandbox addressing ----------------------------------------------------
   // A containerized worker can never reach sibling target containers through
   // its own localhost: it must share a Docker network with them

@@ -7,7 +7,7 @@
 // restart behavior is injected so the loop is independent of the sandbox.
 
 import { execFile } from "node:child_process";
-import { access, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createArtifactStore, createFixAttemptId } from "./artifacts.js";
@@ -323,6 +323,12 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 
     for (let attempt = 1; attempt <= 2 && provenRegressionTest === null; attempt += 1) {
       regressionSummary.generationAttempts = attempt;
+      const regressionAttemptDir = path.join(
+        store.dir,
+        "regression-attempts",
+        String(attempt).padStart(3, "0"),
+      );
+      await mkdir(regressionAttemptDir, { recursive: true });
 
       let raw: unknown;
 
@@ -330,14 +336,30 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         raw = await input.generateRegressionTest(feedback);
       } catch (error) {
         regressionSummary.reason = `Regression-test generation failed: ${formatError(error)}`;
+        await writeFile(
+          path.join(regressionAttemptDir, "generation-error.txt"),
+          regressionSummary.reason,
+          "utf8",
+        );
         break;
       }
+
+      await writeFile(
+        path.join(regressionAttemptDir, "proposal.json"),
+        JSON.stringify(raw ?? null, null, 2),
+        "utf8",
+      );
 
       const shape = validateRegressionProposalShape(raw);
 
       if (!shape.ok) {
         feedback = shape.errors.join(" | ");
         regressionSummary.reason = `The proposed test was structurally invalid: ${feedback}`;
+        await writeFile(
+          path.join(regressionAttemptDir, "result.json"),
+          JSON.stringify({ classification: "structurally_invalid", errors: shape.errors }, null, 2),
+          "utf8",
+        );
         continue;
       }
 
@@ -346,6 +368,11 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
       if (!safety.ok) {
         feedback = safety.errors.join(" | ");
         regressionSummary.reason = `The proposed test was unsafe: ${feedback}`;
+        await writeFile(
+          path.join(regressionAttemptDir, "result.json"),
+          JSON.stringify({ classification: "unsafe", errors: safety.errors }, null, 2),
+          "utf8",
+        );
         continue;
       }
 
@@ -362,6 +389,11 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         testProposal.contents,
         "utf8",
       );
+      await writeFile(
+        path.join(regressionAttemptDir, "regression-test-source.mjs"),
+        testProposal.contents,
+        "utf8",
+      );
 
       const preRuntime = await prepareVerificationRuntime(
         input.repoPath,
@@ -375,6 +407,11 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         await preRuntime.cleanup();
         feedback = "The materialized test bytes did not match the proposal hash.";
         regressionSummary.reason = feedback;
+        await writeFile(
+          path.join(regressionAttemptDir, "result.json"),
+          JSON.stringify({ classification: "hash_mismatch", reason: feedback }, null, 2),
+          "utf8",
+        );
         continue;
       }
 
@@ -401,7 +438,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
       const classification = classifyPrePatchRun(preRun, failureMarker);
       regressionSummary.prePatch = classification;
 
-      await store.writeJson("regression-prepatch-result.json", {
+      const prePatchArtifact = {
         investigationId: input.investigationId,
         fixAttemptId,
         attempt,
@@ -411,7 +448,13 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         durationMs: preRun.durationMs,
         stdout: boundOutput(preRun.stdout),
         stderr: boundOutput(preRun.stderr),
-      });
+      };
+      await store.writeJson("regression-prepatch-result.json", prePatchArtifact);
+      await writeFile(
+        path.join(regressionAttemptDir, "prepatch-result.json"),
+        JSON.stringify(prePatchArtifact, null, 2),
+        "utf8",
+      );
 
       if (classification === "failed_as_expected") {
         provenRegressionTest = testProposal;

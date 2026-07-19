@@ -7,6 +7,7 @@
 // crash still leaves a partial record.
 
 import type { ArtifactStore } from "./artifacts.js";
+import type { EfficiencyPolicy } from "./efficiency-policy.js";
 
 export type BudgetProfileName = "standard" | "deep";
 
@@ -26,6 +27,37 @@ export type CostShape = {
   fixerFailureCode: string | null;
   budgetProfile: BudgetProfileName;
   compactionEvents: number;
+  // --- fable/16 tool-call efficiency observability ---------------------------
+  // The immutable policy resolved at investigation start (null until set).
+  resolvedEfficiencyPolicy: EfficiencyPolicy | null;
+  // Token totals derived from the append-only inference JSONL (one record per
+  // LOGICAL call, so retries are never double counted). Null until derived.
+  inputTokensTotal: number | null;
+  outputTokensTotal: number | null;
+  cacheReadTokensTotal: number | null;
+  cacheWriteTokensTotal: number | null;
+  // Sum of per-record estimatedCostUsd. Null when pricing was unknown for any
+  // successful record (never a guess).
+  estimatedInferenceCostUsd: number | null;
+  // Calls whose usage reported nonzero cache reads vs none.
+  cacheHitTurns: number;
+  cacheMissTurns: number;
+  // Fixer dense/batched tooling.
+  fixerParallelBatches: number;
+  fixerBatchedReads: number;
+  fixerReadManyCalls: number;
+  fixerFilesReadThroughReadMany: number;
+  fixerRunCodeCalls: number;
+  fixerRunCodeTimeouts: number;
+  fixerRunCodeInvalidResults: number;
+  fixerSuccessfulInspections: number;
+  // Reproducer batching/deltas.
+  reproducerRunStepsCalls: number;
+  reproducerBatchedActions: number;
+  reproducerActionDeltaBytes: number;
+  reproducerReadPageCalls: number;
+  // Warm start (prior scripted attempt handed to the reproducer).
+  warmStartUsed: boolean;
 };
 
 export type CostShapeTracker = {
@@ -55,6 +87,27 @@ export function createCostShapeTracker(
     fixerFailureCode: null,
     budgetProfile,
     compactionEvents: 0,
+    resolvedEfficiencyPolicy: null,
+    inputTokensTotal: null,
+    outputTokensTotal: null,
+    cacheReadTokensTotal: null,
+    cacheWriteTokensTotal: null,
+    estimatedInferenceCostUsd: null,
+    cacheHitTurns: 0,
+    cacheMissTurns: 0,
+    fixerParallelBatches: 0,
+    fixerBatchedReads: 0,
+    fixerReadManyCalls: 0,
+    fixerFilesReadThroughReadMany: 0,
+    fixerRunCodeCalls: 0,
+    fixerRunCodeTimeouts: 0,
+    fixerRunCodeInvalidResults: 0,
+    fixerSuccessfulInspections: 0,
+    reproducerRunStepsCalls: 0,
+    reproducerBatchedActions: 0,
+    reproducerActionDeltaBytes: 0,
+    reproducerReadPageCalls: 0,
+    warmStartUsed: false,
   };
 
   return {
