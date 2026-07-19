@@ -43,6 +43,7 @@ RUN npm ci
 COPY tsconfig.json ./
 COPY backend ./backend
 COPY src ./src
+COPY evals/pricing.v1.json ./evals/pricing.v1.json
 RUN npm run build
 
 # Playwright Chromium plus its native libraries (the worker runs the

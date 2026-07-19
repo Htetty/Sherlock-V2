@@ -21,10 +21,20 @@ import { createArtifactStore } from "../services/artifacts.js";
 import { truncateWithMarker } from "../services/bounded-text.js";
 import {
   MODEL,
-  createModelMessage,
   formatGraphSection,
   formatRepoEvidence,
 } from "../services/claude.js";
+import { runInference, type InferenceTelemetry } from "../services/inference.js";
+import {
+  resolveEfficiencyPolicy,
+  type EfficiencyPolicy,
+} from "../services/efficiency-policy.js";
+import { executeRunCode, RUN_CODE_LIMITS } from "./run-code.js";
+import {
+  assembleBatchResults,
+  parallelReadsEnabled,
+  planToolBatch,
+} from "./tool-batch.js";
 import {
   runFixAttempt,
   type FixAttemptResult,
@@ -74,6 +84,10 @@ const FIXER_SHARED_LIMITS = {
   maxAttemptFeedbackBytes: 4 * 1024,
   // Cumulative read_file/grep bytes returned to the model.
   maxEvidenceBytes: 300 * 1024,
+  // Per read_many call: total bytes across all returned files (fable/16).
+  maxReadManyCallBytes: 128 * 1024,
+  // Per grep result after context expansion (fable/16).
+  maxGrepBytes: 16 * 1024,
 };
 
 export const STANDARD_FIXER_BUDGETS = {
@@ -82,6 +96,9 @@ export const STANDARD_FIXER_BUDGETS = {
   maxReadFileCalls: 4,
   maxGrepCalls: 2,
   maxGraphCalls: 3,
+  // run_code Docker exploration calls (fable/16). A new budget, not a raise
+  // of any pre-existing one.
+  maxRunCodeCalls: 3,
   maxExplorationBeforeFirstPatch: 6,
   maxPatchAttempts: 2,
 };
@@ -92,6 +109,7 @@ export const DEEP_FIXER_BUDGETS = {
   maxReadFileCalls: 20,
   maxGrepCalls: 10,
   maxGraphCalls: 10,
+  maxRunCodeCalls: 8,
   maxExplorationBeforeFirstPatch: 12,
   maxPatchAttempts: 3,
 };
@@ -106,6 +124,17 @@ export function getFixerBudgets(): FixerBudgets {
   return process.env.SHERLOCK_DEEP_INVESTIGATION === "true"
     ? DEEP_FIXER_BUDGETS
     : STANDARD_FIXER_BUDGETS;
+}
+
+export function getFixerMinimumInspections(
+  budgets: FixerBudgets,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const raw = env.SHERLOCK_FIXER_MIN_INSPECTIONS?.trim();
+  if (!raw) return 0;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(budgets.maxExplorationBeforeFirstPatch, Math.floor(parsed));
 }
 
 const IGNORED_DIRS = new Set([
@@ -152,6 +181,19 @@ export type FixerAgentInput = {
   // path — memory replay and one-shot plans must not fabricate findings.
   reproducerFindings?: ReproducerFinding[];
   restart: () => Promise<RestartResult>;
+  // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
+  // absent means calls run untelemetered, exactly as before the gateway.
+  telemetry?: InferenceTelemetry | null;
+  // Per-task policy overrides (Phase 2.5). Absent: env-flag defaults.
+  budgetProfile?: "standard" | "deep";
+  compaction?: boolean;
+  // Parallel read-only tool calls (Phase 2 tool-batch contract). Explicit
+  // override; absent falls through to `efficiency`, then to the env default.
+  parallelReads?: boolean;
+  // Resolved per-investigation efficiency policy (fable/16). Immutable for
+  // the whole run. Absent (tests/direct callers): resolved from env once at
+  // run start — never re-read mid-run.
+  efficiency?: EfficiencyPolicy;
   // --- Verification extras (dev: repo validation + regression tests) ------
   // "owner/name" used in validation artifacts; never a URL or secret.
   repositoryLabel?: string;
@@ -198,6 +240,17 @@ export type FixerAgentResult = {
   // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
   turns: number;
   compactionEvents: number;
+  // fable/16 efficiency observability.
+  efficiencyCounters: {
+    parallelBatches: number;
+    batchedReads: number;
+    readManyCalls: number;
+    filesReadThroughReadMany: number;
+    runCodeCalls: number;
+    runCodeTimeouts: number;
+    runCodeInvalidResults: number;
+    successfulInspections: number;
+  };
 };
 
 export type CreateModelMessage = (
@@ -287,6 +340,31 @@ const TOOLS: Anthropic.Messages.Tool[] = [
     },
   },
   {
+    name: "read_many",
+    description:
+      "Read up to 8 files (or file spans) from the repository in ONE call. Each entry: {path, startLine?, endLine?} with repo-relative paths and 1-based inclusive line numbers. Each file consumes one read_file budget unit; the combined result is capped at 128KB (files that do not fit are listed as skipped). Prefer this over several read_file calls when you already know which files you need.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        files: {
+          type: "array",
+          minItems: 1,
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              startLine: { type: "number", description: "First line to read (1-based)." },
+              endLine: { type: "number", description: "Last line to read (inclusive)." },
+            },
+            required: ["path"],
+          },
+        },
+      },
+      required: ["files"],
+    },
+  },
+  {
     name: "get_graph_neighbors",
     description:
       "Look up a node in the static code graph and return it with its direct neighbors and edges (calls, imports_from, contains, uses, ...). Pass a node label exactly as shown in NODE lines (e.g. \"writeTaskList()\") or a node id. Use this for structural questions like \"who calls X\" instead of grep.",
@@ -299,12 +377,20 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "grep",
     description:
-      "Search file contents in the repository with a regular expression (falls back to literal text if the pattern is invalid). Optional glob filters files, e.g. **/*.js. Returns path:line: snippet, capped.",
+      "Search file contents in the repository with a regular expression (falls back to literal text if the pattern is invalid). Optional glob filters files, e.g. **/*.js. Returns path:line: match lines with contextLines (default 2, max 5) surrounding lines per match; overlapping context is merged. Set filesOnly=true for a cheap breadth-first scan that returns only matching file paths with match counts. Output is capped; omitted match/file counts are reported explicitly.",
     input_schema: {
       type: "object" as const,
       properties: {
         query: { type: "string" },
         glob: { type: "string" },
+        contextLines: {
+          type: "number",
+          description: "Lines of context around each match (0-5, default 2).",
+        },
+        filesOnly: {
+          type: "boolean",
+          description: "Return only matching file paths with match counts.",
+        },
       },
       required: ["query"],
     },
@@ -327,29 +413,79 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   },
 ];
 
+// run_code (fable/16): appended to the tool list only when the resolved
+// efficiency policy enables it. The list is fixed at run start, so tool
+// definitions stay byte-identical across every turn of one run (cache
+// prefix stability).
+const RUN_CODE_TOOL: Anthropic.Messages.Tool = {
+  name: "run_code",
+  description:
+    'Run ONE read-only POSIX shell script inside an isolated explorer container (repo mounted read-only at /app, cwd /app, NO network, git and ripgrep available). Use it to answer a broad exploration question in one call instead of many read/grep turns: search, filter, and distill IN the script, then print exactly one JSON object to stdout: {"summary": string, "queriesRun": string[], "filesConsidered": string[], "filesExamined": string[], "evidence": [{"path", "startLine", "endLine", "excerpt", "reason"}], "uncertainties": string[]}. Print distilled conclusions with short cited excerpts — never raw file dumps. Non-JSON output is rejected. Must be called alone, never in a parallel batch.',
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      script: { type: "string", description: "POSIX shell script, executed via /bin/sh." },
+      timeoutSeconds: {
+        type: "number",
+        description: `Wall-clock limit in seconds (default ${RUN_CODE_LIMITS.defaultTimeoutSeconds}, max ${RUN_CODE_LIMITS.maxTimeoutSeconds}).`,
+      },
+    },
+    required: ["script"],
+  },
+};
+
 // --- Agent loop ----------------------------------------------------------------
 
 export async function runFixerAgent(
   input: FixerAgentInput,
   deps: Partial<FixerAgentDeps> = {},
 ): Promise<FixerAgentResult> {
-  const createMessage = deps.createMessage ?? createModelMessage;
+  // Efficiency policy (fable/16): resolved once per investigation and passed
+  // in; resolved from env exactly once here only for tests/direct callers.
+  const efficiency = input.efficiency ?? resolveEfficiencyPolicy();
+  const createMessage =
+    deps.createMessage ??
+    ((params) =>
+      runInference(
+        {
+          phase: "fix",
+          telemetry: input.telemetry ?? null,
+          policy: { cacheMode: efficiency.promptCacheMode },
+        },
+        params,
+      ));
   const verify = deps.runFixAttempt ?? runFixAttempt;
 
   // Budget profile is selected once at run start and used for the whole run.
+  // Per-task policy override first (Phase 2.5), env default second.
   const budgetProfile =
-    process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard";
-  const budgets = getFixerBudgets();
+    input.budgetProfile ??
+    (process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard");
+  const budgets = budgetProfile === "deep" ? DEEP_FIXER_BUDGETS : STANDARD_FIXER_BUDGETS;
+  const parallelReads = parallelReadsEnabled(
+    input.parallelReads ?? efficiency.fixerParallelReads,
+  );
+  // Opt-in agent-observation mode. Default zero preserves the cost-conscious
+  // behavior where sufficiently grounded fixes may patch immediately.
+  const minimumInspections = getFixerMinimumInspections(budgets);
+  // Fixed at run start: the tool list must be byte-identical on every turn.
+  const tools = efficiency.fixerRunCode ? [...TOOLS, RUN_CODE_TOOL] : TOOLS;
 
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Fixer: ${message}`);
   };
 
   log(`Fixer budget profile: ${budgetProfile}`);
+  if (minimumInspections > 0) {
+    log(
+      `Fixer inspection test mode: ${minimumInspections} successful inspection tool call(s) required before propose_patch.`,
+    );
+  }
 
   const agentDir = path.join(input.investigationDir, "fix-agent");
   const store = await createArtifactStore(input.investigationId, agentDir);
   await mkdir(path.join(agentDir, "tool-calls"), { recursive: true });
+  await mkdir(path.join(agentDir, "run-code"), { recursive: true });
 
   const startedAt = Date.now();
   const counters = {
@@ -357,10 +493,35 @@ export async function runFixerAgent(
     readFile: 0,
     grep: 0,
     graph: 0,
+    // fable/16 observability: batches and dense-tool usage.
+    parallelBatches: 0,
+    batchedReads: 0,
+    readManyCalls: 0,
+    filesReadThroughReadMany: 0,
+    runCode: 0,
+    runCodeTimeouts: 0,
+    runCodeInvalidResults: 0,
     patchAttempts: 0,
     malformedPatchProposals: 0,
     duplicatePatchRejections: 0,
+    successfulInspections: 0,
     evidenceBytes: 0,
+  };
+
+  const boundAndAccountEvidence = (
+    text: string,
+  ): { text: string; truncated: boolean } => {
+    const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
+    if (remaining === 0) {
+      return {
+        text: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+        truncated: true,
+      };
+    }
+
+    const bounded = truncateUtf8Bytes(text, remaining);
+    counters.evidenceBytes += Buffer.byteLength(bounded, "utf8");
+    return { text: bounded, truncated: bounded !== text };
   };
 
   // Change 1: the accepted reproduction's evidence summary, computed once and
@@ -395,9 +556,12 @@ export async function runFixerAgent(
   let lastAttempt: FixAttemptResult | null = null;
   let nudged = false;
 
-  // Compaction (SHERLOCK_COMPACTION=true): locally tracked state used to
-  // rebuild a compact summary when old history is spliced out.
-  const compactor = createCompactor();
+  // Compaction: per-task override first, then the resolved efficiency policy
+  // (default ON, fable/16). Unchanged triggers (6 tool calls / 60KB).
+  const compactor = createCompactor({
+    enabled: input.compaction ?? efficiency.compaction,
+    allowParallelToolCalls: parallelReads,
+  });
   const factLog: string[] = [];
   let lastVerifierFeedback = "";
   let lastAssistantText = "";
@@ -422,10 +586,324 @@ export async function runFixerAgent(
         : "No patch attempts yet.",
       lastVerifierFeedback ? `Latest verifier feedback:\n${lastVerifierFeedback}` : "",
       lastAssistantText ? `Your last stated reasoning:\n${lastAssistantText.slice(0, 600)}` : "",
-      `Remaining budgets: ${budgets.maxModelTurns - counters.turns} model turn(s), ${Math.max(0, budgets.maxReadFileCalls - counters.readFile)} read_file, ${Math.max(0, budgets.maxGrepCalls - counters.grep)} grep, ${Math.max(0, budgets.maxGraphCalls - counters.graph)} get_graph_neighbors, ${budgets.maxPatchAttempts - counters.patchAttempts} patch attempt(s).`,
+      `Remaining budgets: ${budgets.maxModelTurns - counters.turns} model turn(s), ${Math.max(0, budgets.maxReadFileCalls - counters.readFile)} read_file, ${Math.max(0, budgets.maxGrepCalls - counters.grep)} grep, ${Math.max(0, budgets.maxGraphCalls - counters.graph)} get_graph_neighbors${efficiency.fixerRunCode ? `, ${Math.max(0, budgets.maxRunCodeCalls - counters.runCode)} run_code` : ""}, ${budgets.maxPatchAttempts - counters.patchAttempts} patch attempt(s).`,
+      minimumInspections > 0
+        ? `Inspection test mode: ${counters.successfulInspections}/${minimumInspections} required successful inspection tool calls completed.`
+        : "",
     ];
 
     return sections.filter(Boolean).join("\n\n");
+  };
+
+  // Executes one read-only inspection tool (read_file / grep /
+  // get_graph_neighbors) with all existing gates and budget accounting.
+  // Shared by the single-call path and the parallel-reads batch path so the
+  // two paths can never drift.
+  const executeInspectionToolCore = async (
+    block: Anthropic.Messages.ToolUseBlock,
+    accountEvidence = true,
+  ): Promise<{ resultText: string; isError: boolean }> => {
+    const inspectionGate = shouldBlockInspectionTool(block.name, counters, budgets);
+
+    if (inspectionGate.blocked) {
+      return { resultText: inspectionGate.reason, isError: true };
+    }
+
+    if (block.name === "read_file") {
+      const requestedRaw = (block.input as { path?: unknown })?.path;
+      const requestedNormalized =
+        typeof requestedRaw === "string" && requestedRaw
+          ? path.normalize(requestedRaw).split(path.sep).join("/")
+          : null;
+
+      if (requestedNormalized && hydratedFullFiles.has(requestedNormalized)) {
+        // Deterministic redundancy gate: the full file is in the initial
+        // context. Reject without consuming the read_file budget.
+        return {
+          resultText: `REDUNDANT read_file rejected: ${requestedNormalized} is already provided IN FULL in the initial context under "Selected source/config files with contents", and every non-verified patch is rolled back, so that content is still exact. Use it directly (including for verbatim oldText). If the evidence is sufficient, call propose_patch now.`,
+          isError: true,
+        };
+      }
+
+      counters.readFile += 1;
+      if (counters.readFile > budgets.maxReadFileCalls) {
+        return {
+          resultText: "read_file budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const readInput = block.input as {
+        path?: unknown;
+        startLine?: unknown;
+        endLine?: unknown;
+      };
+      const lineRange = parseReadLineRange(readInput?.startLine, readInput?.endLine);
+      const outcome = lineRange.ok
+        ? await execReadFile(input.repoPath, readInput?.path, lineRange.range)
+        : { ok: false, text: lineRange.error };
+      if (outcome.ok && accountEvidence) {
+        const bounded = boundAndAccountEvidence(outcome.text);
+        return { resultText: bounded.text, isError: bounded.truncated };
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    // read_many (fable/16): several files in one call. Each returned file
+    // consumes one read_file budget unit; the combined result is capped at
+    // maxReadManyCallBytes with an explicit skipped-file report — never a
+    // silent truncation of the set.
+    if (block.name === "read_many") {
+      const files = (block.input as { files?: unknown })?.files;
+
+      if (!Array.isArray(files) || files.length < 1 || files.length > 8) {
+        return {
+          resultText:
+            "read_many requires files: an array of 1-8 {path, startLine?, endLine?} entries.",
+          isError: true,
+        };
+      }
+
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      counters.readManyCalls += 1;
+
+      const sections: string[] = [];
+      const skipped: string[] = [];
+      let totalBytes = 0;
+      let returnedFiles = 0;
+
+      for (const entry of files) {
+        const item = (entry ?? {}) as { path?: unknown; startLine?: unknown; endLine?: unknown };
+        const label = typeof item.path === "string" ? item.path : JSON.stringify(item.path);
+        const normalized =
+          typeof item.path === "string" && item.path
+            ? path.normalize(item.path).split(path.sep).join("/")
+            : null;
+
+        if (normalized && hydratedFullFiles.has(normalized)) {
+          // Redundancy gate, same as read_file: no budget consumed.
+          skipped.push(
+            `${label}: already provided IN FULL in the initial context — use that content directly.`,
+          );
+          continue;
+        }
+
+        if (counters.readFile >= budgets.maxReadFileCalls) {
+          skipped.push(`${label}: read_file budget exhausted.`);
+          continue;
+        }
+
+        const nestedExplorationGate = shouldBlockInspectionTool("read_file", counters, budgets);
+        if (nestedExplorationGate.blocked) {
+          skipped.push(`${label}: ${nestedExplorationGate.reason}`);
+          continue;
+        }
+
+        if (accountEvidence && counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+          skipped.push(`${label}: evidence budget exhausted.`);
+          continue;
+        }
+
+        counters.readFile += 1;
+
+        const lineRange = parseReadLineRange(item.startLine, item.endLine);
+        const outcome = lineRange.ok
+          ? await execReadFile(input.repoPath, item.path, lineRange.range)
+          : { ok: false, text: lineRange.error };
+
+        if (!outcome.ok) {
+          skipped.push(`${label}: ${firstLine(outcome.text)}`);
+          continue;
+        }
+
+        const section = `=== ${label} ===\n${outcome.text}`;
+
+        const perCallRemaining = budgets.maxReadManyCallBytes - totalBytes;
+        const globalRemaining = accountEvidence
+          ? budgets.maxEvidenceBytes - counters.evidenceBytes - totalBytes
+          : Number.POSITIVE_INFINITY;
+        const allowedBytes = Math.max(0, Math.min(perCallRemaining, globalRemaining));
+
+        if (allowedBytes === 0 || Buffer.byteLength(section, "utf8") > allowedBytes) {
+          skipped.push(
+            `${label}: did not fit the remaining read_many/evidence byte budget (read it individually or with a narrower line range).`,
+          );
+          continue;
+        }
+
+        totalBytes += Buffer.byteLength(section, "utf8");
+        returnedFiles += 1;
+        counters.filesReadThroughReadMany += 1;
+        sections.push(section);
+      }
+
+      const report =
+        skipped.length > 0 ? `\n\nSKIPPED (${skipped.length}):\n${skipped.map((line) => `- ${line}`).join("\n")}` : "";
+      const resultText = `${sections.join("\n\n") || "(no files returned)"}${report}`;
+
+      if (accountEvidence) {
+        const bounded = boundAndAccountEvidence(resultText);
+        return {
+          resultText: bounded.text,
+          isError: returnedFiles === 0 || bounded.truncated,
+        };
+      }
+
+      return { resultText, isError: returnedFiles === 0 };
+    }
+
+    if (block.name === "get_graph_neighbors") {
+      counters.graph += 1;
+      if (counters.graph > budgets.maxGraphCalls) {
+        return {
+          resultText:
+            "get_graph_neighbors budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const nodeRef = (block.input as { node?: unknown })?.node;
+      const outcome =
+        typeof nodeRef === "string"
+          ? await queryGraphNeighbors(input.repoPath, nodeRef)
+          : { ok: false, text: "get_graph_neighbors requires a string node reference." };
+      if (outcome.ok && accountEvidence) {
+        const bounded = boundAndAccountEvidence(outcome.text);
+        return { resultText: bounded.text, isError: bounded.truncated };
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    if (block.name === "grep") {
+      counters.grep += 1;
+      if (counters.grep > budgets.maxGrepCalls) {
+        return {
+          resultText: "grep budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const grepInput = block.input as {
+        query?: unknown;
+        glob?: unknown;
+        contextLines?: unknown;
+        filesOnly?: unknown;
+      };
+      const outcome = await execGrep(
+        input.repoPath,
+        grepInput?.query,
+        typeof grepInput?.glob === "string" ? grepInput.glob : undefined,
+        {
+          contextLines:
+            typeof grepInput?.contextLines === "number" ? grepInput.contextLines : undefined,
+          filesOnly: grepInput?.filesOnly === true,
+        },
+      );
+      if (outcome.ok && accountEvidence) {
+        const bounded = boundAndAccountEvidence(outcome.text);
+        return { resultText: bounded.text, isError: bounded.truncated };
+      }
+      return { resultText: outcome.text, isError: !outcome.ok };
+    }
+
+    // run_code (fable/16): Docker-only, read-only mount, no network. Never
+    // reached from a parallel batch (not in READ_ONLY_FIXER_TOOLS).
+    if (block.name === "run_code") {
+      if (!efficiency.fixerRunCode) {
+        return {
+          resultText: "run_code is disabled for this investigation.",
+          isError: true,
+        };
+      }
+
+      counters.runCode += 1;
+
+      if (counters.runCode > budgets.maxRunCodeCalls) {
+        return {
+          resultText: "run_code budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+        return {
+          resultText: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+          isError: true,
+        };
+      }
+
+      const runInput = block.input as { script?: unknown; timeoutSeconds?: unknown };
+      const rawArtifactHandle = `run-code/${String(counters.runCode).padStart(2, "0")}-raw.json`;
+      const outcome = await executeRunCode({
+        repoPath: input.repoPath,
+        script: runInput?.script,
+        timeoutSeconds: runInput?.timeoutSeconds,
+        rawArtifactHandle,
+      });
+
+      if (outcome.timedOut) {
+        counters.runCodeTimeouts += 1;
+      }
+
+      if (outcome.invalidResult) {
+        counters.runCodeInvalidResults += 1;
+      }
+
+      // Full raw output goes to disk (redacted); the model sees only the
+      // validated JSON or the structured error.
+      await store.writeJson(rawArtifactHandle, {
+        imageId: outcome.imageId,
+        exitCode: outcome.exitCode,
+        timedOut: outcome.timedOut,
+        invalidResult: outcome.invalidResult,
+        sanitizedCommand: outcome.sanitizedCommand,
+        rawOutput: redactSecrets(outcome.rawOutput),
+      });
+
+      if (outcome.ok && accountEvidence) {
+        const bounded = boundAndAccountEvidence(outcome.resultText);
+        return { resultText: bounded.text, isError: bounded.truncated };
+      }
+
+      return { resultText: outcome.resultText, isError: !outcome.ok };
+    }
+
+    return { resultText: `Unknown tool "${block.name}".`, isError: true };
+  };
+
+  const executeInspectionTool = async (
+    block: Anthropic.Messages.ToolUseBlock,
+    accountEvidence = true,
+  ): Promise<{ resultText: string; isError: boolean }> => {
+    const outcome = await executeInspectionToolCore(block, accountEvidence);
+    if (!outcome.isError) {
+      counters.successfulInspections += 1;
+    }
+    return outcome;
   };
 
   const messages: Anthropic.Messages.MessageParam[] = [
@@ -452,6 +930,16 @@ export async function runFixerAgent(
       attempts,
       turns: counters.turns,
       compactionEvents: compactor.events,
+      efficiencyCounters: {
+        parallelBatches: counters.parallelBatches,
+        batchedReads: counters.batchedReads,
+        readManyCalls: counters.readManyCalls,
+        filesReadThroughReadMany: counters.filesReadThroughReadMany,
+        runCodeCalls: counters.runCode,
+        runCodeTimeouts: counters.runCodeTimeouts,
+        runCodeInvalidResults: counters.runCodeInvalidResults,
+        successfulInspections: counters.successfulInspections,
+      },
     };
     transcript.push({ type: "final_result", status, reason, failureCode, attempts });
     await store.writeJson("transcript.json", transcript);
@@ -510,15 +998,22 @@ export async function runFixerAgent(
         system: buildSystemPrompt(budgets, {
           hydratedFullFiles: [...hydratedFullFiles],
           hasMemory: Boolean(input.pastInvestigations?.trim()),
+          parallelReads,
+          runCodeEnabled: efficiency.fixerRunCode,
+          minimumInspections,
         }),
-        tools: TOOLS,
-        tool_choice: { type: "any", disable_parallel_tool_use: true },
+        tools,
+        // Parallel reads (Phase 2, default OFF): when enabled, the model may
+        // emit several READ-ONLY calls per turn under the tool-batch
+        // contract; terminal/mutation tools must still be called alone.
+        tool_choice: { type: "any", disable_parallel_tool_use: !parallelReads },
         messages: [...messages],
       });
 
-      const toolUse = message.content.find(
+      const toolUses = message.content.filter(
         (block): block is Anthropic.Messages.ToolUseBlock => block.type === "tool_use",
       );
+      const toolUse = toolUses[0];
 
       if (!toolUse) {
         transcript.push({
@@ -538,7 +1033,12 @@ export async function runFixerAgent(
         nudged = true;
         messages.push(
           { role: "assistant", content: nonEmptyContent(message.content) },
-          { role: "user", content: "Respond with exactly one tool call." },
+          {
+            role: "user",
+            content: parallelReads
+              ? "Respond with tool calls only. Independent read-only inspections may be called in parallel; mutation and terminal tools must be called alone."
+              : "Respond with exactly one tool call.",
+          },
         );
         continue;
       }
@@ -549,6 +1049,96 @@ export async function runFixerAgent(
 
       if (textBlock?.text.trim()) {
         lastAssistantText = textBlock.text.trim();
+      }
+
+      // --- Parallel-reads batch path (Phase 2, flag-gated) -----------------
+      // Multiple tool_use blocks reach here only when parallelReads is on
+      // (disable_parallel_tool_use is set otherwise). Contract: every block
+      // gets exactly one result in model order; only read-only tools execute,
+      // concurrently; terminal/mutation calls in a batch are rejected
+      // unexecuted with structured errors.
+      if (toolUses.length > 1) {
+        const plan = planToolBatch(toolUses);
+        if (plan.fatalReason) {
+          return await finish("failed", plan.fatalReason, lastAttempt);
+        }
+        counters.parallelBatches += 1;
+        counters.batchedReads += plan.execute.length;
+        const resultsById = new Map<string, { content: string; isError: boolean }>();
+
+        transcript.push({
+          type: "model_action_batch",
+          turn: counters.turns,
+          tools: toolUses.map((block) => block.name),
+          rejected: plan.rejected.map((entry) => entry.block.name),
+        });
+        log(
+          `turn ${counters.turns}: parallel batch [${toolUses.map((block) => block.name).join(", ")}]`,
+        );
+
+        await Promise.all(
+          plan.execute.map(async (block) => {
+            const outcome = await executeInspectionTool(block, false);
+            resultsById.set(block.id, {
+              content: outcome.resultText,
+              isError: outcome.isError,
+            });
+            await recordToolCall(block.name, block.input, outcome.resultText);
+            factLog.push(
+              `${block.name} ${JSON.stringify(block.input).slice(0, 160)} -> ${outcome.isError ? `error: ${firstLine(outcome.resultText)}` : `ok (${outcome.resultText.length} bytes)`}`,
+            );
+          }),
+        );
+
+        // Apply the shared evidence cap after concurrent reads complete, in
+        // model order. No sibling can race past the global byte budget.
+        for (const block of plan.execute) {
+          const outcome = resultsById.get(block.id);
+          if (!outcome || outcome.isError) continue;
+          const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
+          if (remaining === 0) {
+            resultsById.set(block.id, {
+              content: "Evidence budget exhausted — propose a patch or call submit_blocked.",
+              isError: true,
+            });
+            continue;
+          }
+          const bounded = truncateUtf8Bytes(outcome.content, remaining);
+          counters.evidenceBytes += Buffer.byteLength(bounded, "utf8");
+          resultsById.set(block.id, {
+            content: bounded,
+            isError: bounded !== outcome.content,
+          });
+        }
+
+        for (const entry of plan.rejected) {
+          if (!resultsById.has(entry.block.id)) {
+            resultsById.set(entry.block.id, { content: entry.reason, isError: true });
+          } else {
+            resultsById.set(`${entry.block.id}#dup`, { content: entry.reason, isError: true });
+          }
+          await recordToolCall(entry.block.name, entry.block.input, entry.reason);
+        }
+
+        const batchResults = assembleBatchResults(toolUses, resultsById);
+
+        messages.push(
+          { role: "assistant", content: message.content },
+          { role: "user", content: batchResults },
+        );
+
+        const batchBytes = batchResults.reduce(
+          (total, block) => total + (typeof block.content === "string" ? block.content.length : 0),
+          0,
+        );
+        compactor.record(batchBytes);
+
+        if (compactor.maybeCompact(messages, buildStateSummary)) {
+          transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+          log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+        }
+
+        continue;
       }
 
       transcript.push({
@@ -572,6 +1162,34 @@ export async function runFixerAgent(
 
       // Terminal-capable action: propose_patch.
       if (toolUse.name === "propose_patch") {
+        if (counters.successfulInspections < minimumInspections) {
+          const remaining = minimumInspections - counters.successfulInspections;
+          const feedback = `INSPECTION TEST MODE: propose_patch is temporarily blocked until ${remaining} more successful inspection tool call(s) complete. Use read_file/read_many/grep/get_graph_neighbors${efficiency.fixerRunCode ? "/run_code" : ""} to inspect a concrete unknown, then propose the patch.`;
+          await recordToolCall("propose_patch", "(blocked by inspection test mode)", feedback);
+          transcript.push({
+            type: "proposal_blocked_minimum_inspections",
+            turn: counters.turns,
+            completed: counters.successfulInspections,
+            required: minimumInspections,
+          });
+          messages.push(
+            { role: "assistant", content: message.content },
+            {
+              role: "user",
+              content: [
+                {
+                  type: "tool_result",
+                  tool_use_id: toolUse.id,
+                  content: feedback,
+                  is_error: true,
+                },
+              ],
+            },
+          );
+          compactor.record(Buffer.byteLength(feedback, "utf8"));
+          continue;
+        }
+
         const proposal = {
           version: FIX_PROPOSAL_VERSION,
           ...(toolUse.input as Record<string, unknown>),
@@ -775,93 +1393,9 @@ export async function runFixerAgent(
       // Inspection tools: read_file / grep.
       let resultText: string;
       let isError = false;
-      const inspectionGate = shouldBlockInspectionTool(toolUse.name, counters, budgets);
-
-      if (inspectionGate.blocked) {
-        resultText = inspectionGate.reason;
-        isError = true;
-      } else if (toolUse.name === "read_file") {
-        const requestedRaw = (toolUse.input as { path?: unknown })?.path;
-        const requestedNormalized =
-          typeof requestedRaw === "string" && requestedRaw
-            ? path.normalize(requestedRaw).split(path.sep).join("/")
-            : null;
-
-        if (requestedNormalized && hydratedFullFiles.has(requestedNormalized)) {
-          // Deterministic redundancy gate: the full file is in the initial
-          // context. Reject without consuming the read_file budget.
-          resultText = `REDUNDANT read_file rejected: ${requestedNormalized} is already provided IN FULL in the initial context under "Selected source/config files with contents", and every non-verified patch is rolled back, so that content is still exact. Use it directly (including for verbatim oldText). If the evidence is sufficient, call propose_patch now.`;
-          isError = true;
-        } else {
-          counters.readFile += 1;
-          if (counters.readFile > budgets.maxReadFileCalls) {
-            resultText = "read_file budget exhausted — propose a patch or call submit_blocked.";
-            isError = true;
-          } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-            resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-            isError = true;
-          } else {
-            const readInput = toolUse.input as {
-              path?: unknown;
-              startLine?: unknown;
-              endLine?: unknown;
-            };
-            const lineRange = parseReadLineRange(readInput?.startLine, readInput?.endLine);
-            const outcome = lineRange.ok
-              ? await execReadFile(input.repoPath, readInput?.path, lineRange.range)
-              : { ok: false, text: lineRange.error };
-            resultText = outcome.text;
-            isError = !outcome.ok;
-            if (outcome.ok) {
-              counters.evidenceBytes += resultText.length;
-            }
-          }
-        }
-      } else if (toolUse.name === "get_graph_neighbors") {
-        counters.graph += 1;
-        if (counters.graph > budgets.maxGraphCalls) {
-          resultText = "get_graph_neighbors budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-          resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else {
-          const nodeRef = (toolUse.input as { node?: unknown })?.node;
-          const outcome =
-            typeof nodeRef === "string"
-              ? await queryGraphNeighbors(input.repoPath, nodeRef)
-              : { ok: false, text: "get_graph_neighbors requires a string node reference." };
-          resultText = outcome.text;
-          isError = !outcome.ok;
-          if (outcome.ok) {
-            counters.evidenceBytes += resultText.length;
-          }
-        }
-      } else if (toolUse.name === "grep") {
-        counters.grep += 1;
-        if (counters.grep > budgets.maxGrepCalls) {
-          resultText = "grep budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
-          resultText = "Evidence budget exhausted — propose a patch or call submit_blocked.";
-          isError = true;
-        } else {
-          const grepInput = toolUse.input as { query?: unknown; glob?: unknown };
-          const outcome = await execGrep(
-            input.repoPath,
-            grepInput?.query,
-            typeof grepInput?.glob === "string" ? grepInput.glob : undefined,
-          );
-          resultText = outcome.text;
-          isError = !outcome.ok;
-          if (outcome.ok) {
-            counters.evidenceBytes += resultText.length;
-          }
-        }
-      } else {
-        resultText = `Unknown tool "${toolUse.name}".`;
-        isError = true;
-      }
+      const executed = await executeInspectionTool(toolUse);
+      resultText = executed.resultText;
+      isError = executed.isError;
 
       await recordToolCall(toolUse.name, toolUse.input, resultText);
       transcript.push({
@@ -1094,14 +1628,32 @@ async function resolveRepoPath(
   return { ok: true, absolutePath };
 }
 
+type GrepOptions = {
+  // Lines of context around each match (0-5, default 2). Overlapping or
+  // adjacent context windows within one file are merged and deduplicated.
+  contextLines?: number;
+  // Return only matching file paths with match counts (cheap breadth scan).
+  filesOnly?: boolean;
+};
+
+// Hard bail on pathological queries: matches are still COUNTED (for the
+// explicit omission report) after output caps are hit, but never past this.
+const MAX_GREP_COUNTED_MATCHES = 10_000;
+
 async function execGrep(
   repoPath: string,
   query: unknown,
   glob: string | undefined,
+  options: GrepOptions = {},
 ): Promise<ToolOutcome> {
   if (typeof query !== "string" || !query) {
     return { ok: false, text: "grep requires a non-empty string query." };
   }
+
+  const contextLines =
+    options.filesOnly === true
+      ? 0
+      : Math.min(5, Math.max(0, Math.floor(options.contextLines ?? 2)));
 
   let pattern: RegExp;
 
@@ -1114,11 +1666,38 @@ async function execGrep(
   const globPattern = glob ? globToRegExp(glob) : null;
   const globOnBasename = glob ? !glob.includes("/") : false;
   const repoRoot = path.resolve(repoPath);
-  const lines: string[] = [];
-  let truncated = false;
+
+  const outputLines: string[] = [];
+  let outputBytes = 0;
+  let outputFull = false;
+  // Totals continue past the output caps so omissions are reported, not
+  // silently dropped (fable/16).
+  let totalMatches = 0;
+  let totalMatchedFiles = 0;
+  let emittedMatches = 0;
+  const emittedFiles = new Set<string>();
+  let countingBailed = false;
+
+  const pushOutput = (line: string): boolean => {
+    if (outputFull) {
+      return false;
+    }
+
+    if (
+      outputLines.length >= FIXER_BUDGETS.maxGrepLines ||
+      outputBytes + line.length > FIXER_BUDGETS.maxGrepBytes
+    ) {
+      outputFull = true;
+      return false;
+    }
+
+    outputLines.push(line);
+    outputBytes += line.length + 1;
+    return true;
+  };
 
   const walk = async (dir: string): Promise<void> => {
-    if (truncated) {
+    if (countingBailed) {
       return;
     }
 
@@ -1131,7 +1710,7 @@ async function execGrep(
     }
 
     for (const entry of entries) {
-      if (truncated) {
+      if (countingBailed) {
         return;
       }
 
@@ -1173,15 +1752,78 @@ async function execGrep(
       }
 
       const fileLines = contents.split("\n");
+      const matchIndexes: number[] = [];
 
       for (let index = 0; index < fileLines.length; index += 1) {
         if (pattern.test(fileLines[index])) {
-          lines.push(`${relative}:${index + 1}: ${fileLines[index].slice(0, 300)}`);
+          matchIndexes.push(index);
+          totalMatches += 1;
 
-          if (lines.length >= FIXER_BUDGETS.maxGrepLines) {
-            truncated = true;
+          if (totalMatches >= MAX_GREP_COUNTED_MATCHES) {
+            countingBailed = true;
             break;
           }
+        }
+      }
+
+      if (matchIndexes.length === 0) {
+        continue;
+      }
+
+      totalMatchedFiles += 1;
+
+      if (options.filesOnly === true) {
+        if (pushOutput(`${relative} (${matchIndexes.length} match${matchIndexes.length === 1 ? "" : "es"})`)) {
+          emittedFiles.add(relative);
+          emittedMatches += matchIndexes.length;
+        }
+        continue;
+      }
+
+      if (outputFull) {
+        continue; // Keep counting totals; emit nothing further.
+      }
+
+      // Merge overlapping/adjacent context windows into ranges so shared
+      // context lines are never duplicated.
+      const matchSet = new Set(matchIndexes);
+      const ranges: Array<{ start: number; end: number }> = [];
+
+      for (const index of matchIndexes) {
+        const start = Math.max(0, index - contextLines);
+        const end = Math.min(fileLines.length - 1, index + contextLines);
+        const last = ranges[ranges.length - 1];
+
+        if (last && start <= last.end + 1) {
+          last.end = Math.max(last.end, end);
+        } else {
+          ranges.push({ start, end });
+        }
+      }
+
+      for (const range of ranges) {
+        if (outputFull) {
+          break;
+        }
+
+        for (let index = range.start; index <= range.end; index += 1) {
+          const isMatch = matchSet.has(index);
+          const line = isMatch
+            ? `${relative}:${index + 1}: ${fileLines[index].slice(0, 300)}`
+            : `${relative}-${index + 1}- ${fileLines[index].slice(0, 300)}`;
+
+          if (!pushOutput(line)) {
+            break;
+          }
+
+          if (isMatch) {
+            emittedMatches += 1;
+            emittedFiles.add(relative);
+          }
+        }
+
+        if (!outputFull && ranges.length > 1 && range !== ranges[ranges.length - 1]) {
+          pushOutput("--");
         }
       }
     }
@@ -1189,13 +1831,23 @@ async function execGrep(
 
   await walk(repoRoot);
 
-  if (lines.length === 0) {
+  if (totalMatches === 0) {
     return { ok: true, text: "(no matches)" };
+  }
+
+  const omittedMatches = Math.max(0, totalMatches - emittedMatches);
+  const omittedFiles = Math.max(0, totalMatchedFiles - emittedFiles.size);
+  const footer: string[] = [];
+
+  if (omittedMatches > 0 || omittedFiles > 0 || countingBailed) {
+    footer.push(
+      `[OUTPUT CAPPED: showing ${options.filesOnly ? emittedFiles.size : emittedMatches}${options.filesOnly ? ` of ${totalMatchedFiles} matching files` : ` of ${totalMatches}${countingBailed ? "+" : ""} matches`}; omitted ${omittedMatches}${countingBailed ? "+" : ""} match(es) in ${omittedFiles} additional file(s). Narrow the query or glob, or use filesOnly.]`,
+    );
   }
 
   return {
     ok: true,
-    text: `${lines.join("\n")}${truncated ? `\n[TRUNCATED at ${FIXER_BUDGETS.maxGrepLines} matches]` : ""}`,
+    text: [outputLines.join("\n"), ...footer].filter(Boolean).join("\n"),
   };
 }
 
@@ -1217,6 +1869,9 @@ function globToRegExp(glob: string): RegExp {
 type SystemPromptContext = {
   hydratedFullFiles: string[];
   hasMemory: boolean;
+  parallelReads: boolean;
+  runCodeEnabled: boolean;
+  minimumInspections: number;
 };
 
 const buildSystemPrompt = (
@@ -1225,9 +1880,10 @@ const buildSystemPrompt = (
 ) => `You are Sherlock's fixer agent. A bug has already been deterministically reproduced in an isolated workspace; your job is to find the root cause and land the smallest safe fix.
 
 What you CAN do:
-- read_file, grep, get_graph_neighbors — ONLY to obtain a specific missing fact that blocks patching.
-- propose_patch — as soon as you can state a plausible minimal change. This is your primary move.
+- read_file, read_many, grep, get_graph_neighbors — ONLY to obtain a specific missing fact that blocks patching. read_many returns up to 8 files in one call (each costs one read_file budget unit): use it instead of several read_file calls when you already know which files you need. Example: read_many {"files": [{"path": "src/api/tasks.js"}, {"path": "src/store.js", "startLine": 40, "endLine": 90}]} answers in one turn what two read_file turns would. grep accepts contextLines (default 2) so a single search returns enough surrounding code to act on — example: grep {"query": "writeTaskList\\\\(", "contextLines": 3} shows every call site with its context; add filesOnly: true first when you only need to locate files.
+${context.runCodeEnabled ? `- run_code — ONE read-only POSIX shell script in an isolated container (repo at /app, git + ripgrep available, no network). For broad exploration on large repos, prefer one script that greps/finds/filters and prints a distilled JSON conclusion over many separate model turns — but use the ordinary tools when each next step genuinely depends on reasoning over the prior result. Print conclusions with short cited excerpts, never raw file dumps.\n` : ""}- propose_patch — as soon as you can state a plausible minimal change. This is your primary move.
 - submit_blocked — when a safe fix is impossible with the available evidence and attempts.
+${context.parallelReads ? `\nParallel reads: when you need several independent facts (files, searches, graph lookups) and none depends on another's result, request them ALL in one response as multiple tool calls — each still consumes its own budget, but you spend one turn instead of several. Mutation and terminal tools (propose_patch, submit_blocked${context.runCodeEnabled ? ", run_code" : ""}) must always be called alone.\n` : ""}
 
 What you CANNOT do:
 - You cannot re-read files whose FULL contents are already in the initial context. ${context.hydratedFullFiles.length > 0 ? `These files are fully provided and read_file on them is REJECTED automatically: ${context.hydratedFullFiles.join(", ")}. Their contents in the initial message are exact and stay exact (non-verified patches are rolled back) — copy oldText verbatim from there.` : "(No fully hydrated files this run.)"}
@@ -1235,6 +1891,7 @@ What you CANNOT do:
 - You cannot declare success — only the deterministic verifier can.
 
 Rules:
+${context.minimumInspections > 0 ? `- INSPECTION TEST MODE: before propose_patch is accepted, complete at least ${context.minimumInspections} successful inspection tool calls. This temporary test setting overrides the normal instruction to patch immediately; make each inspection answer a concrete question and do not waste calls.\n` : ""}- You already receive the reproduced failure, assertion result, observed evidence, Graphify-ranked context, hydrated source files, and${context.hasMemory ? "" : " (this run: none matched)"} PAST INVESTIGATIONS memory. Treat all of it as evidence, not background noise.
 - You already receive the reproduced failure, assertion result, observed evidence, Graphify-ranked context, hydrated source files, and${context.hasMemory ? "" : " (this run: none matched)"} PAST INVESTIGATIONS memory. Treat all of it as evidence, not background noise.
 ${context.hasMemory ? `- MEMORY FIRST: if a PAST INVESTIGATIONS entry is a verified fix for this same issue and its diff is not marked STALE, adapt that diff and call propose_patch on your FIRST turn — zero exploration calls. If it is marked STALE, verify only the changed region, then patch.\n` : ""}- Before calling any non-patch tool, decide what exact fact is missing, whether it is already present in the provided evidence, how the result will change your patch, and whether you can patch now without it. If you can patch now, patch now.
 - A non-patch tool call is allowed only when it answers a concrete unknown that blocks patching.
@@ -1254,13 +1911,14 @@ ${context.hasMemory ? `- MEMORY FIRST: if a PAST INVESTIGATIONS entry is a verif
 - You have at most ${budgets.maxExplorationBeforeFirstPatch} non-patch tool calls before the first patch attempt. If that exploration budget is exhausted, only propose_patch or submit_blocked is allowed.
 - If ${budgets.maxModelTurns - 2} model turns have passed and no patch has been proposed, only propose_patch or submit_blocked is allowed.
 - If a safe fix is not possible, call submit_blocked with a clear reason.
-- Respond with exactly one tool call per turn.`;
+${context.parallelReads ? "- Respond with tool calls only: one call per turn, or several READ-ONLY calls (read_file/read_many/grep/get_graph_neighbors) batched in one response when they are independent." : "- Respond with exactly one tool call per turn."}`;
 
 type FixerCounters = {
   turns: number;
   readFile: number;
   grep: number;
   graph: number;
+  runCode: number;
   patchAttempts: number;
 };
 
@@ -1272,7 +1930,9 @@ function shouldBlockInspectionTool(
   counters: FixerCounters,
   budgets: FixerBudgets,
 ): { blocked: true; reason: string } | { blocked: false } {
-  if (!["read_file", "grep", "get_graph_neighbors"].includes(toolName)) {
+  if (
+    !["read_file", "read_many", "grep", "get_graph_neighbors", "run_code"].includes(toolName)
+  ) {
     return { blocked: false };
   }
 
@@ -1280,7 +1940,8 @@ function shouldBlockInspectionTool(
     return { blocked: false };
   }
 
-  const explorationCalls = counters.readFile + counters.grep + counters.graph;
+  const explorationCalls =
+    counters.readFile + counters.grep + counters.graph + counters.runCode;
   const remainingTurns = budgets.maxModelTurns - counters.turns;
 
   if (

@@ -200,6 +200,18 @@ export function buildPullRequestDescriptionData(
       "The repository declares no runnable validation scripts (test, typecheck, lint, or build), so repository validation could not run.",
     );
   }
+  // Phase 3.3 truthfulness: state security posture explicitly. Diff-risk
+  // heuristics (Phase 3.1) are advisory pattern checks, never a security
+  // verification; if they did not run, say so rather than imply the diff was
+  // security-reviewed.
+  const ranDiffRisk = fixAttempt.checks.some((check) =>
+    check.name.startsWith("diff-risk"),
+  );
+  limitations.push(
+    ranDiffRisk
+      ? "Advisory diff-risk heuristics ran; they flag known-risky patterns only and are NOT a security verification."
+      : "No automated security or diff-risk scan was performed on this patch; reviewers should assess security implications.",
+  );
 
   // Review focus: explicit structured signals only. No generic filler.
   const reviewFocus: string[] = [];

@@ -1019,6 +1019,16 @@ assert.ok(source.includes("http"), "REGRESSION_EXPECTED_FAILURE: trivially true 
       expect(attempt2.outcome).toBe("verified");
       expect(attempt2.regressionTest?.status).toBe("unavailable");
       expect(attempt2.regressionTest?.prePatch).toBe("invalid_test");
+      for (const attemptNumber of ["001", "002"]) {
+        const attemptDir = path.join(
+          attempt2.attemptDir,
+          "regression-attempts",
+          attemptNumber,
+        );
+        await stat(path.join(attemptDir, "proposal.json"));
+        await stat(path.join(attemptDir, "regression-test-source.mjs"));
+        await stat(path.join(attemptDir, "prepatch-result.json"));
+      }
       const regressionCheck = attempt2.checks.find((c) => c.name === "regression_test");
       expect(regressionCheck?.status).toBe("advisory");
       expect(regressionCheck?.detail).toContain("No generated regression test was available");

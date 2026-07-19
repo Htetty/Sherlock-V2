@@ -168,6 +168,15 @@ describe("deterministic reproduction", () => {
         "step-5",
       ]);
       expect(result.networkFailures.length).toBeGreaterThan(0);
+      expect(result.apiResponses).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            method: "POST",
+            status: 500,
+            body: expect.stringContaining("Internal Server Error"),
+          }),
+        ]),
+      );
       expect(result.screenshots.length).toBeGreaterThan(0);
 
       // Evidence files exist on disk.

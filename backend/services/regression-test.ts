@@ -21,6 +21,7 @@ import {
 } from "./container.js";
 import type { ReproductionPlan } from "./plan.js";
 import type { ReproductionResult } from "./playwright.js";
+import { redactSecrets } from "./report.js";
 
 export const REGRESSION_PROPOSAL_VERSION = 1;
 
@@ -453,6 +454,123 @@ export type RegressionGenerationInput = {
   sourceFiles: { path: string; contents: string }[];
 };
 
+const MAX_REGRESSION_API_RESPONSES = 8;
+const MAX_REGRESSION_API_BODY_CHARS = 2_000;
+const MAX_REGRESSION_SOURCE_CHARS = 32_000;
+const MAX_REGRESSION_SOURCE_FILE_CHARS = 12_000;
+
+function redactJsonSecrets(value: unknown, depth = 0): unknown {
+  if (depth > 8) return "[TRUNCATED]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 100).map((item) => redactJsonSecrets(item, depth + 1));
+  }
+  if (!value || typeof value !== "object") return value;
+
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .slice(0, 100)
+      .map(([key, item]) => [
+        key,
+        /key|token|secret|password|passwd|credential|authorization|auth/i.test(key)
+          ? "[REDACTED]"
+          : redactJsonSecrets(item, depth + 1),
+      ]),
+  );
+}
+
+function redactApiBody(body: string): string {
+  try {
+    return JSON.stringify(redactJsonSecrets(JSON.parse(body)));
+  } catch {
+    return redactSecrets(body);
+  }
+}
+
+function formatRegressionApiEvidence(result: ReproductionResult): string {
+  const responses = (result.apiResponses ?? []).slice(-MAX_REGRESSION_API_RESPONSES);
+  if (responses.length === 0) return "(no response bodies were captured)";
+
+  return responses
+    .map((response) => {
+      const safeBody = redactApiBody(response.body ?? "");
+      const body = safeBody.length > MAX_REGRESSION_API_BODY_CHARS
+        ? `${safeBody.slice(0, MAX_REGRESSION_API_BODY_CHARS)}\n[RESPONSE BODY EVIDENCE TRUNCATED]`
+        : safeBody;
+      return `${response.method} ${response.url} -> ${response.status} ${response.statusText}\n${body}`;
+    })
+    .join("\n\n");
+}
+
+function proposalFilePaths(value: unknown): Set<string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return new Set();
+  const files = (value as { files?: unknown }).files;
+  if (!Array.isArray(files)) return new Set();
+  return new Set(
+    files
+      .map((file) =>
+        file && typeof file === "object" && typeof (file as { path?: unknown }).path === "string"
+          ? (file as { path: string }).path
+          : null,
+      )
+      .filter((file): file is string => file !== null),
+  );
+}
+
+function regressionSearchTerms(input: RegressionGenerationInput): string[] {
+  const text = [
+    input.issueTitle,
+    input.issueBody,
+    JSON.stringify(input.plan),
+    JSON.stringify(input.fixProposal),
+  ].join(" ");
+  return [...new Set(text.match(/[A-Za-z0-9][A-Za-z0-9_-]{4,}/g) ?? [])]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, 40);
+}
+
+function sourceExcerpt(contents: string, terms: string[]): string {
+  if (contents.length <= MAX_REGRESSION_SOURCE_FILE_CHARS) return contents;
+
+  const lines = contents.split("\n");
+  const selected = new Set<number>();
+  for (let index = 0; index < Math.min(lines.length, 35); index += 1) selected.add(index);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!terms.some((term) => lines[index].toLowerCase().includes(term.toLowerCase()))) continue;
+    for (let line = Math.max(0, index - 8); line <= Math.min(lines.length - 1, index + 12); line += 1) {
+      selected.add(line);
+    }
+  }
+
+  const rendered = [...selected]
+    .sort((a, b) => a - b)
+    .map((index) => `${index + 1}: ${lines[index]}`)
+    .join("\n");
+  return rendered.length > MAX_REGRESSION_SOURCE_FILE_CHARS
+    ? `${rendered.slice(0, MAX_REGRESSION_SOURCE_FILE_CHARS)}\n[SOURCE EVIDENCE TRUNCATED]`
+    : rendered;
+}
+
+function formatRegressionSourceEvidence(input: RegressionGenerationInput): string {
+  const changedPaths = proposalFilePaths(input.fixProposal);
+  const terms = regressionSearchTerms(input);
+  const ordered = [...input.sourceFiles].sort((left, right) =>
+    Number(changedPaths.has(right.path)) - Number(changedPaths.has(left.path)),
+  );
+  let remaining = MAX_REGRESSION_SOURCE_CHARS;
+  const sections: string[] = [];
+
+  for (const file of ordered.slice(0, 8)) {
+    if (remaining <= 0) break;
+    const excerpt = sourceExcerpt(file.contents, terms);
+    const bounded = excerpt.slice(0, remaining);
+    sections.push(`--- ${file.path} ---\n${bounded}`);
+    remaining -= bounded.length;
+  }
+
+  return sections.join("\n\n") || "(no selected source files found)";
+}
+
 // Prompt for the structured test proposal. Lives here (Claude-free) so the
 // generation rules are unit-testable; claude.ts only sends it.
 export function buildRegressionTestPrompt(
@@ -482,6 +600,8 @@ Test rules:
   assert.ok(condition, "${REGRESSION_FAILURE_MARKER_PREFIX} archived completed task reappeared after archive-completed");
 - Setup steps (creating fixtures, calling endpoints) must use plain assertions WITHOUT that marker, so a setup failure is never mistaken for the behavioral failure.
 - Capture IDs from the resources the test itself creates (parse the response bodies) instead of assuming fixed IDs, unless the verified reproduction plan itself proves fixed IDs.
+- Prefer proving the FINAL observable resource or user-visible state over polling background-job metadata. Do not parse or poll a job identifier unless its exact response field AND type are explicitly shown in the captured API response evidence or relevant source below. If the final state can be polled using a unique fixture token, do that instead and avoid the job ID entirely.
+- Never guess a JSON response shape. When a setup assertion depends on a response body, include a bounded diagnostic containing only its top-level keys and value TYPES (never secret/user values) so a rejected first attempt can be corrected safely.
 - Test ONLY the reproduced behavioral assertion; no broad suites, no unrelated checks.
 - Write one deterministic test whose exact bytes can run unchanged before and after the patch; do not branch on source version, patch state, or run phase.
 - The relativePath must be a single new file at the repository root ending in ".mjs".
@@ -524,14 +644,14 @@ ${JSON.stringify(input.plan, null, 2)}
 Observed failure: ${input.reproductionResult.outcomeReason}
 Failed assertion: ${JSON.stringify(input.reproductionResult.assertion)}
 
+Captured same-origin API response evidence (bounded and secret-redacted; trusted for response fields/types):
+${formatRegressionApiEvidence(input.reproductionResult)}
+
 Proposed patch (about to be applied; the test must fail BEFORE it and pass AFTER it):
 ${JSON.stringify(input.fixProposal, null, 2)}
 
 Relevant source files:
-${input.sourceFiles
-  .slice(0, 6)
-  .map((file) => `--- ${file.path} ---\n${file.contents.slice(0, 4_000)}`)
-  .join("\n\n")}
+${formatRegressionSourceEvidence(input)}
 ${feedback ? `\nYour previous proposal was rejected: ${feedback}\nReturn a corrected proposal as bare JSON.` : ""}
 `;
 }

@@ -222,10 +222,17 @@ export function buildTargetEnv(
 export type ContainerRunSpec = {
   containerName: string;
   workspacePath: string;
+  // Mount the workspace read-only at /app (fable/16 run_code explorer). The
+  // Docker :ro mount is the security boundary for generated exploration code
+  // — never a post-hoc git rollback.
+  workspaceReadOnly?: boolean;
   env: Record<string, string>;
   command: string[]; // argv executed in the container, e.g. ["npm", "install"]
   portMapping?: { hostPort: number; containerPort: number };
   image?: string;
+  // Container user override (default CONTAINER_DEFAULTS.user). The explorer
+  // image may not define the "node" user; non-root is still required.
+  user?: string;
   // Adds the Docker host-gateway alias so a verification container can reach
   // the sandbox application published on the host's localhost. Adds a DNS
   // name only — no host networking, and the restriction set is unchanged.
@@ -247,12 +254,12 @@ export function buildContainerRunArgs(spec: ContainerRunSpec): string[] {
     `--pids-limit=${CONTAINER_DEFAULTS.pidsLimit}`,
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
-    `--user=${CONTAINER_DEFAULTS.user}`,
+    `--user=${spec.user ?? CONTAINER_DEFAULTS.user}`,
     "--read-only",
     "--tmpfs",
     "/tmp:rw,exec,size=512m",
     "-v",
-    `${spec.workspacePath}:${CONTAINER_WORKDIR}`,
+    `${spec.workspacePath}:${CONTAINER_WORKDIR}${spec.workspaceReadOnly ? ":ro" : ""}`,
     "-w",
     CONTAINER_WORKDIR,
   ];
@@ -375,10 +382,21 @@ export async function runContainerCommand(
   spec: Omit<ContainerRunSpec, "containerName"> & {
     purpose: string;
     timeoutMs: number;
+    // Sent to the container's stdin, then stdin is closed. Used by run_code
+    // to transport a generated script without interpolating it into any
+    // shell/Docker command string or filename (fable/16).
+    stdinData?: string;
   },
 ): Promise<ContainerCommandResult> {
   const containerName = createContainerName(spec.purpose);
+  const needsStdin = spec.stdinData !== undefined;
   const args = buildContainerRunArgs({ ...spec, containerName });
+
+  if (needsStdin) {
+    // docker run -i keeps stdin open so the piped script reaches the shell.
+    args.splice(1, 0, "-i");
+  }
+
   const sanitizedCommand = sanitizeDockerCommand(args, spec.workspacePath);
   const startedAt = Date.now();
 
@@ -389,6 +407,15 @@ export async function runContainerCommand(
   let timedOut = false;
 
   const child = docker.spawnContainer(args);
+
+  if (needsStdin) {
+    child.stdin.on("error", () => {
+      // A container that exits before consuming stdin must not crash the
+      // worker with an unhandled EPIPE.
+    });
+    child.stdin.write(spec.stdinData);
+    child.stdin.end();
+  }
   child.stdout.on("data", (chunk) => {
     stdout = appendBoundedText(
       stdout,

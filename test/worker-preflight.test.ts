@@ -83,6 +83,8 @@ describe("worker preflight", () => {
       "docker:cli",
       "docker:daemon",
       "docker:target-image",
+      "docker:explorer-image",
+      "pricing:file",
       "sandbox:addressing",
       "redis",
       "playwright:chromium",
@@ -211,6 +213,34 @@ describe("worker preflight", () => {
     );
     expect(statusOf(daemonDown, "docker:cli")).toBe("PASS");
     expect(statusOf(daemonDown, "docker:daemon")).toBe("FAIL");
+
+    const explorerMissing = await runWorkerPreflight(
+      passingDeps({
+        runCommand: async (command, args) => {
+          if (
+            command === "docker" &&
+            args[0] === "image" &&
+            args[1] === "inspect" &&
+            args[2] === "sherlock-explorer:latest"
+          ) {
+            throw new Error("No such image");
+          }
+          if (command === "docker" && args[0] === "network") {
+            return { stdout: ATTACHED_CONTAINERS_JSON, stderr: "" };
+          }
+          return { stdout: "ok", stderr: "" };
+        },
+      }),
+    );
+    expect(statusOf(explorerMissing, "docker:explorer-image")).toBe("FAIL");
+    expect(explorerMissing.ok).toBe(false);
+
+    const explorerDisabled = await runWorkerPreflight(
+      passingDeps({
+        env: { ...fullEnv, SHERLOCK_FIXER_RUN_CODE: "false" } as NodeJS.ProcessEnv,
+      }),
+    );
+    expect(statusOf(explorerDisabled, "docker:explorer-image")).toBe("PASS");
 
     const imageUnavailable = await runWorkerPreflight(
       passingDeps({

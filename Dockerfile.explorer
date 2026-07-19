@@ -1,0 +1,30 @@
+# Explorer image for the fixer's run_code tool (fable/16).
+#
+# A controlled, minimal toolbox for read-only repository exploration: POSIX
+# shell, git, ripgrep, and basic text processing. Deliberately NOT the target
+# image — target-image binaries are untrusted and unpinned.
+#
+# Build:  docker build -f Dockerfile.explorer -t sherlock-explorer:latest .
+# Select: SHERLOCK_EXPLORER_IMAGE (defaults to sherlock-explorer:latest)
+#
+# Runtime contract (enforced by backend/agents/run-code.ts, not this file):
+# repo mounted read-only at /app, --network=none, non-root user, read-only
+# container root, bounded /tmp, script delivered over stdin to /bin/sh -s.
+
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    bash \
+    coreutils \
+    findutils \
+    git \
+    grep \
+    jq \
+    ripgrep \
+    sed
+
+# Non-root by default; run-code passes --user explicitly as well.
+RUN adduser -D -u 1000 explorer
+USER explorer
+
+WORKDIR /app

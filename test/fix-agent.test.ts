@@ -273,6 +273,43 @@ const SECOND_PROPOSAL_INPUT = {
 // --- Tests ------------------------------------------------------------------------
 
 describe("fixer agent loop", () => {
+  test("inspection test mode blocks an immediate patch until the required inspections succeed", async () => {
+    const previous = process.env.SHERLOCK_FIXER_MIN_INSPECTIONS;
+    process.env.SHERLOCK_FIXER_MIN_INSPECTIONS = "2";
+
+    try {
+      const input = await makeInput();
+      const model = scriptedModel([
+        toolUseMessage("propose_patch", PROPOSAL_INPUT),
+        toolUseMessage("grep", { query: "login", path: "." }),
+        toolUseMessage("read_file", { path: "server.js" }),
+        toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      ]);
+
+      let verifierCalls = 0;
+      const result = await runFixerAgent(input, {
+        createMessage: model.createMessage,
+        runFixAttempt: async () => {
+          verifierCalls += 1;
+          return attemptResult("verified", "Replay clean, tests passed.");
+        },
+      });
+
+      expect(result.status).toBe("verified");
+      expect(verifierCalls).toBe(1);
+      expect(result.attempts).toHaveLength(1);
+      expect(result.efficiencyCounters.successfulInspections).toBe(2);
+      expect(lastToolResultText(model.calls[1])).toContain("INSPECTION TEST MODE");
+      expect(lastToolResultText(model.calls[1])).toContain("2 more successful inspection");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SHERLOCK_FIXER_MIN_INSPECTIONS;
+      } else {
+        process.env.SHERLOCK_FIXER_MIN_INSPECTIONS = previous;
+      }
+    }
+  });
+
   test("reads a file, then proposes a verified patch", async () => {
     const input = await makeInput();
     const model = scriptedModel([
@@ -501,7 +538,9 @@ describe("fixer agent loop", () => {
     const matchLines = grepResult.split("\n").filter((line) => /^[^[]/.test(line));
     expect(matchLines.length).toBeLessThanOrEqual(FIXER_BUDGETS.maxGrepLines);
     expect(grepResult).not.toContain("node_modules");
-    expect(grepResult).toContain(`[TRUNCATED at ${FIXER_BUDGETS.maxGrepLines} matches]`);
+    // fable/16: capped output reports omitted match/file counts explicitly.
+    expect(grepResult).toContain("[OUTPUT CAPPED");
+    expect(grepResult).toContain("omitted");
   });
 
   test("read_file returns only the requested line span", async () => {
@@ -618,7 +657,7 @@ describe("fixer agent loop", () => {
     // The nudge was delivered between the two model calls.
     const secondCall = model.calls[1];
     const nudge = secondCall.messages[secondCall.messages.length - 1];
-    expect(nudge.content).toBe("Respond with exactly one tool call.");
+    expect(nudge.content).toContain("Independent read-only inspections may be called in parallel");
   });
 
   test("read_file of a fully hydrated file is rejected without consuming budget", async () => {
@@ -860,8 +899,37 @@ describe("compaction preserves attempt signatures", () => {
       expect(allMessages).toContain("before: reproduced");
       expect(allMessages).toContain('after: reproduced | assertion observed');
     } finally {
-      process.env.SHERLOCK_COMPACTION = previous;
+      if (previous === undefined) {
+        delete process.env.SHERLOCK_COMPACTION;
+      } else {
+        process.env.SHERLOCK_COMPACTION = previous;
+      }
     }
+  });
+});
+
+describe("dense inspection budgets", () => {
+  test("read_many cannot cross the pre-patch exploration ceiling", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("grep", { query: "login" }),
+      toolUseMessage("grep", { query: "status" }),
+      toolUseMessage("get_graph_neighbors", { node: "one" }),
+      toolUseMessage("get_graph_neighbors", { node: "two" }),
+      toolUseMessage("get_graph_neighbors", { node: "three" }),
+      toolUseMessage("read_many", {
+        files: [
+          { path: "server.js", startLine: 1, endLine: 1 },
+          { path: "server.js", startLine: 2, endLine: 2 },
+          { path: "server.js", startLine: 3, endLine: 3 },
+        ],
+      }),
+      toolUseMessage("submit_blocked", { reason: "done" }),
+    ]);
+
+    const result = await runFixerAgent(input, { createMessage: model.createMessage });
+    expect(result.efficiencyCounters.filesReadThroughReadMany).toBe(1);
+    expect(lastToolResultText(model.calls[6])).toContain("Exploration budget exhausted");
   });
 });
 

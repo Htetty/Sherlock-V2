@@ -906,6 +906,8 @@ export async function processDeliveryJob(
     );
   }
 
+  await recordState({ type: "stage_changed", stage: "delivering" });
+
   try {
     const { state: delivered, complete } = await runDeliveryFromState(
       state,
@@ -922,6 +924,7 @@ export async function processDeliveryJob(
     log(
       `[${payload.investigationId}] Delivery completed (pull request: ${delivered.pullRequest.status}, comment: ${delivered.terminalComment.status}).`,
     );
+    await recordState({ type: "stage_changed", stage: "completed" });
     return {
       investigationId: payload.investigationId,
       outcome: delivered.executionOutcome,

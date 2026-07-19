@@ -128,6 +128,10 @@ export type SessionEvidence = {
   events: PlaywrightEvent[];
   screenshots: string[];
   truncation: EvidenceTruncation;
+  // Browser fetch/XHR response bodies are read asynchronously from Playwright
+  // response objects. Track those reads so a step cannot finish before its
+  // bounded API evidence has reached the reproduction result.
+  pendingResponseCaptures: Set<Promise<void>>;
 };
 
 function createSessionEvidence(): SessionEvidence {
@@ -139,6 +143,7 @@ function createSessionEvidence(): SessionEvidence {
     apiResponses: [],
     events: [],
     screenshots: [],
+    pendingResponseCaptures: new Set(),
     truncation: {
       consoleErrorsDropped: 0,
       pageErrorsDropped: 0,
@@ -149,7 +154,11 @@ function createSessionEvidence(): SessionEvidence {
 
 // The exact listeners the plan executor has always installed, extracted so a
 // live session captures identical evidence.
-function attachEvidenceListeners(page: Page, evidence: SessionEvidence) {
+function attachEvidenceListeners(
+  page: Page,
+  evidence: SessionEvidence,
+  baseUrl: string,
+) {
   const recordEvent = (type: PlaywrightEvent["type"], detail: string) => {
     if (evidence.events.length < MAX_EVENTS) {
       evidence.events.push({ timestamp: new Date().toISOString(), type, detail });
@@ -230,7 +239,58 @@ function attachEvidenceListeners(page: Page, evidence: SessionEvidence) {
         "networkFailuresDropped",
       );
     }
+
+    // Explicit `request` plan steps already record their response body in
+    // performStepAction(). Browser-driven reproductions previously retained
+    // only status/URL for page fetch/XHR traffic, which left later regression
+    // generation guessing response contracts. Capture same-origin bodies in
+    // a bounded form and wait for the read before completing the step.
+    const resourceType = response.request().resourceType();
+    const sameOrigin = (() => {
+      try {
+        return new URL(response.url()).origin === new URL(baseUrl).origin;
+      } catch {
+        return false;
+      }
+    })();
+
+    if (
+      sameOrigin &&
+      (resourceType === "fetch" || resourceType === "xhr") &&
+      evidence.apiResponses.length < MAX_HTTP_RESPONSES
+    ) {
+      let capture: Promise<void>;
+      capture = response
+        .text()
+        .then((rawBody) => {
+          const body = truncateWithMarker(
+            rawBody,
+            MAX_API_RESPONSE_BODY_CHARS,
+            "API BODY TRUNCATED",
+          );
+          evidence.apiResponses.push({
+            method,
+            url: response.url(),
+            status: response.status(),
+            statusText: response.statusText(),
+            body,
+            bodyTruncated: rawBody.length > MAX_API_RESPONSE_BODY_CHARS,
+            originalBodyLength: rawBody.length,
+          });
+        })
+        .catch(() => {})
+        .finally(() => {
+          evidence.pendingResponseCaptures.delete(capture);
+        });
+      evidence.pendingResponseCaptures.add(capture);
+    }
   });
+}
+
+async function flushPendingResponseCaptures(evidence: SessionEvidence) {
+  while (evidence.pendingResponseCaptures.size > 0) {
+    await Promise.allSettled([...evidence.pendingResponseCaptures]);
+  }
 }
 
 function pushCapped<T>(
@@ -359,6 +419,7 @@ export async function executeSessionStep(
 
   try {
     record.screenshot = await performStepAction(page, baseUrl, step, evidence, screenshot);
+    await flushPendingResponseCaptures(evidence);
     record.outcome = "passed";
   } catch (error) {
     record.outcome = "failed";
@@ -443,7 +504,7 @@ export async function executeReproductionPlan(
   page.setDefaultTimeout(STEP_TIMEOUT_MS);
   page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
 
-  attachEvidenceListeners(page, evidence);
+  attachEvidenceListeners(page, evidence, plan.baseUrl);
 
   // API-only plans never open a page: screenshots would be blank white
   // frames that make the run look broken. Skip them and record why
@@ -487,6 +548,7 @@ export async function executeReproductionPlan(
     }
 
     await waitForPageToSettle(page);
+    await flushPendingResponseCaptures(evidence);
     const rawHtml = await page.content().catch(() => "");
     result.html = truncateWithMarker(
       rawHtml,
@@ -809,6 +871,12 @@ export type LiveSession = {
   evidence: SessionEvidence;
   executeStep: (step: ReproductionStep) => Promise<StepRecord>;
   readPageDigest: () => Promise<string>;
+  // Structured page snapshot (fable/16 action deltas): URL, title, and the
+  // SAME interactive-element lines readPageDigest renders — one page model,
+  // never a second collector. Snapshots compare deterministically. Optional
+  // so pre-existing LiveSession fakes remain valid; consumers must fall back
+  // to readPageDigest when absent.
+  readPageSnapshot?: () => Promise<PageSnapshot>;
   // Save a screenshot of the current page into the session store (null when
   // no store was provided or the capture fails). Used by the reproducer for
   // exploration traces after browser actions.
@@ -838,7 +906,7 @@ export async function openLiveSession(
   page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
 
   const evidence = createSessionEvidence();
-  attachEvidenceListeners(page, evidence);
+  attachEvidenceListeners(page, evidence, baseUrl);
 
   const screenshot = async (name: string) => {
     if (!options.store) {
@@ -853,7 +921,11 @@ export async function openLiveSession(
     baseUrl,
     evidence,
     executeStep: (step) => executeSessionStep(page, baseUrl, step, evidence, screenshot),
-    readPageDigest: () => buildPageDigest(page),
+    readPageDigest: async () => {
+      await flushPendingResponseCaptures(evidence);
+      return formatPageSnapshot(await buildPageSnapshot(page));
+    },
+    readPageSnapshot: () => buildPageSnapshot(page),
     captureScreenshot: screenshot,
     close: async () => {
       await browser.close().catch(() => {});
@@ -863,10 +935,71 @@ export async function openLiveSession(
 
 const MAX_DIGEST_ELEMENTS = 200;
 
+// Structured page snapshot (fable/16): URL, title, and interactive-element
+// lines in the exact target vocabulary. The single source for read_page
+// digests AND action-delta diffs — one page model.
+export type PageSnapshot = {
+  url: string;
+  title: string;
+  elements: string[];
+};
+
+export function formatPageSnapshot(snapshot: PageSnapshot): string {
+  return [
+    `URL: ${snapshot.url}`,
+    `Title: ${snapshot.title || "(none)"}`,
+    "Interactive elements:",
+    ...(snapshot.elements.length > 0 ? snapshot.elements : ["(none found)"]),
+  ].join("\n");
+}
+
+// Deterministic snapshot comparison: URL/title changes plus element lines
+// that appeared or disappeared. Element lines are compared verbatim (they are
+// already normalized by the collector), so the diff is stable.
+export function computePageSnapshotDelta(
+  previous: PageSnapshot | null,
+  next: PageSnapshot,
+): string[] {
+  const lines: string[] = [];
+
+  if (!previous) {
+    lines.push(`URL: ${next.url}`, `Title: ${next.title || "(none)"}`);
+
+    if (next.elements.length > 0) {
+      lines.push("New interactive elements:", ...next.elements);
+    }
+
+    return lines;
+  }
+
+  if (previous.url !== next.url) {
+    lines.push(`URL changed: ${previous.url} -> ${next.url}`);
+  }
+
+  if (previous.title !== next.title) {
+    lines.push(`Title changed: "${previous.title}" -> "${next.title}"`);
+  }
+
+  const previousSet = new Set(previous.elements);
+  const nextSet = new Set(next.elements);
+  const appeared = next.elements.filter((line) => !previousSet.has(line));
+  const disappeared = previous.elements.filter((line) => !nextSet.has(line));
+
+  if (appeared.length > 0) {
+    lines.push("Appeared:", ...appeared);
+  }
+
+  if (disappeared.length > 0) {
+    lines.push("Disappeared:", ...disappeared);
+  }
+
+  return lines;
+}
+
 // Interactive elements described in the exact vocabulary DomTargetIntent
 // accepts (role, name, label, placeholder, testId, id, text) - what the agent
 // sees is what it can target. Capping/truncation is the caller's job.
-async function buildPageDigest(page: Page): Promise<string> {
+async function buildPageSnapshot(page: Page): Promise<PageSnapshot> {
   const url = page.url();
   const title = await page.title().catch(() => "");
 
@@ -927,12 +1060,7 @@ async function buildPageDigest(page: Page): Promise<string> {
     }, MAX_DIGEST_ELEMENTS)
     .catch(() => ["(page digest unavailable)"]);
 
-  return [
-    `URL: ${url}`,
-    `Title: ${title || "(none)"}`,
-    "Interactive elements:",
-    ...(elements.length > 0 ? elements : ["(none found)"]),
-  ].join("\n");
+  return { url, title, elements };
 }
 
 async function isBaseUrlReachable(baseUrl: string, timeoutMs: number) {

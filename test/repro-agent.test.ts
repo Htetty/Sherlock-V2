@@ -332,6 +332,39 @@ describe("reproducer agent loop", () => {
     await stat(path.join(agentDir, "summary.json"));
   });
 
+  test("run_steps executes sequentially and reports one bounded batch result", async () => {
+    const { input } = await makeInput();
+    const sessions = stubSessionFactory([
+      stepRecord("goto", "passed"),
+      stepRecord("click", "passed"),
+    ]);
+    const model = scriptedModel([
+      toolUseMessage("run_steps", {
+        steps: [
+          { action: "goto", path: "/" },
+          { action: "click", target: { testId: "archive-btn" } },
+        ],
+      }),
+      toolUseMessage("submit_plan", VALID_SUBMISSION),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("reproduced", "Expected failure condition observed: 500."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(result.efficiencyCounters.runStepsCalls).toBe(1);
+    expect(result.efficiencyCounters.batchedActions).toBe(2);
+    const batchResult = lastToolResultText(model.calls[1]);
+    expect(batchResult).toContain("run_steps: all 2 step(s) executed");
+    expect(Buffer.byteLength(batchResult, "utf8")).toBeLessThanOrEqual(
+      REPRODUCER_BUDGETS.maxEvidenceBytes,
+    );
+  });
+
   test("ambiguous click returns diagnostics and the agent retargets", async () => {
     const { input } = await makeInput();
     const diagnostics =
