@@ -3,7 +3,6 @@
 // filesystem paths, and artifact content never enter report formatting.
 
 import type {
-  ArtifactCleanupOperationalSummary,
   FilesystemUsage,
   ProductionMonitoringConfig,
   QueueOperationalSummary,
@@ -30,7 +29,6 @@ export type ProductionOpsAdapters = {
   workerHeartbeats(): Promise<WorkerHeartbeatSummary>;
   queueSummary(): Promise<QueueOperationalSummary>;
   filesystemUsage(): Promise<FilesystemUsage[]>;
-  cleanupStatus(): Promise<ArtifactCleanupOperationalSummary>;
 };
 
 export async function runProductionOpsCheck(
@@ -154,32 +152,6 @@ export async function runProductionOpsCheck(
     }
   } catch {
     add("filesystem", "fail", "filesystem usage checks failed");
-  }
-
-  try {
-    const cleanup = await adapters.cleanupStatus();
-    if (!cleanup.latest || cleanup.latestAgeMs === null) {
-      add("artifact-cleanup", "warn", "no recent cleanup status is available");
-    } else {
-      const latest = cleanup.latest;
-      const detail = [
-        `age=${formatAge(cleanup.latestAgeMs)}`,
-        `scanned=${latest.scanned}`,
-        `deleted=${latest.deleted}`,
-        `retained=${latest.retained}`,
-        `protected=${latest.protected}`,
-        `failures=${latest.failures}`,
-        `oldest_failed=${formatAge(latest.oldestRetainedFailedAgeMs)}`,
-      ].join(" ");
-      const warning =
-        cleanup.workersWithFailures > 0 ||
-        cleanup.latestAgeMs > config.cleanupStatusMaxAgeMs ||
-        !latest.bounded ||
-        cleanup.truncated;
-      add("artifact-cleanup", warning ? "warn" : "pass", detail);
-    }
-  } catch {
-    add("artifact-cleanup", "warn", "cleanup status is unavailable");
   }
 
   const overall = checks.some((check) => check.status === "fail")

@@ -4,17 +4,13 @@ import { describe, expect, test, vi } from "vitest";
 import { runOpsCheckCli } from "../backend/ops-check.js";
 import { buildInvestigationJobId } from "../backend/queue/investigation-queue.js";
 import {
-  ARTIFACT_CLEANUP_STATUS_KEY_PREFIX,
   WORKER_HEARTBEAT_KEY_PREFIX,
-  cleanupScanOperationalRecord,
   createWorkerHeartbeat,
   getProductionMonitoringConfig,
-  readArtifactCleanupStatus,
   readFilesystemUsage,
   readQueueOperationalSummary,
   readWorkerHeartbeat,
   readWorkerHeartbeatSummary,
-  writeArtifactCleanupStatus,
   type OperationalRedis,
 } from "../backend/services/production-monitoring.js";
 import {
@@ -106,25 +102,6 @@ function baseAdapters(
         usedPercent: 40,
       },
     ],
-    cleanupStatus: async () => ({
-      records: 1,
-      latest: {
-        version: 1,
-        workerId: "worker-1",
-        ranAt: new Date(NOW - 60_000).toISOString(),
-        kind: "scan",
-        scanned: 10,
-        deleted: 2,
-        retained: 8,
-        protected: 1,
-        failures: 0,
-        bounded: true,
-        oldestRetainedFailedAgeMs: 3_600_000,
-      },
-      latestAgeMs: 60_000,
-      workersWithFailures: 0,
-      truncated: false,
-    }),
     ...overrides,
   };
 }
@@ -629,76 +606,8 @@ describe("filesystem capacity checks", () => {
   });
 });
 
-describe("cleanup visibility", () => {
-  test("persists and reads only bounded cleanup counters", async () => {
-    const redis = new FakeRedis();
-    const record = cleanupScanOperationalRecord(
-      "worker-a",
-      {
-        examined: 12,
-        scanned: 10,
-        deleted: 2,
-        retained: 8,
-        protected: 3,
-        errors: 1,
-        oldestRetainedFailedAgeMs: 600_000,
-        bounded: true,
-      },
-      () => NOW,
-    );
-    await writeArtifactCleanupStatus(redis, record, 7_000);
-    const summary = await readArtifactCleanupStatus(redis, () => NOW + 1_000);
-
-    expect(summary.latest).toMatchObject({
-      scanned: 10,
-      deleted: 2,
-      retained: 8,
-      protected: 3,
-      failures: 1,
-      oldestRetainedFailedAgeMs: 600_000,
-    });
-    expect(redis.ttls.get(`${ARTIFACT_CLEANUP_STATUS_KEY_PREFIX}worker-a`)).toBe(
-      7_000,
-    );
-  });
-
-  test("cleanup failures are visible as a warning", async () => {
-    const adapters = baseAdapters();
-    const baseline = await adapters.cleanupStatus();
-    const report = await runProductionOpsCheck(
-      getProductionMonitoringConfig({}),
-      baseAdapters({
-        cleanupStatus: async () => ({
-          ...baseline,
-          workersWithFailures: 1,
-        }),
-      }),
-    );
-    expect(
-      report.checks.find((check) => check.name === "artifact-cleanup")?.status,
-    ).toBe("warn");
-  });
-
-  test("missing cleanup history is visible without failing service health", async () => {
-    const report = await runProductionOpsCheck(
-      getProductionMonitoringConfig({}),
-      baseAdapters({
-        cleanupStatus: async () => ({
-          records: 0,
-          latest: null,
-          latestAgeMs: null,
-          workersWithFailures: 0,
-          truncated: false,
-        }),
-      }),
-    );
-    expect(report.overall).toBe("warn");
-    expect(report.exitCode).toBe(0);
-  });
-});
-
 describe("operator command safety and failure semantics", () => {
-  test("fresh heartbeat, normal queue, disk, and cleanup state pass", async () => {
+  test("fresh heartbeat, normal queue, and disk state pass", async () => {
     const report = await runProductionOpsCheck(
       getProductionMonitoringConfig({}),
       baseAdapters(),
@@ -870,7 +779,6 @@ describe("operator command safety and failure semantics", () => {
       getProductionMonitoringConfig({}),
       baseAdapters({
         filesystemUsage: async () => { throw new Error(privateValue); },
-        cleanupStatus: async () => { throw new Error(privateValue); },
       }),
     );
     expect(formatProductionOpsReport(report)).not.toContain(privateValue);

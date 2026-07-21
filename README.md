@@ -66,6 +66,13 @@ Docker-socket requirement, and the Docker-outside-of-Docker path-alignment
 warning (sibling target containers bind-mount clone paths, so the worker's
 workspace path must exist from the Docker daemon host's perspective).
 
+### Investigation artifacts
+
+Sherlock retains each `artifacts/<investigationId>/` directory so later agent
+runs can use its evidence and replay plans as memory. There is no automatic
+age-based deletion; operators should provision the artifact volume as durable
+storage and manage capacity without removing replay inputs Sherlock still uses.
+
 ### Investigation state store (optional)
 
 The worker can persist a small, redacted per-investigation lifecycle summary
@@ -77,6 +84,27 @@ service role key to client code) and apply the migration in
 the backend service role bypasses it. See
 [docs/production-worker.md](docs/production-worker.md#investigation-state-store-optional)
 for details.
+
+### Replay evidence (optional, off by default)
+
+Sherlock can record the reproduction run (where the bug fails) and the
+post-fix verification run (where the exact saved plan passes), build a
+side-by-side comparison, and embed it in the GitHub comment as visual proof.
+See [docs/FABLE_REPLAY_EVIDENCE_PROMPT.md](docs/FABLE_REPLAY_EVIDENCE_PROMPT.md)
+for the design.
+
+- `SHERLOCK_REPRO_VIDEO=true` — record a video (`videos/run.webm`,
+  `videos/post-patch.webm`) during plan execution. Skipped for API-only
+  plans; recording failures never fail a run.
+- `ffmpeg` on the worker (optional; preflight warns) — produces
+  `evidence/evidence.mp4` (side-by-side) and a bounded `evidence/evidence.gif`.
+- `SHERLOCK_EVIDENCE_UPLOAD=supabase` — upload the media to a public Supabase
+  Storage bucket (`SHERLOCK_EVIDENCE_BUCKET`, default `sherlock-evidence`;
+  requires `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`) under an
+  unguessable path, and embed the GIF plus an mp4 link in the issue comment.
+  Only repositories known to be public are uploaded unless
+  `SHERLOCK_EVIDENCE_UPLOAD_PRIVATE_REPOS=true`. Bucket retention/cleanup is
+  deployment-owned.
 
 ## Contributing
 

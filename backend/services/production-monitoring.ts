@@ -1,22 +1,15 @@
 // Lightweight, payload-free operational signals for the hosted worker.
-// Redis records contain only worker identity, timestamps, and bounded cleanup
-// counters. Queue inspection reads counts and job timestamps only; job data is
-// never returned or formatted.
+// Redis records contain only worker identity and timestamps. Queue inspection
+// reads counts and job timestamps only; job data is never returned or formatted.
 
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import type { StatsFs } from "node:fs";
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
-import type {
-  ArtifactCleanupResult,
-  ArtifactCleanupScanResult,
-} from "./artifact-retention.js";
 
 export const WORKER_HEARTBEAT_KEY_PREFIX =
   "sherlock:ops:worker-heartbeat:";
-export const ARTIFACT_CLEANUP_STATUS_KEY_PREFIX =
-  "sherlock:ops:artifact-cleanup:";
 
 const SAFE_WORKER_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const MAX_OPERATIONAL_RECORD_BYTES = 4_096;
@@ -72,7 +65,6 @@ export type ProductionMonitoringConfig = {
   queueMaxWaitingAgeMs: number;
   diskWarningPercent: number;
   diskCriticalPercent: number;
-  cleanupStatusMaxAgeMs: number;
   requestTimeoutMs: number;
 };
 
@@ -83,7 +75,6 @@ export const PRODUCTION_MONITORING_DEFAULTS = {
   queueMaxWaitingAgeMs: 10 * 60_000,
   diskWarningPercent: 80,
   diskCriticalPercent: 90,
-  cleanupStatusMaxAgeMs: 3 * 60 * 60_000,
   requestTimeoutMs: 5_000,
 } as const;
 
@@ -143,11 +134,6 @@ export function getProductionMonitoringConfig(
     ),
     diskWarningPercent,
     diskCriticalPercent,
-    cleanupStatusMaxAgeMs: minutes(
-      env,
-      "SHERLOCK_CLEANUP_STATUS_MAX_AGE_MINUTES",
-      PRODUCTION_MONITORING_DEFAULTS.cleanupStatusMaxAgeMs,
-    ),
     requestTimeoutMs: seconds(
       env,
       "SHERLOCK_OPS_REQUEST_TIMEOUT_SECONDS",
@@ -162,14 +148,6 @@ function seconds(
   fallbackMs: number,
 ): number {
   return positiveNumber(env[key], key, fallbackMs / 1_000) * 1_000;
-}
-
-function minutes(
-  env: NodeJS.ProcessEnv,
-  key: string,
-  fallbackMs: number,
-): number {
-  return positiveNumber(env[key], key, fallbackMs / 60_000) * 60_000;
 }
 
 function percentage(
@@ -576,162 +554,6 @@ export async function readFilesystemUsage(
       }
     }),
   );
-}
-
-export type ArtifactCleanupOperationalRecord = {
-  version: 1;
-  workerId: string;
-  ranAt: string;
-  kind: "scan" | "completed-job";
-  scanned: number;
-  deleted: number;
-  retained: number;
-  protected: number;
-  failures: number;
-  bounded: boolean;
-  oldestRetainedFailedAgeMs: number | null;
-};
-
-export function cleanupScanOperationalRecord(
-  workerId: string,
-  result: ArtifactCleanupScanResult,
-  now: () => number = Date.now,
-): ArtifactCleanupOperationalRecord {
-  return {
-    version: 1,
-    workerId,
-    ranAt: new Date(now()).toISOString(),
-    kind: "scan",
-    scanned: result.scanned,
-    deleted: result.deleted,
-    retained: result.retained,
-    protected: result.protected,
-    failures: result.errors,
-    bounded: result.bounded,
-    oldestRetainedFailedAgeMs: result.oldestRetainedFailedAgeMs,
-  };
-}
-
-export function cleanupResultOperationalRecord(
-  workerId: string,
-  result: ArtifactCleanupResult,
-  now: () => number = Date.now,
-): ArtifactCleanupOperationalRecord {
-  const retained =
-    result.status !== "deleted" && result.status !== "missing" ? 1 : 0;
-  return {
-    version: 1,
-    workerId,
-    ranAt: new Date(now()).toISOString(),
-    kind: "completed-job",
-    scanned: result.status === "missing" ? 0 : 1,
-    deleted: result.status === "deleted" ? 1 : 0,
-    retained,
-    protected: result.status === "protected" ? 1 : 0,
-    failures:
-      result.status === "error" || result.status === "unsafe" ? 1 : 0,
-    bounded: true,
-    oldestRetainedFailedAgeMs: result.retainedFailedAgeMs ?? null,
-  };
-}
-
-export async function writeArtifactCleanupStatus(
-  redis: OperationalRedis,
-  record: ArtifactCleanupOperationalRecord,
-  ttlMs = 24 * 60 * 60_000,
-): Promise<void> {
-  if (!SAFE_WORKER_ID.test(record.workerId) || ttlMs <= 0) {
-    throw new Error("Invalid cleanup status record.");
-  }
-  const value = JSON.stringify(record);
-  if (Buffer.byteLength(value, "utf8") > MAX_OPERATIONAL_RECORD_BYTES) {
-    throw new Error("Cleanup status record is too large.");
-  }
-  await redis.set(
-    `${ARTIFACT_CLEANUP_STATUS_KEY_PREFIX}${record.workerId}`,
-    value,
-    "PX",
-    ttlMs,
-  );
-}
-
-function parseCleanupRecord(
-  value: string | null,
-): ArtifactCleanupOperationalRecord | null {
-  if (!value || Buffer.byteLength(value, "utf8") > MAX_OPERATIONAL_RECORD_BYTES) {
-    return null;
-  }
-  try {
-    const record = JSON.parse(value) as Partial<ArtifactCleanupOperationalRecord>;
-    const counts = [
-      record.scanned,
-      record.deleted,
-      record.retained,
-      record.protected,
-      record.failures,
-    ];
-    if (
-      record.version !== 1 ||
-      typeof record.workerId !== "string" ||
-      !SAFE_WORKER_ID.test(record.workerId) ||
-      typeof record.ranAt !== "string" ||
-      !Number.isFinite(Date.parse(record.ranAt)) ||
-      (record.kind !== "scan" && record.kind !== "completed-job") ||
-      counts.some(
-        (count) =>
-          !Number.isSafeInteger(count) || (count as number) < 0 || (count as number) > 1_000_000,
-      ) ||
-      typeof record.bounded !== "boolean" ||
-      (record.oldestRetainedFailedAgeMs !== null &&
-        (typeof record.oldestRetainedFailedAgeMs !== "number" ||
-          !Number.isFinite(record.oldestRetainedFailedAgeMs) ||
-          record.oldestRetainedFailedAgeMs < 0))
-    ) {
-      return null;
-    }
-    return record as ArtifactCleanupOperationalRecord;
-  } catch {
-    return null;
-  }
-}
-
-export type ArtifactCleanupOperationalSummary = {
-  records: number;
-  latest: ArtifactCleanupOperationalRecord | null;
-  latestAgeMs: number | null;
-  workersWithFailures: number;
-  truncated: boolean;
-};
-
-export async function readArtifactCleanupStatus(
-  redis: OperationalRedis,
-  now: () => number = Date.now,
-): Promise<ArtifactCleanupOperationalSummary> {
-  const { values, truncated } = await scanOperationalValues(
-    redis,
-    ARTIFACT_CLEANUP_STATUS_KEY_PREFIX,
-  );
-  const records = values
-    .map(parseCleanupRecord)
-    .filter((record): record is ArtifactCleanupOperationalRecord => Boolean(record));
-  const latest = records.reduce<ArtifactCleanupOperationalRecord | null>(
-    (current, record) =>
-      !current || Date.parse(record.ranAt) > Date.parse(current.ranAt)
-        ? record
-        : current,
-    null,
-  );
-  const latestAgeMs = latest
-    ? Math.max(0, now() - Date.parse(latest.ranAt))
-    : null;
-
-  return {
-    records: records.length,
-    latest,
-    latestAgeMs,
-    workersWithFailures: records.filter((record) => record.failures > 0).length,
-    truncated,
-  };
 }
 
 async function scanOperationalValues(

@@ -30,13 +30,6 @@ import {
 } from "./queue/process-investigation.js";
 import { cleanupAllContainers } from "./services/container.js";
 import {
-  createArtifactCleanupService,
-  createRedisArtifactCleanupProtection,
-  evaluateTerminalJobArtifactRetention,
-  getArtifactRetentionConfig,
-  startArtifactCleanupScheduler,
-} from "./services/artifact-retention.js";
-import {
   createDeliveryGitHubRestClient,
   createFileDeliveryStateStore,
   reconcileTerminalCommentPaginated,
@@ -49,12 +42,9 @@ import {
 } from "./services/rate-limit.js";
 import {
   asOperationalRedis,
-  cleanupResultOperationalRecord,
-  cleanupScanOperationalRecord,
   createWorkerHeartbeat,
   getProductionMonitoringConfig,
   getWorkerId,
-  writeArtifactCleanupStatus,
 } from "./services/production-monitoring.js";
 import {
   describeWorkerError,
@@ -92,11 +82,8 @@ const stateStore = createInvestigationStateStoreFromEnv();
 const deliveryStore = createFileDeliveryStateStore();
 const deliveryQueueConnection = createRedisConnection();
 const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
-const artifactRetentionConfig = getArtifactRetentionConfig();
-
 const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
-  failedArtifactRetentionMs: artifactRetentionConfig.failedRetentionMs,
   delivery: {
     store: deliveryStore,
     enqueue: (payload: DeliveryJobPayload) =>
@@ -214,16 +201,6 @@ const concurrencyGate = createInvestigationConcurrencyGate(() =>
   asScriptRunner(connection),
 );
 
-const artifactCleanup = createArtifactCleanupService({
-  deliveryStore,
-  protection: createRedisArtifactCleanupProtection({
-    queue: deliveryQueue,
-    redis: asScriptRunner(connection),
-  }),
-  config: artifactRetentionConfig,
-  log: (message) => console.log(message),
-});
-
 const worker = new Worker<InvestigationJobPayload | DeliveryJobPayload>(
   INVESTIGATION_QUEUE_NAME,
   async (job: Job<InvestigationJobPayload | DeliveryJobPayload>, token?: string) => {
@@ -264,38 +241,12 @@ const workerHeartbeat = createWorkerHeartbeat({
 });
 workerHeartbeat.start();
 
-async function publishCleanupStatus(
-  record: Parameters<typeof writeArtifactCleanupStatus>[1],
-) {
-  try {
-    await writeArtifactCleanupStatus(operationalRedis, record);
-  } catch {
-    console.error("[artifact-cleanup] Redis status update failed.");
-  }
-}
-
-function evaluateArtifactRetention(investigationId: string) {
-  // BullMQ has moved the job to its terminal set before this event. Cleanup
-  // remains detached and non-fatal; a delivery job that is still waiting,
-  // delayed, or active protects the artifacts through the activity probe.
-  void evaluateTerminalJobArtifactRetention({
-    cleanup: artifactCleanup,
-    investigationId,
-    onResult: (result) =>
-      publishCleanupStatus(cleanupResultOperationalRecord(workerId, result)),
-  });
-}
-
 worker.on("completed", (job) => {
   console.log(`[queue] Job ${job.id} completed.`);
-  evaluateArtifactRetention(job.data.investigationId);
 });
 
 worker.on("failed", (job, error) => {
   console.error(`[queue] Job ${job?.id} failed: ${describeWorkerError(error)}`);
-  if (job?.data.investigationId) {
-    evaluateArtifactRetention(job.data.investigationId);
-  }
 });
 
 // Redis/worker infrastructure errors surface asynchronously; log them
@@ -308,16 +259,6 @@ console.log(
   `Sherlock investigation worker started (queue "${INVESTIGATION_QUEUE_NAME}", concurrency ${concurrency}).`,
 );
 
-const stopArtifactCleanup = startArtifactCleanupScheduler({
-  cleanup: artifactCleanup,
-  config: artifactRetentionConfig,
-  onScanComplete: (result) => {
-    // Visibility is best-effort and must not hold the retention scheduler open
-    // during a Redis interruption.
-    void publishCleanupStatus(cleanupScanOperationalRecord(workerId, result));
-  },
-});
-
 // Graceful shutdown: worker.close() waits for active jobs, whose pipeline
 // finally-blocks stop sandbox processes/containers and clean workspaces.
 let shuttingDown = false;
@@ -328,7 +269,6 @@ async function shutdown(signal: string) {
   }
 
   shuttingDown = true;
-  stopArtifactCleanup();
   console.log(`Received ${signal}; closing worker, queue connection, and sandboxes...`);
 
   try {

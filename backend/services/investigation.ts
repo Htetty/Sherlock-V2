@@ -39,6 +39,10 @@ import {
 } from "../agents/reproducer.js";
 import { createCostShapeTracker } from "./cost-shape.js";
 import type { FixAttemptResult, FixOutcome } from "./fix.js";
+import {
+  prepareReplayEvidence,
+  type ReplayEvidenceUrls,
+} from "./evidence-upload.js";
 import { getSandboxNetworkPolicy } from "./container.js";
 import type { AppNetworkTarget } from "./regression-test.js";
 import { buildGraphContext, tokenize } from "./graphContext.js";
@@ -146,6 +150,10 @@ export type InvestigationPipelineInput = {
   installationToken?: string | null;
   // Permission metadata from the installation access-token response.
   installationPermissions?: Record<string, string> | null;
+  // Repository visibility from the triggering webhook; null/absent means
+  // unknown. Replay-evidence upload treats anything but an explicit false
+  // as private (conservative).
+  repoIsPrivate?: boolean | null;
 };
 
 export type InvestigationPipelineResult = {
@@ -1577,6 +1585,27 @@ export async function runInvestigationPipeline(
       ...(reproductionMode ? { reproductionMode } : {}),
     };
 
+    // Replay evidence (docs/FABLE_REPLAY_EVIDENCE_PROMPT.md): build and host
+    // the comparison media from the recordings the runs already produced.
+    // Everything inside is flag-gated and degrades to null; it must never
+    // change the investigation outcome or block delivery.
+    let replayEvidence: ReplayEvidenceUrls | null = null;
+
+    try {
+      replayEvidence = await prepareReplayEvidence({
+        store,
+        failingVideo: result.video ?? null,
+        fixAttemptDir:
+          fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
+        passingVideo:
+          fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
+        repoIsPrivate: payload.repoIsPrivate ?? null,
+        log,
+      });
+    } catch (error) {
+      log(`Replay evidence preparation failed (non-fatal): ${formatError(error)}`);
+    }
+
     // Structured report data replaces the old preformatted comment sections.
     // GitHub delivery rerenders it against the final pull-request state; the
     // diagnostic analysis is only ever surfaced when no fix was verified.
@@ -1585,6 +1614,7 @@ export async function runInvestigationPipeline(
       fixAttempt,
       analysis:
         !fixAttempt || fixAttempt.outcome !== "verified" ? claudeAnalysis : null,
+      replayEvidence,
     });
 
     return await finish(

@@ -182,6 +182,7 @@ export const createSherlockApp =
         triggeredBy: username,
         sourceRef: context.payload.repository.default_branch ?? null,
         deliveryId: context.id ?? null,
+        repositoryIsPrivate: context.payload.repository.private,
       };
 
       // The queue atomically claims this command before invoking onClaim.
