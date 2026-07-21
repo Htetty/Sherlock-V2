@@ -6,11 +6,10 @@
 // the only bot-compatible way to show media inline.
 //
 // Rules honored here:
-//   - Off by default: SHERLOCK_EVIDENCE_UPLOAD=supabase enables it.
-//   - Privacy: repository visibility must be an explicit `false` (public) to
-//     upload, unless SHERLOCK_EVIDENCE_UPLOAD_PRIVATE_REPOS=true. Unknown
-//     visibility is treated as private. Object paths carry an unguessable
-//     random token and never an investigation id.
+//   - Automatic when the worker already has Supabase credentials.
+//   - Public hosting: evidence from both public and private repositories is
+//     uploaded because GitHub cannot embed authenticated Storage objects.
+//     Object paths carry an unguessable random token and never an investigation id.
 //   - Failures degrade to "no evidence in the comment", never to a failed
 //     investigation or delivery.
 //   - The service-role key stays server-side (worker), like the state store.
@@ -24,15 +23,12 @@ import {
   type FfmpegRunner,
 } from "./replay-evidence.js";
 
-export type EvidenceUploadMode = "off" | "supabase";
-
 export type EvidenceUploadConfig = {
-  mode: EvidenceUploadMode;
   supabaseUrl: string | null;
   serviceRoleKey: string | null;
-  bucket: string;
-  allowPrivateRepos: boolean;
 };
+
+export const EVIDENCE_BUCKET = "sherlock-evidence";
 
 // Single hard cap on any uploaded object; replay-evidence.ts enforces the
 // tighter per-format caps before this is ever reached.
@@ -41,15 +37,9 @@ const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 export function resolveEvidenceUploadConfig(
   env: NodeJS.ProcessEnv = process.env,
 ): EvidenceUploadConfig {
-  const mode: EvidenceUploadMode =
-    env.SHERLOCK_EVIDENCE_UPLOAD === "supabase" ? "supabase" : "off";
-
   return {
-    mode,
     supabaseUrl: env.SUPABASE_URL?.replace(/\/+$/, "") ?? null,
     serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY ?? null,
-    bucket: env.SHERLOCK_EVIDENCE_BUCKET ?? "sherlock-evidence",
-    allowPrivateRepos: env.SHERLOCK_EVIDENCE_UPLOAD_PRIVATE_REPOS === "true",
   };
 }
 
@@ -86,6 +76,13 @@ async function uploadFile(
   notes: string[],
 ): Promise<string | null> {
   try {
+    const supabaseUrl = config.supabaseUrl;
+    const serviceRoleKey = config.serviceRoleKey;
+    if (!supabaseUrl || !serviceRoleKey) {
+      notes.push(`Uploading ${path.basename(filePath)} skipped: Supabase is not configured.`);
+      return null;
+    }
+
     const info = await stat(filePath);
 
     if (info.size === 0 || info.size > MAX_UPLOAD_BYTES) {
@@ -100,11 +97,12 @@ async function uploadFile(
       CONTENT_TYPES[path.extname(filePath).toLowerCase()] ??
       "application/octet-stream";
     const response = await fetchImpl(
-      `${config.supabaseUrl}/storage/v1/object/${config.bucket}/${objectPath}`,
+      `${supabaseUrl}/storage/v1/object/${EVIDENCE_BUCKET}/${objectPath}`,
       {
         method: "POST",
         headers: {
-          authorization: `Bearer ${config.serviceRoleKey}`,
+          apikey: serviceRoleKey,
+          authorization: `Bearer ${serviceRoleKey}`,
           "content-type": contentType,
           "x-upsert": "false",
         },
@@ -121,7 +119,7 @@ async function uploadFile(
     }
 
     notes.push(`Uploaded ${path.basename(filePath)} (${info.size} bytes).`);
-    return `${config.supabaseUrl}/storage/v1/object/public/${config.bucket}/${objectPath}`;
+    return `${supabaseUrl}/storage/v1/object/public/${EVIDENCE_BUCKET}/${objectPath}`;
   } catch (error) {
     notes.push(
       `Uploading ${path.basename(filePath)} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -140,9 +138,6 @@ export type PrepareReplayEvidenceInput = {
   // nulls when there is no verified fix.
   fixAttemptDir: string | null;
   passingVideo: string | null;
-  // Repository visibility: explicit false = public. Anything else is treated
-  // as private.
-  repoIsPrivate: boolean | null;
   log?: (message: string) => void;
   // Injectable for tests.
   env?: NodeJS.ProcessEnv;
@@ -166,15 +161,11 @@ export async function prepareReplayEvidence(
     urls: ReplayEvidenceUrls | null,
   ) => {
     await input.store
-      .writeJson("evidence-upload.json", { mode: config.mode, status, notes, urls })
+      .writeJson("evidence-upload.json", { mode: "supabase", status, notes, urls })
       .catch(() => {});
   };
 
   try {
-    if (config.mode === "off") {
-      return null;
-    }
-
     if (input.failingVideo === null) {
       notes.push("No reproduction video was recorded; nothing to upload.");
       await writeArtifact("skipped_no_video", null);
@@ -183,19 +174,10 @@ export async function prepareReplayEvidence(
 
     if (!config.supabaseUrl || !config.serviceRoleKey) {
       notes.push(
-        "SHERLOCK_EVIDENCE_UPLOAD=supabase requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
+        "Replay evidence upload requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.",
       );
       await writeArtifact("skipped_misconfigured", null);
       log("Replay evidence upload skipped: Supabase is not configured.");
-      return null;
-    }
-
-    if (input.repoIsPrivate !== false && !config.allowPrivateRepos) {
-      notes.push(
-        "Repository visibility is private or unknown and SHERLOCK_EVIDENCE_UPLOAD_PRIVATE_REPOS is not enabled.",
-      );
-      await writeArtifact("skipped_private_repository", null);
-      log("Replay evidence upload skipped: repository is not known to be public.");
       return null;
     }
 

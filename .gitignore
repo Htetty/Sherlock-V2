@@ -21,6 +21,9 @@ dist
 # Local tool output
 fable
 docs
+!docs/
+docs/*
+!docs/production-worker.md
 
 # OS files
 .DS_Store

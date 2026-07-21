@@ -1271,7 +1271,7 @@ export function renderIssueReport(
   report: InvestigationReportData,
   pullRequest: ReportPullRequest | null,
 ): string {
-  const sections: string[] = [outcomeCallout(report)];
+  const sections: string[] = ["## Sherlock Investigation", outcomeCallout(report)];
 
   const rootCause = inlineField(report.rootCause, MAX_ROOT_CAUSE_CHARS);
   if (rootCause) {
@@ -1371,6 +1371,7 @@ export const QUEUED_INVESTIGATION_ASCII_ART = `⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 
 export function renderQueuedIssueReport(): string {
   return [
+    "## Sherlock Investigation",
     "",
     "> [!NOTE]",
     "> **Investigation queued** — Sherlock will update this comment when the investigation is complete.",

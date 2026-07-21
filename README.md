@@ -85,7 +85,7 @@ the backend service role bypasses it. See
 [docs/production-worker.md](docs/production-worker.md#investigation-state-store-optional)
 for details.
 
-### Replay evidence (optional, off by default)
+### Replay evidence
 
 Sherlock can record the reproduction run (where the bug fails) and the
 post-fix verification run (where the exact saved plan passes), build a
@@ -93,18 +93,17 @@ side-by-side comparison, and embed it in the GitHub comment as visual proof.
 See [docs/FABLE_REPLAY_EVIDENCE_PROMPT.md](docs/FABLE_REPLAY_EVIDENCE_PROMPT.md)
 for the design.
 
-- `SHERLOCK_REPRO_VIDEO=true` — record a video (`videos/run.webm`,
-  `videos/post-patch.webm`) during plan execution. Skipped for API-only
-  plans; recording failures never fail a run.
-- `ffmpeg` on the worker (optional; preflight warns) — produces
+- Browser and mixed reproduction plans automatically record `videos/run.webm`
+  and `videos/post-patch.webm`. API-only plans have nothing visual to record;
+  recording failures fall back to the normal report.
+- `ffmpeg` in the worker image produces
   `evidence/evidence.mp4` (side-by-side) and a bounded `evidence/evidence.gif`.
-- `SHERLOCK_EVIDENCE_UPLOAD=supabase` — upload the media to a public Supabase
-  Storage bucket (`SHERLOCK_EVIDENCE_BUCKET`, default `sherlock-evidence`;
-  requires `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`) under an
-  unguessable path, and embed the GIF plus an mp4 link in the issue comment.
-  Only repositories known to be public are uploaded unless
-  `SHERLOCK_EVIDENCE_UPLOAD_PRIVATE_REPOS=true`. Bucket retention/cleanup is
-  deployment-owned.
+- When the existing `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set,
+  replay evidence is automatically uploaded to the managed public
+  `sherlock-evidence` bucket under an unguessable path, then embedded in the
+  issue comment. This includes private repositories because GitHub cannot embed
+  authenticated Storage objects; anyone with the unguessable URL can view the
+  media. Bucket retention is deployment-owned.
 
 ## Contributing
 

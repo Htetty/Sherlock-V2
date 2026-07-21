@@ -150,10 +150,6 @@ export type InvestigationPipelineInput = {
   installationToken?: string | null;
   // Permission metadata from the installation access-token response.
   installationPermissions?: Record<string, string> | null;
-  // Repository visibility from the triggering webhook; null/absent means
-  // unknown. Replay-evidence upload treats anything but an explicit false
-  // as private (conservative).
-  repoIsPrivate?: boolean | null;
 };
 
 export type InvestigationPipelineResult = {
@@ -1599,7 +1595,6 @@ export async function runInvestigationPipeline(
           fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
         passingVideo:
           fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
-        repoIsPrivate: payload.repoIsPrivate ?? null,
         log,
       });
     } catch (error) {

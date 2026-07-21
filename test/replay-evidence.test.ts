@@ -91,63 +91,40 @@ describe("replay evidence media", () => {
 // --- Upload configuration and privacy gating ---------------------------------------
 
 describe("evidence upload", () => {
-  test("is off by default", () => {
-    expect(resolveEvidenceUploadConfig({}).mode).toBe("off");
-    expect(resolveEvidenceUploadConfig({ SHERLOCK_EVIDENCE_UPLOAD: "banana" }).mode).toBe("off");
-    expect(
-      resolveEvidenceUploadConfig({ SHERLOCK_EVIDENCE_UPLOAD: "supabase" }).mode,
-    ).toBe("supabase");
+  test("uses the existing Supabase configuration without a feature flag", () => {
+    expect(resolveEvidenceUploadConfig({})).toEqual({
+      supabaseUrl: null,
+      serviceRoleKey: null,
+    });
+    expect(resolveEvidenceUploadConfig({
+      SUPABASE_URL: "https://example.supabase.co/",
+      SUPABASE_SERVICE_ROLE_KEY: "test-key",
+    })).toEqual({
+      supabaseUrl: "https://example.supabase.co",
+      serviceRoleKey: "test-key",
+    });
   });
 
-  test("returns null and writes no artifact when the flag is off", async () => {
+  test("records a diagnostic when Supabase credentials are unavailable", async () => {
     const store = await makeStore();
     const urls = await prepareReplayEvidence({
       store,
       failingVideo: "videos/run.webm",
       fixAttemptDir: null,
       passingVideo: null,
-      repoIsPrivate: false,
       env: {},
     });
 
     expect(urls).toBeNull();
-    await expect(
-      readFile(path.join(store.dir, "evidence-upload.json"), "utf8"),
-    ).rejects.toThrow();
-  });
-
-  test("skips private or unknown-visibility repositories by default", async () => {
-    const store = await makeStore();
-
-    for (const repoIsPrivate of [true, null]) {
-      const urls = await prepareReplayEvidence({
-        store,
-        failingVideo: "videos/run.webm",
-        fixAttemptDir: null,
-        passingVideo: null,
-        repoIsPrivate,
-        env: {
-          SHERLOCK_EVIDENCE_UPLOAD: "supabase",
-          SUPABASE_URL: "https://example.supabase.co",
-          SUPABASE_SERVICE_ROLE_KEY: "test-key",
-        },
-        fetchImpl: async () => {
-          throw new Error("must not be called");
-        },
-      });
-
-      expect(urls).toBeNull();
-    }
-
     const artifact = JSON.parse(
       await readFile(path.join(store.dir, "evidence-upload.json"), "utf8"),
     ) as { status: string };
-    expect(artifact.status).toBe("skipped_private_repository");
+    expect(artifact.status).toBe("skipped_misconfigured");
   });
 
   test("uploads media and returns public URLs without internal ids", async () => {
     const store = await makeStore();
-    const requests: string[] = [];
+    const requests: Array<{ url: string; headers: Record<string, string> }> = [];
 
     // Fake ffmpeg writes non-empty outputs.
     const urls = await prepareReplayEvidence({
@@ -155,9 +132,7 @@ describe("evidence upload", () => {
       failingVideo: "videos/run.webm",
       fixAttemptDir: "/attempt",
       passingVideo: "videos/post-patch.webm",
-      repoIsPrivate: false,
       env: {
-        SHERLOCK_EVIDENCE_UPLOAD: "supabase",
         SUPABASE_URL: "https://example.supabase.co/",
         SUPABASE_SERVICE_ROLE_KEY: "test-key",
       },
@@ -165,8 +140,8 @@ describe("evidence upload", () => {
         if (args.length === 1) return;
         await writeFile(args[args.length - 1], "media");
       },
-      fetchImpl: async (url) => {
-        requests.push(url);
+      fetchImpl: async (url, init) => {
+        requests.push({ url, headers: init.headers });
         return { ok: true, status: 200, text: async () => "" };
       },
       randomToken: () => "deadbeef",
@@ -178,7 +153,8 @@ describe("evidence upload", () => {
       videoUrl:
         "https://example.supabase.co/storage/v1/object/public/sherlock-evidence/deadbeef/evidence.mp4",
     });
-    expect(requests.every((url) => !url.includes(store.investigationId))).toBe(true);
+    expect(requests.every(({ url }) => !url.includes(store.investigationId))).toBe(true);
+    expect(requests.every(({ headers }) => headers.apikey === "test-key")).toBe(true);
 
     const artifact = JSON.parse(
       await readFile(path.join(store.dir, "evidence-upload.json"), "utf8"),
@@ -194,9 +170,7 @@ describe("evidence upload", () => {
       failingVideo: "videos/run.webm",
       fixAttemptDir: null,
       passingVideo: null,
-      repoIsPrivate: false,
       env: {
-        SHERLOCK_EVIDENCE_UPLOAD: "supabase",
         SUPABASE_URL: "https://example.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY: "test-key",
       },

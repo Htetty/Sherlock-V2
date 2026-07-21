@@ -367,12 +367,12 @@ describe("replay", () => {
     },
   );
 
-  test("video recording is off by default: no video reference, no videos dir", { timeout: 60_000 }, async () => {
+  test("video recording can be disabled by an internal override", { timeout: 60_000 }, async () => {
     const baseUrl = await startFixtureApp({ buggy: true });
     const plan = buildLoginPlan(baseUrl);
     const store = await makeStore();
 
-    const result = await executeReproductionPlan(plan, store);
+    const result = await executeReproductionPlan(plan, store, { recordVideo: false });
 
     expect(result.outcome).toBe("reproduced");
     expect(result.video ?? null).toBeNull();
@@ -382,14 +382,12 @@ describe("replay", () => {
     ).rejects.toThrow();
   });
 
-  test("records a video when enabled and harvests it deterministically", { timeout: 60_000 }, async () => {
+  test("records a video by default and harvests it deterministically", { timeout: 60_000 }, async () => {
     const baseUrl = await startFixtureApp({ buggy: true });
     const plan = buildLoginPlan(baseUrl);
     const store = await makeStore();
 
-    const result = await executeReproductionPlan(plan, store, {
-      recordVideo: true,
-    });
+    const result = await executeReproductionPlan(plan, store);
 
     expect(result.outcome).toBe("reproduced");
     expect(result.video).toBe(path.join("videos", "run.webm"));

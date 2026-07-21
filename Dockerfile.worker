@@ -13,11 +13,13 @@
 
 FROM node:22-bookworm-slim
 
-# git for cloning; curl/ca-certificates for the Docker CLI and uv installs.
+# git for cloning; curl/ca-certificates for the Docker CLI and uv installs;
+# ffmpeg for automatic replay-evidence GIF/MP4 generation.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       ca-certificates \
       curl \
+      ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Docker CLI only — the daemon comes from the mounted host socket.

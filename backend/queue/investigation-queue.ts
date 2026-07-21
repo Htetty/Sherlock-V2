@@ -60,10 +60,6 @@ export type InvestigationJobPayload = {
   triggeredBy: string;
   sourceRef: string | null;
   deliveryId: string | null;
-  // Repository visibility from the triggering webhook. Optional so queued
-  // jobs from before this field remain valid; absent means unknown, which
-  // replay-evidence upload treats as private (conservative).
-  repositoryIsPrivate?: boolean;
 };
 
 // Delivery-only job payload: just enough non-secret identity to load the

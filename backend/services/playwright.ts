@@ -120,9 +120,8 @@ export type ReproductionResult = {
   originalHtmlLength?: number;
   // Store-relative reference to the run's video recording (e.g.
   // "videos/run.webm"), or null. Optional so loosely-shaped test fixtures
-  // remain valid. Only set when SHERLOCK_REPRO_VIDEO recording was attempted
-  // and the capture succeeded; recording failures degrade to null, never
-  // fail the run.
+  // remain valid. Set when automatic browser recording succeeds; recording
+  // failures degrade to null and never fail the run.
   video?: string | null;
 };
 
@@ -458,8 +457,8 @@ export async function executeSessionStep(
 
 export type ExecuteOptions = {
   probeTimeoutMs?: number;
-  // Force video recording on/off; defaults to the SHERLOCK_REPRO_VIDEO env
-  // flag. Recording is always skipped for api-only plans (no page opens).
+  // Internal/test override. Browser and mixed plans record by default;
+  // recording is always skipped for api-only plans (no page opens).
   recordVideo?: boolean;
   // Deterministic name for the harvested recording inside the store's
   // videos/ directory (default "run.webm"; the post-fix verification uses
@@ -523,8 +522,7 @@ export async function executeReproductionPlan(
   // (docs/fable/11 observability); browser/mixed plans keep today's behavior.
   // Video recording follows the same rule.
   const planMode = getPlanMode(plan);
-  const wantVideo =
-    options.recordVideo ?? process.env.SHERLOCK_REPRO_VIDEO === "true";
+  const wantVideo = options.recordVideo ?? true;
   const videoFileName = options.videoName ?? "run.webm";
 
   const browser = await chromium.launch();
@@ -572,9 +570,9 @@ export async function executeReproductionPlan(
             ? "API-only reproduction plan; nothing visual to record."
             : wantVideo
               ? recordingContext !== null
-                ? "SHERLOCK_REPRO_VIDEO recording is active for this run."
+                ? "Replay-evidence recording is active for this run."
                 : "Recording was requested but the recording context could not be created."
-              : "Video recording is disabled (SHERLOCK_REPRO_VIDEO is not enabled).",
+              : "Video recording was disabled by an internal execution override.",
       },
     })
     .catch(() => {});

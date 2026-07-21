@@ -643,7 +643,6 @@ export async function processInvestigationJob(
         triggeredBy: payload.triggeredBy,
         installationToken: installationAuth?.token ?? null,
         installationPermissions: installationAuth?.permissions ?? null,
-        repoIsPrivate: payload.repositoryIsPrivate ?? null,
       },
       {
         onStage: reportStage,
