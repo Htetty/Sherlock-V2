@@ -44,9 +44,18 @@ capture, ffmpeg conversion, Supabase upload, or public URL generation fails,
 the investigation and GitHub comment still complete without replay media.
 API-only plans intentionally produce no video.
 
-Replay media is hosted at public, unguessable URLs even for private
-repositories because GitHub comments cannot embed authenticated Storage
-objects. Anyone who obtains one of those URLs can view its media.
+Uploading replay media to the public bucket is opt-in and disabled by
+default. Set `SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE=allowlist` and list exact
+`owner/repo` identities in `SHERLOCK_PUBLIC_REPLAY_ALLOWLIST` (comma-separated,
+case-insensitive, no wildcards) to enable it for explicitly approved
+Sherlock-controlled demo repositories only. Any other mode value fails closed
+as disabled; local recording is unaffected either way.
+
+When upload is enabled, replay media is hosted at public, unguessable URLs
+even for private repositories because GitHub comments cannot embed
+authenticated Storage objects. Anyone who obtains one of those URLs can view
+its media. Previously uploaded objects and URLs are not affected by the
+policy.
 
 ## Preflight
 

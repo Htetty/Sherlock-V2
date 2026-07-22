@@ -112,7 +112,12 @@ describe("evidence upload", () => {
       failingVideo: "videos/run.webm",
       fixAttemptDir: null,
       passingVideo: null,
-      env: {},
+      repositoryOwner: "demo-org",
+      repositoryName: "demo-repo",
+      env: {
+        SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE: "allowlist",
+        SHERLOCK_PUBLIC_REPLAY_ALLOWLIST: "demo-org/demo-repo",
+      },
     });
 
     expect(urls).toBeNull();
@@ -132,9 +137,13 @@ describe("evidence upload", () => {
       failingVideo: "videos/run.webm",
       fixAttemptDir: "/attempt",
       passingVideo: "videos/post-patch.webm",
+      repositoryOwner: "demo-org",
+      repositoryName: "demo-repo",
       env: {
         SUPABASE_URL: "https://example.supabase.co/",
         SUPABASE_SERVICE_ROLE_KEY: "test-key",
+        SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE: "allowlist",
+        SHERLOCK_PUBLIC_REPLAY_ALLOWLIST: "Demo-Org/Demo-Repo",
       },
       ffmpegRunner: async (command, args) => {
         if (args.length === 1) return;
@@ -170,9 +179,13 @@ describe("evidence upload", () => {
       failingVideo: "videos/run.webm",
       fixAttemptDir: null,
       passingVideo: null,
+      repositoryOwner: "demo-org",
+      repositoryName: "demo-repo",
       env: {
         SUPABASE_URL: "https://example.supabase.co",
         SUPABASE_SERVICE_ROLE_KEY: "test-key",
+        SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE: "allowlist",
+        SHERLOCK_PUBLIC_REPLAY_ALLOWLIST: "demo-org/demo-repo",
       },
       ffmpegRunner: async (command, args) => {
         if (args.length === 1) return;

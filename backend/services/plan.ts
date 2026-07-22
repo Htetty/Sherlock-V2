@@ -107,6 +107,16 @@ export function hashPlanBehavior(plan: ReproductionPlan): string {
 const MAX_STEPS = 30;
 const MAX_WAIT_MS = 10_000;
 
+// Step ids become screenshot file names (playwright.ts saveScreenshot), so
+// they are restricted to a bounded filesystem-safe alphabet. Path traversal
+// is additionally blocked at the filesystem boundary (resolveScreenshotPath);
+// this validation-side allowlist is the first of the two defenses.
+export const STEP_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+export function isSafeStepId(value: unknown): value is string {
+  return typeof value === "string" && STEP_ID_PATTERN.test(value);
+}
+
 // Steps that drive a real browser page. Assertions that read browser state
 // (console errors, element text) are vacuous without at least one of these.
 const BROWSER_ACTIONS = new Set(["goto", "click", "fill", "waitForSelector"]);
@@ -203,6 +213,12 @@ export function validateStep(value: unknown, index: number): string[] {
 
   if (typeof step.id !== "string" || !step.id) {
     return [`${label} must have a non-empty string id.`];
+  }
+
+  if (!isSafeStepId(step.id)) {
+    return [
+      `${label} id must match ${STEP_ID_PATTERN} (letters, digits, "_" or "-", starting with a letter or digit, at most 64 characters).`,
+    ];
   }
 
   switch (step.action) {

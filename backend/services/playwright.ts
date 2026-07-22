@@ -940,20 +940,50 @@ async function evaluateAssertion(
   }
 }
 
+// Screenshot names derive from plan step ids (validated by plan.ts against
+// STEP_ID_PATTERN) plus fixed internal suffixes ("-failure", "final"). This
+// check is the independent filesystem-boundary defense: even if validation
+// were bypassed, the resolved file must be a direct child of the screenshots
+// directory. Never rely on string replacement or basename normalization here.
+const SCREENSHOT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+export function resolveScreenshotPath(
+  screenshotsDir: string,
+  name: string,
+): string {
+  if (!SCREENSHOT_NAME_PATTERN.test(name)) {
+    throw new Error("Refusing screenshot path for unsafe name.");
+  }
+
+  const resolvedDir = path.resolve(screenshotsDir);
+  const resolved = path.resolve(resolvedDir, `${name}.png`);
+
+  // Canonical containment: the file must sit directly inside the screenshots
+  // directory (no traversal, no absolute-path escape, no subdirectories).
+  if (
+    path.dirname(resolved) !== resolvedDir ||
+    !resolved.startsWith(resolvedDir + path.sep)
+  ) {
+    throw new Error("Screenshot path escaped the screenshots directory.");
+  }
+
+  return resolved;
+}
+
 async function saveScreenshot(
   page: Page,
   store: ArtifactStore,
   evidence: SessionEvidence,
   name: string,
 ) {
-  const fileName = `${name}.png`;
+  const filePath = resolveScreenshotPath(store.screenshotsDir, name);
   await page.screenshot({
-    path: path.join(store.screenshotsDir, fileName),
+    path: filePath,
     fullPage: true,
     type: "png",
   });
 
-  const reference = path.join("screenshots", fileName);
+  const reference = path.join("screenshots", path.basename(filePath));
   evidence.screenshots.push(reference);
   return reference;
 }

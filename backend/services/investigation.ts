@@ -1595,6 +1595,8 @@ export async function runInvestigationPipeline(
           fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
         passingVideo:
           fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
+        repositoryOwner: payload.repoOwner,
+        repositoryName: payload.repoName,
         log,
       });
     } catch (error) {

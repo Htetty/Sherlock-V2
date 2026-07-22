@@ -492,19 +492,27 @@ describe("production safety", () => {
     expect(serialized).not.toContain("WEBHOOK_SECRET");
   });
 
-  test("the synchronous HTTP endpoint is disabled in production but health stays available", async () => {
-    // Gate logic across environments.
-    expect(isSyncInvestigationEndpointEnabled({ NODE_ENV: "development" })).toBe(true);
-    expect(isSyncInvestigationEndpointEnabled({})).toBe(true);
+  test("the synchronous HTTP endpoint is disabled by default everywhere but health stays available", async () => {
+    // Gate logic: disabled by default in EVERY environment, opt-in outside
+    // production only, and NEVER available in production even with the flag.
+    expect(isSyncInvestigationEndpointEnabled({ NODE_ENV: "development" })).toBe(false);
+    expect(isSyncInvestigationEndpointEnabled({})).toBe(false);
     expect(isSyncInvestigationEndpointEnabled({ NODE_ENV: "production" })).toBe(false);
+    expect(
+      isSyncInvestigationEndpointEnabled({
+        NODE_ENV: "development",
+        ALLOW_SYNC_INVESTIGATIONS: "true",
+      }),
+    ).toBe(true);
     expect(
       isSyncInvestigationEndpointEnabled({
         NODE_ENV: "production",
         ALLOW_SYNC_INVESTIGATIONS: "true",
       }),
-    ).toBe(true);
+    ).toBe(false);
 
-    // Real HTTP behavior of a production-configured app.
+    // Real HTTP behavior of a production-configured app: the endpoint is
+    // indistinguishable from a nonexistent route.
     const app = createApp({ NODE_ENV: "production" });
     const server = app.listen(0);
     const { port } = server.address() as { port: number };
@@ -520,9 +528,9 @@ describe("production safety", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ repoUrl: "https://github.com/x/y" }),
       });
-      expect(investigation.status).toBe(403);
+      expect(investigation.status).toBe(404);
       const body = (await investigation.json()) as { error: string };
-      expect(body.error).toContain("Redis queue");
+      expect(body.error).not.toContain("Redis queue");
     } finally {
       server.close();
     }

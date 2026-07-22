@@ -226,6 +226,58 @@ export function createInvestigationRateLimiter(
   };
 }
 
+// --- Installation-start rate limiter ------------------------------------------------
+// Product-API limit for POST /api/installations/start, keyed by the
+// authenticated Supabase user id. Reuses the same atomic fixed-window Lua
+// script under its own key prefix, so investigation rate limits are entirely
+// unaffected. Redis failures propagate to the caller (the route maps them to
+// a 503) instead of silently disabling the limit.
+
+export const INSTALLATION_START_RATE_LIMIT = {
+  max: 10,
+  windowSeconds: 10 * 60,
+} as const;
+
+export const INSTALLATION_START_RATE_LIMIT_KEY_PREFIX =
+  "sherlock:rate-limit:installation-start:user:";
+
+export type InstallationStartRateLimitDecision = {
+  allowed: boolean;
+  count: number;
+  limit: number;
+  windowSeconds: number;
+};
+
+export type InstallationStartRateLimiter = {
+  checkAndConsumeInstallationStart: (
+    userId: string,
+  ) => Promise<InstallationStartRateLimitDecision>;
+};
+
+export function createInstallationStartRateLimiter(
+  getRedis: () => RedisScriptRunner,
+  config: RateLimitConfig = {
+    max: INSTALLATION_START_RATE_LIMIT.max,
+    windowSeconds: INSTALLATION_START_RATE_LIMIT.windowSeconds,
+  },
+): InstallationStartRateLimiter {
+  return {
+    checkAndConsumeInstallationStart: async (userId) => {
+      const key = `${INSTALLATION_START_RATE_LIMIT_KEY_PREFIX}${userId}`;
+      const count = Number(
+        await getRedis().eval(RATE_LIMIT_SCRIPT, 1, key, config.windowSeconds),
+      );
+
+      return {
+        allowed: count <= config.max,
+        count,
+        limit: config.max,
+        windowSeconds: config.windowSeconds,
+      };
+    },
+  };
+}
+
 // --- Concurrency gate -------------------------------------------------------------------
 
 export type ConcurrencySlot = {

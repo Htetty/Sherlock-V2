@@ -43,6 +43,79 @@ export function resolveEvidenceUploadConfig(
   };
 }
 
+// --- Public upload policy ----------------------------------------------------
+//
+// Uploading replay media to the public bucket is opt-in. The default (and any
+// invalid/missing configuration) is `disabled`: media is still recorded and
+// kept locally, but nothing leaves the worker. `allowlist` mode uploads only
+// for repositories whose exact normalized "owner/repo" identity appears in
+// SHERLOCK_PUBLIC_REPLAY_ALLOWLIST (comma-separated, case-insensitive, no
+// wildcards). Existing already-published objects and URLs are unaffected.
+
+export type PublicReplayUploadMode = "disabled" | "allowlist";
+
+export type PublicReplayUploadPolicy = {
+  mode: PublicReplayUploadMode;
+  // Normalized (lowercased, trimmed) "owner/repo" entries. Empty when disabled.
+  allowlist: ReadonlySet<string>;
+};
+
+// Conservative repository-identity shape; anything else (wildcards, slashes in
+// the owner, traversal characters) fails normalization and never matches.
+const ALLOWLIST_ENTRY_PATTERN =
+  /^[a-z0-9](?:[a-z0-9]|-(?=[a-z0-9])){0,38}\/[a-z0-9._-]{1,100}$/;
+
+export function normalizeRepositoryIdentity(
+  owner: string | null | undefined,
+  repo: string | null | undefined,
+): string | null {
+  if (typeof owner !== "string" || typeof repo !== "string") {
+    return null;
+  }
+
+  const normalized = `${owner.trim().toLowerCase()}/${repo.trim().toLowerCase()}`;
+
+  return ALLOWLIST_ENTRY_PATTERN.test(normalized) ? normalized : null;
+}
+
+export function resolvePublicReplayUploadPolicy(
+  env: NodeJS.ProcessEnv = process.env,
+): PublicReplayUploadPolicy {
+  // Fail closed: anything but the exact string "allowlist" is disabled.
+  if (env.SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE !== "allowlist") {
+    return { mode: "disabled", allowlist: new Set() };
+  }
+
+  const allowlist = new Set<string>();
+
+  for (const rawEntry of (env.SHERLOCK_PUBLIC_REPLAY_ALLOWLIST ?? "").split(",")) {
+    const entry = rawEntry.trim().toLowerCase();
+
+    // Only exact, well-formed owner/repo identities are honored; malformed
+    // entries (wildcards included) are dropped rather than loosely matched.
+    if (entry !== "" && ALLOWLIST_ENTRY_PATTERN.test(entry)) {
+      allowlist.add(entry);
+    }
+  }
+
+  return { mode: "allowlist", allowlist };
+}
+
+export function isPublicReplayUploadAllowed(
+  policy: PublicReplayUploadPolicy,
+  repositoryOwner: string | null | undefined,
+  repositoryName: string | null | undefined,
+): boolean {
+  if (policy.mode !== "allowlist") {
+    return false;
+  }
+
+  // No repository identity means no upload — never guess.
+  const identity = normalizeRepositoryIdentity(repositoryOwner, repositoryName);
+
+  return identity !== null && policy.allowlist.has(identity);
+}
+
 // URLs delivered into the report payload. Only ever built from Sherlock's own
 // upload responses — never from model output.
 export type ReplayEvidenceUrls = {
@@ -138,6 +211,10 @@ export type PrepareReplayEvidenceInput = {
   // nulls when there is no verified fix.
   fixAttemptDir: string | null;
   passingVideo: string | null;
+  // Repository identity used ONLY by the public-upload allowlist policy.
+  // When absent, allowlist mode never uploads (no identity, no upload).
+  repositoryOwner?: string | null;
+  repositoryName?: string | null;
   log?: (message: string) => void;
   // Injectable for tests.
   env?: NodeJS.ProcessEnv;
@@ -169,6 +246,28 @@ export async function prepareReplayEvidence(
     if (input.failingVideo === null) {
       notes.push("No reproduction video was recorded; nothing to upload.");
       await writeArtifact("skipped_no_video", null);
+      return null;
+    }
+
+    // Public upload is opt-in (disabled by default; exact allowlist only).
+    // Skipping here is a policy decision, never a failure: local media stays
+    // on disk and the GitHub report simply omits public replay links.
+    const policy = resolvePublicReplayUploadPolicy(input.env ?? process.env);
+
+    if (
+      !isPublicReplayUploadAllowed(
+        policy,
+        input.repositoryOwner ?? null,
+        input.repositoryName ?? null,
+      )
+    ) {
+      notes.push(
+        policy.mode === "disabled"
+          ? "Public replay upload is disabled (SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE)."
+          : "Repository is not on the public replay upload allowlist.",
+      );
+      await writeArtifact("skipped_policy", null);
+      log("Replay evidence upload skipped by the public-upload policy.");
       return null;
     }
 
