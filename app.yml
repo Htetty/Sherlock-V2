@@ -24,6 +24,12 @@ default_events:
   # - gollum
   # - issue_comment
   - issue_comment
+  # Installation lifecycle persistence for dashboard onboarding
+  # (src/installation-events.ts). NOTE: editing this file does NOT update an
+  # already-created GitHub App — subscribe to "Installation" and
+  # "Installation repositories" manually in the App's settings.
+  - installation
+  - installation_repositories
 # - label
 # - milestone
 # - member

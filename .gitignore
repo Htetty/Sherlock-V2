@@ -20,11 +20,9 @@ dist
 
 # Local tool output
 fable
-docs
-!docs/
-docs/*
-!docs/production-worker.md
 
+docs
+docs/
 # OS files
 .DS_Store
 
@@ -37,5 +35,5 @@ _state
 PROJECT_OVERVIEW.md
 LOCAL_AGENT_IMPLEMENTATION_PLAN.md
 .claude/
-
-evals
+docs/
+supabase/.temp/

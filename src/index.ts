@@ -25,6 +25,11 @@ import {
   parseSherlockCommand,
   type RepositoryRole,
 } from "./command-gate.js";
+import {
+  registerInstallationEvents,
+  type InstallationEventDeps,
+} from "./installation-events.js";
+import type { InstallationLifecycleDeps } from "../backend/services/github-installations.js";
 
 const UNAUTHORIZED_COMMENT =
   "Sherlock investigations can only be started by users with write access or higher on this repository.";
@@ -67,7 +72,50 @@ export type SherlockAppDeps = {
   queue?: InvestigationQueueAdapter;
   getRepositoryRole?: GetRepositoryRole;
   rateLimiter?: InvestigationRateLimiter;
+  installationEvents?: InstallationEventDeps;
 };
+
+// Default installation-lifecycle persistence: Supabase service-role stores,
+// created lazily on the first installation event. Returns null (handlers skip
+// with a warning) when Supabase is not configured, so local bot development
+// and the investigation flow never depend on the product database.
+function createDefaultInstallationEventDeps(): InstallationEventDeps {
+  let cached: Promise<InstallationLifecycleDeps | null> | null = null;
+
+  return {
+    getLifecycleDeps: () => {
+      cached ??= (async () => {
+        const { missingSupabaseServiceEnv, getSupabaseServiceRoleClient } =
+          await import("../backend/services/supabase-clients.js");
+
+        if (missingSupabaseServiceEnv().length > 0) {
+          return null;
+        }
+
+        const supabase = await getSupabaseServiceRoleClient();
+        const { createSupabaseInstallationDataStore } = await import(
+          "../backend/services/github-installations.js"
+        );
+        const { createSupabaseProfileStore } = await import(
+          "../backend/services/github-identity.js"
+        );
+
+        return {
+          store: createSupabaseInstallationDataStore(
+            supabase as unknown as Parameters<
+              typeof createSupabaseInstallationDataStore
+            >[0],
+          ),
+          profiles: createSupabaseProfileStore(
+            supabase as unknown as Parameters<typeof createSupabaseProfileStore>[0],
+          ),
+        };
+      })();
+
+      return cached;
+    },
+  };
+}
 
 // Dependencies are injectable so webhook tests run without Redis or the
 // real GitHub API; production lazily connects on the first command.
@@ -82,6 +130,14 @@ export const createSherlockApp =
       queue ??= createInvestigationQueueAdapter();
       return queue;
     };
+
+    // Installation lifecycle persistence (dashboard onboarding). Registered
+    // first but fully independent of the investigation flow below: these
+    // handlers listen to different events and never run for issue comments.
+    registerInstallationEvents(
+      app,
+      deps.installationEvents ?? createDefaultInstallationEventDeps(),
+    );
 
     // Redis-backed limiter shared across all backend/worker processes; its
     // decisions are logged inside the service (tenant key, count, limit).
