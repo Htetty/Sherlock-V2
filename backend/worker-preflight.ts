@@ -412,6 +412,19 @@ export async function runWorkerPreflight(
     );
   }
 
+  // --- ffmpeg (optional: replay-evidence comparison media degrades without it)
+  try {
+    await runCommand("ffmpeg", ["-version"]);
+    add("ffmpeg", "PASS", "ffmpeg is available.", false);
+  } catch (error) {
+    add(
+      "ffmpeg",
+      "WARN",
+      `ffmpeg is not available (${message(error)}); replay-evidence videos are still saved, but no comparison mp4/GIF is produced.`,
+      false,
+    );
+  }
+
   return {
     checks,
     ok: checks.every((check) => !check.mandatory || check.status !== "FAIL"),

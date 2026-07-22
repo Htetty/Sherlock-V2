@@ -14,11 +14,9 @@ import { createInvestigationQueue } from "./queue/investigation-queue.js";
 import {
   asOperationalRedis,
   getProductionMonitoringConfig,
-  readArtifactCleanupStatus,
   readFilesystemUsage,
   readQueueOperationalSummary,
   readWorkerHeartbeatSummary,
-  type ArtifactCleanupOperationalRecord,
   type FilesystemTarget,
   type ProductionMonitoringConfig,
 } from "./services/production-monitoring.js";
@@ -137,10 +135,6 @@ export function createProductionOpsAdapters(input: {
       },
       filesystemUsage: () =>
         readFilesystemUsage(productionFilesystemTargets(env), { statfs }),
-      cleanupStatus: async () => {
-        await ensureRedis();
-        return readArtifactCleanupStatus(operationalRedis, now);
-      },
     },
     close: async () => {
       await queue.close().catch(() => {});
@@ -149,22 +143,7 @@ export function createProductionOpsAdapters(input: {
   };
 }
 
-export function createTestOpsAdapters(
-  nowMs = Date.parse("2026-01-01T00:00:00.000Z"),
-): ProductionOpsAdapters {
-  const cleanup: ArtifactCleanupOperationalRecord = {
-    version: 1,
-    workerId: "test-worker",
-    ranAt: new Date(nowMs - 60_000).toISOString(),
-    kind: "scan",
-    scanned: 4,
-    deleted: 2,
-    retained: 2,
-    protected: 1,
-    failures: 0,
-    bounded: true,
-    oldestRetainedFailedAgeMs: 60 * 60_000,
-  };
+export function createTestOpsAdapters(): ProductionOpsAdapters {
   return {
     apiHealth: async () => true,
     redisPing: async () => true,
@@ -197,13 +176,6 @@ export function createTestOpsAdapters(
           usedPercent: 40,
         }),
       ),
-    cleanupStatus: async () => ({
-      records: 1,
-      latest: cleanup,
-      latestAgeMs: 60_000,
-      workersWithFailures: 0,
-      truncated: false,
-    }),
   };
 }
 

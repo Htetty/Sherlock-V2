@@ -117,6 +117,7 @@ export function rebaseExecutionArtifactPaths(
       ...step,
       screenshot: rebase(step.screenshot),
     })),
+    video: rebase(result.video ?? null),
   };
 }
 

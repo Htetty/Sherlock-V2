@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { UnrecoverableError } from "bullmq";
@@ -8,12 +8,6 @@ import {
   type WorkerDeps,
 } from "../backend/queue/process-investigation.js";
 import type { InvestigationJobPayload } from "../backend/queue/investigation-queue.js";
-import {
-  ARTIFACT_RETENTION_DEFAULTS,
-  createArtifactCleanupService,
-  createNoopArtifactCleanupProtection,
-  evaluateTerminalJobArtifactRetention,
-} from "../backend/services/artifact-retention.js";
 import {
   createFileDeliveryStateStore,
   createInMemoryDeliveryStateStore,
@@ -50,7 +44,6 @@ afterEach(async () => {
 
 function deps(store: DeliveryStateStore, failure: unknown): WorkerDeps {
   return {
-    failedArtifactRetentionMs: 1_000,
     delivery: {
       store,
       enqueue: async () => {},
@@ -152,7 +145,6 @@ describe("exhausted investigation terminalization", () => {
       category: "infrastructure",
       stage: "running",
       terminalAt: new Date(0).toISOString(),
-      retentionEligibleAt: new Date(1_000).toISOString(),
     });
     const runPipeline = vi.fn();
     const fixture = deps(store, new Error("unused"));
@@ -167,73 +159,7 @@ describe("exhausted investigation terminalization", () => {
   });
 });
 
-describe("terminal-failure artifact retention", () => {
-  test("failed-job completion invokes one bounded cleanup evaluation non-fatally", async () => {
-    const cleanupInvestigation = vi
-      .fn()
-      .mockResolvedValueOnce({ investigationId: INV, status: "not_expired" });
-    await expect(
-      evaluateTerminalJobArtifactRetention({
-        cleanup: {
-          cleanupInvestigation,
-          scanExpired: vi.fn(),
-        },
-        investigationId: INV,
-      }),
-    ).resolves.toMatchObject({ status: "not_expired" });
-    expect(cleanupInvestigation).toHaveBeenCalledOnce();
-
-    await expect(
-      evaluateTerminalJobArtifactRetention({
-        cleanup: {
-          cleanupInvestigation: vi.fn().mockRejectedValue(new Error("disk unavailable")),
-          scanExpired: vi.fn(),
-        },
-        investigationId: INV,
-      }),
-    ).resolves.toBeNull();
-  });
-
-  test("the configured eligibility timestamp controls failed artifact cleanup", async () => {
-    const root = await mkdtemp(path.join(tmpdir(), "sherlock-terminal-failure-"));
-    roots.push(root);
-    const store = createFileDeliveryStateStore(root);
-    await store.saveTerminalFailure({
-      version: 1,
-      investigationId: INV,
-      tenantId: payload.tenantId,
-      repoOwner: payload.repositoryOwner,
-      repoName: payload.repositoryName,
-      category: "repository",
-      stage: "running",
-      terminalAt: new Date(1_000).toISOString(),
-      retentionEligibleAt: new Date(2_000).toISOString(),
-    });
-    await writeFile(path.join(root, INV, "partial-clone.txt"), "raw repository bytes", "utf8");
-
-    const before = createArtifactCleanupService({
-      rootDir: root,
-      deliveryStore: store,
-      protection: createNoopArtifactCleanupProtection(),
-      config: { ...ARTIFACT_RETENTION_DEFAULTS, cleanupIntervalMs: 0 },
-      now: () => 1_999,
-    });
-    await expect(before.cleanupInvestigation(INV)).resolves.toMatchObject({
-      status: "not_expired",
-    });
-
-    const after = createArtifactCleanupService({
-      rootDir: root,
-      deliveryStore: store,
-      protection: createNoopArtifactCleanupProtection(),
-      config: { ...ARTIFACT_RETENTION_DEFAULTS, cleanupIntervalMs: 0 },
-      now: () => 2_000,
-    });
-    await expect(after.cleanupInvestigation(INV)).resolves.toMatchObject({
-      status: "deleted",
-    });
-  });
-
+describe("terminal-failure artifact persistence", () => {
   test("the on-disk terminal record contains no raw exception or repository content", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "sherlock-terminal-metadata-"));
     roots.push(root);
@@ -247,7 +173,6 @@ describe("terminal-failure artifact retention", () => {
       category: "infrastructure",
       stage: "running",
       terminalAt: new Date(0).toISOString(),
-      retentionEligibleAt: new Date(1_000).toISOString(),
     });
     const raw = await readFile(path.join(root, INV, TERMINAL_FAILURE_FILE), "utf8");
     expect(raw).not.toContain("Authorization");

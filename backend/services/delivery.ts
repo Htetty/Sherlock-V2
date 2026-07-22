@@ -221,7 +221,6 @@ export type TerminalFailureRecord = {
   category: TerminalFailureCategory;
   stage: string;
   terminalAt: string;
-  retentionEligibleAt: string;
 };
 
 const MAX_DELIVERY_ERROR_CHARS = 2_000;
@@ -231,8 +230,8 @@ const MAX_DELIVERY_STATE_BYTES = 128 * 1024;
 const MAX_DELIVERY_PAYLOAD_BYTES = 3 * 1024 * 1024;
 export const DELIVERY_LOCK_TTL_MS = 20_000;
 export const DELIVERY_LOCK_HEARTBEAT_MS = 5_000;
-// A cleanup pass or another delivery can hold the per-investigation lease for
-// a few milliseconds. Absorb that local scheduling collision inside one queue
+// Another delivery can hold the per-investigation lease for a few
+// milliseconds. Absorb that local scheduling collision inside one queue
 // attempt instead of immediately paying the queue's 30-second backoff.
 export const DELIVERY_LOCK_WAIT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 const execFileAsync = promisify(execFile);
@@ -1190,8 +1189,7 @@ function normalizeTerminalFailure(value: unknown): TerminalFailureRecord {
     !categories.has(record.category) ||
     typeof record.stage !== "string" ||
     !DELIVERY_STAGES.has(record.stage) ||
-    !Number.isFinite(Date.parse(record.terminalAt)) ||
-    !Number.isFinite(Date.parse(record.retentionEligibleAt))
+    !Number.isFinite(Date.parse(record.terminalAt))
   ) {
     throw new Error("Terminal failure has an invalid shape.");
   }
@@ -1215,10 +1213,8 @@ export function createFileDeliveryStateStore(
   const lockHeartbeatMs =
     lockOptions.heartbeatMs ?? DELIVERY_LOCK_HEARTBEAT_MS;
   const now = lockOptions.now ?? Date.now;
-  // Locks live outside investigation directories so retention cleanup can
-  // remove artifacts/<id>/ while still holding the same lock delivery uses.
-  // A lock inside the deletion target would disappear mid-critical-section
-  // and permit a concurrent delivery retry to recreate state underneath it.
+  // Locks live in one dedicated directory so delivery state and payload files
+  // remain immutable investigation artifacts rather than lock bookkeeping.
   const lockRoot = path.join(resolvedRoot, "_delivery-locks");
   const ensureRoot = async () => {
     try {

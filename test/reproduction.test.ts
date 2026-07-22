@@ -367,6 +367,45 @@ describe("replay", () => {
     },
   );
 
+  test("video recording can be disabled by an internal override", { timeout: 60_000 }, async () => {
+    const baseUrl = await startFixtureApp({ buggy: true });
+    const plan = buildLoginPlan(baseUrl);
+    const store = await makeStore();
+
+    const result = await executeReproductionPlan(plan, store, { recordVideo: false });
+
+    expect(result.outcome).toBe("reproduced");
+    expect(result.video ?? null).toBeNull();
+    await expect(stat(path.join(store.dir, "videos"))).rejects.toThrow();
+    await expect(
+      readFile(path.join(store.dir, "video-evidence.json"), "utf8"),
+    ).rejects.toThrow();
+  });
+
+  test("records a video by default and harvests it deterministically", { timeout: 60_000 }, async () => {
+    const baseUrl = await startFixtureApp({ buggy: true });
+    const plan = buildLoginPlan(baseUrl);
+    const store = await makeStore();
+
+    const result = await executeReproductionPlan(plan, store);
+
+    expect(result.outcome).toBe("reproduced");
+    expect(result.video).toBe(path.join("videos", "run.webm"));
+
+    const videoStat = await stat(path.join(store.dir, "videos", "run.webm"));
+    expect(videoStat.size).toBeGreaterThan(0);
+
+    const videoEvidence = JSON.parse(
+      await readFile(path.join(store.dir, "video-evidence.json"), "utf8"),
+    ) as { video: string | null };
+    expect(videoEvidence.video).toBe(path.join("videos", "run.webm"));
+
+    const visualEvidence = JSON.parse(
+      await readFile(path.join(store.dir, "visual-evidence.json"), "utf8"),
+    ) as { videoRecording?: { enabled: boolean } };
+    expect(visualEvidence.videoRecording?.enabled).toBe(true);
+  });
+
   test("rejects an invalid saved plan as plan_failed", async () => {
     const store = await makeStore();
     const planPath = await store.writeJson("reproduction-plan.json", {

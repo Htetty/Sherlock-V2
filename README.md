@@ -66,6 +66,13 @@ Docker-socket requirement, and the Docker-outside-of-Docker path-alignment
 warning (sibling target containers bind-mount clone paths, so the worker's
 workspace path must exist from the Docker daemon host's perspective).
 
+### Investigation artifacts
+
+Sherlock retains each `artifacts/<investigationId>/` directory so later agent
+runs can use its evidence and replay plans as memory. There is no automatic
+age-based deletion; operators should provision the artifact volume as durable
+storage and manage capacity without removing replay inputs Sherlock still uses.
+
 ### Investigation state store (optional)
 
 The worker can persist a small, redacted per-investigation lifecycle summary
@@ -77,6 +84,26 @@ service role key to client code) and apply the migration in
 the backend service role bypasses it. See
 [docs/production-worker.md](docs/production-worker.md#investigation-state-store-optional)
 for details.
+
+### Replay evidence
+
+Sherlock can record the reproduction run (where the bug fails) and the
+post-fix verification run (where the exact saved plan passes), build a
+side-by-side comparison, and embed it in the GitHub comment as visual proof.
+See [docs/FABLE_REPLAY_EVIDENCE_PROMPT.md](docs/FABLE_REPLAY_EVIDENCE_PROMPT.md)
+for the design.
+
+- Browser and mixed reproduction plans automatically record `videos/run.webm`
+  and `videos/post-patch.webm`. API-only plans have nothing visual to record;
+  recording failures fall back to the normal report.
+- `ffmpeg` in the worker image produces
+  `evidence/evidence.mp4` (side-by-side) and a bounded `evidence/evidence.gif`.
+- When the existing `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set,
+  replay evidence is automatically uploaded to the managed public
+  `sherlock-evidence` bucket under an unguessable path, then embedded in the
+  issue comment. This includes private repositories because GitHub cannot embed
+  authenticated Storage objects; anyone with the unguessable URL can view the
+  media. Bucket retention is deployment-owned.
 
 ## Contributing
 

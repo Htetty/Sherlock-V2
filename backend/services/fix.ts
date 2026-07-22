@@ -145,6 +145,10 @@ export type FixAttemptResult = {
   // Null until the replay runs; the raw post-patch-reproduction-result.json
   // artifact remains the complete record.
   postPatchEvidence: ReproductionEvidenceSummary | null;
+  // Attempt-dir-relative reference to the post-patch replay video (replay
+  // evidence, e.g. "videos/post-patch.webm"); null when recording is
+  // disabled, skipped (api-only), or failed.
+  postPatchVideo: string | null;
   testRuns: TestRunRecord[];
   // Truthful repository validation summary (null until validation runs).
   repositoryValidation: RepositoryValidationSummary | null;
@@ -174,6 +178,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     rootCause: null,
     postPatchOutcome: null,
     postPatchEvidence: null,
+    postPatchVideo: null,
     testRuns: [],
     repositoryValidation: null,
     regressionTest: null,
@@ -581,9 +586,11 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 
   const postResult = await executeReproductionPlan(replayPlan, store, {
     probeTimeoutMs: input.probeTimeoutMs,
+    videoName: "post-patch.webm",
   });
   result.postPatchOutcome = postResult.outcome;
   result.postPatchEvidence = summarizeReproductionEvidence(postResult);
+  result.postPatchVideo = postResult.video ?? null;
   await store.writeJson("post-patch-reproduction-result.json", {
     investigationId: input.investigationId,
     fixAttemptId,

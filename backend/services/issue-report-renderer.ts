@@ -72,6 +72,15 @@ export type InvestigationReportData = {
     planErrors: string[];
     analysis: string | null;
   };
+  // Replay evidence (docs/FABLE_REPLAY_EVIDENCE_PROMPT.md): public URLs of
+  // the hosted comparison media. Only ever populated from Sherlock's own
+  // upload results — never from model output — and re-validated through
+  // canonicalEvidenceUrl at render time. Optional so persisted payloads from
+  // before this feature normalize cleanly.
+  replayEvidence?: {
+    gifUrl: string | null;
+    videoUrl: string | null;
+  } | null;
 };
 
 // Pull-request delivery state, provided by the caller at render time (the
@@ -118,7 +127,7 @@ const INTERNAL_ID_PATTERN =
 const INTERNAL_MARKER_PATTERN =
   /sherlock-(?:delivery|terminal)-comment\s*:[^\s<`]*/gi;
 const INTERNAL_RUNTIME_DIRECTORY =
-  String.raw`(?:artifacts|fix-attempts|protected-delivery|_delivery-locks|screenshots?|evidence|tool-calls|workspaces?|memory|graphs|graphify-out|repro-agent|fix-agent|exploration|replays|replay-\d+)`;
+  String.raw`(?:artifacts|fix-attempts|protected-delivery|_delivery-locks|screenshots?|evidence|videos?|tool-calls|workspaces?|memory|graphs|graphify-out|repro-agent|fix-agent|exploration|replays|replay-\d+)`;
 const INTERNAL_PATH_PATTERN = new RegExp(
   String.raw`(?:\.{0,2}[\\/])?(?:[^\s\x60"')\]]+[\\/])*${INTERNAL_RUNTIME_DIRECTORY}[\\/][^\s\x60"')\]]+|[\\/](?:private[\\/])?(?:tmp|var[\\/]folders)[\\/][^\s\x60"')\]]+`,
   "gi",
@@ -135,6 +144,12 @@ const INTERNAL_ARTIFACT_FILENAMES = [
   "console-errors.json",
   "cost-shape.json",
   "delivery-state.json",
+  "evidence-upload.json",
+  "evidence.gif",
+  "evidence.mp4",
+  "post-patch.webm",
+  "run.webm",
+  "video-evidence.json",
   "failure-evidence.json",
   "fix-proposal.json",
   "git-diff.patch",
@@ -424,6 +439,9 @@ export type InvestigationReportInput = {
   // Diagnostic model analysis (free text or a { type: "text", text } block).
   // Only ever rendered inside collapsed technical evidence, bounded.
   analysis?: unknown;
+  // Public URLs of hosted replay-evidence media, from Sherlock's own upload
+  // results only (evidence-upload.ts). Null/absent renders no evidence.
+  replayEvidence?: { gifUrl: string | null; videoUrl: string | null } | null;
 };
 
 export function buildInvestigationReportData(
@@ -517,6 +535,7 @@ export function buildInvestigationReportData(
       planErrors: summary.planErrors ?? [],
       analysis: extractAnalysisText(input.analysis ?? null),
     },
+    replayEvidence: input.replayEvidence ?? null,
   };
 }
 
@@ -839,6 +858,27 @@ export function normalizeInvestigationReportData(
     };
   });
 
+  // Optional field: payloads persisted before replay evidence existed have no
+  // replayEvidence key and normalize to null. Present values must be
+  // well-shaped; URLs that fail canonicalization are dropped, not fatal.
+  let replayEvidence: InvestigationReportData["replayEvidence"] = null;
+  if (data.replayEvidence !== undefined && data.replayEvidence !== null) {
+    if (typeof data.replayEvidence !== "object" || Array.isArray(data.replayEvidence)) {
+      throw new Error("Investigation report replay evidence is invalid.");
+    }
+    const item = data.replayEvidence as Record<string, unknown>;
+    requirePayloadKeys(item, ["gifUrl", "videoUrl"], "replay evidence");
+    if (
+      (item.gifUrl !== null && typeof item.gifUrl !== "string") ||
+      (item.videoUrl !== null && typeof item.videoUrl !== "string")
+    ) {
+      throw new Error("Investigation report replay evidence is invalid.");
+    }
+    const gifUrl = canonicalEvidenceUrl(item.gifUrl);
+    const videoUrl = canonicalEvidenceUrl(item.videoUrl);
+    replayEvidence = gifUrl !== null || videoUrl !== null ? { gifUrl, videoUrl } : null;
+  }
+
   const normalized: InvestigationReportData = {
     outcome: data.outcome,
     originalOutcome,
@@ -874,6 +914,7 @@ export function normalizeInvestigationReportData(
       ),
       analysis: boundedPayloadString(evidence.analysis, 2_000, "analysis"),
     },
+    replayEvidence,
   };
 
   if (
@@ -1000,6 +1041,37 @@ function outcomeCallout(report: InvestigationReportData): string {
   return `> [!${callout.kind}]\n> **${callout.title}** — ${callout.text}`;
 }
 
+// Strict allowline for replay-evidence URLs. These bypass scrubPublicText
+// (which removes every web URL), so they must be provably safe on their own:
+// https only, no credentials, a public-looking host, and no characters that
+// could break out of renderer-owned Markdown image/link syntax.
+export function canonicalEvidenceUrl(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 600) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password) {
+      return null;
+    }
+    const host = url.hostname.toLowerCase();
+    if (
+      !host.includes(".") ||
+      host === "localhost" ||
+      host.endsWith(".local") ||
+      host.startsWith("[") ||
+      /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host)
+    ) {
+      return null;
+    }
+    const canonical = url.toString();
+    if (/[\s()<>"'`\\]/.test(canonical)) {
+      return null;
+    }
+    return canonical;
+  } catch {
+    return null;
+  }
+}
+
 export function canonicalGitHubPullRequestUrl(value: unknown): string | null {
   if (typeof value !== "string") return null;
   try {
@@ -1098,6 +1170,43 @@ function validationRows(report: InvestigationReportData): string[] {
   return rows;
 }
 
+// Replay evidence section: the GIF proves the claim visually (reproduction
+// failing, then the identical replay passing after the fix). Rendered only
+// from URLs that pass canonicalEvidenceUrl; when nothing passes, the section
+// is omitted entirely — no placeholder text.
+function replayEvidenceSection(report: InvestigationReportData): string | null {
+  const evidence = report.replayEvidence ?? null;
+  if (!evidence) return null;
+
+  const gifUrl = canonicalEvidenceUrl(evidence.gifUrl);
+  const videoUrl = canonicalEvidenceUrl(evidence.videoUrl);
+  if (gifUrl === null && videoUrl === null) return null;
+
+  const comparison = report.outcome === "verified_fix";
+  const lines: string[] = ["### Replay evidence", ""];
+
+  lines.push(
+    comparison
+      ? "Sherlock recorded both runs. Left: the reproduction failing before the fix. Right: the identical reproduction plan passing after the fix."
+      : "Sherlock recorded the reproduction run that observed the reported failure.",
+  );
+
+  if (gifUrl !== null) {
+    lines.push("", `![Sherlock replay evidence](${gifUrl})`);
+  }
+
+  if (videoUrl !== null) {
+    lines.push(
+      "",
+      comparison
+        ? `[Watch the full comparison video](${videoUrl})`
+        : `[Watch the full video](${videoUrl})`,
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function technicalEvidenceLines(report: InvestigationReportData): string[] {
   const evidence = report.technicalEvidence;
   const lines: string[] = [];
@@ -1162,7 +1271,7 @@ export function renderIssueReport(
   report: InvestigationReportData,
   pullRequest: ReportPullRequest | null,
 ): string {
-  const sections: string[] = [outcomeCallout(report)];
+  const sections: string[] = ["## Sherlock Investigation", outcomeCallout(report)];
 
   const rootCause = inlineField(report.rootCause, MAX_ROOT_CAUSE_CHARS);
   if (rootCause) {
@@ -1204,6 +1313,11 @@ export function renderIssueReport(
   const validation = validationRows(report);
   if (validation.length > 0) {
     sections.push(`### Validation\n\n| Check | Result |\n| --- | --- |\n${validation.join("\n")}`);
+  }
+
+  const replayEvidence = replayEvidenceSection(report);
+  if (replayEvidence) {
+    sections.push(replayEvidence);
   }
 
   const limitations = report.limitations
@@ -1257,6 +1371,7 @@ export const QUEUED_INVESTIGATION_ASCII_ART = `⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 
 export function renderQueuedIssueReport(): string {
   return [
+    "## Sherlock Investigation",
     "",
     "> [!NOTE]",
     "> **Investigation queued** — Sherlock will update this comment when the investigation is complete.",

@@ -9,7 +9,8 @@
 // with `ambiguous` recorded instead of acting on the wrong element.
 
 import path from "node:path";
-import { chromium, type Locator, type Page } from "playwright";
+import { mkdir, rename } from "node:fs/promises";
+import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import { truncateWithMarker } from "./bounded-text.js";
 import {
   getPlanMode,
@@ -30,6 +31,10 @@ const MAX_PAGE_ERRORS = 50;
 const MAX_NETWORK_FAILURES = 300;
 const MAX_API_RESPONSE_BODY_CHARS = 64 * 1024;
 const MAX_RESULT_HTML_CHARS = 64 * 1024;
+// Replay evidence (docs/FABLE_REPLAY_EVIDENCE_PROMPT.md): bounded recording
+// resolution. The video is a side effect of the run that already happens —
+// never a separate execution path.
+const VIDEO_SIZE = { width: 1280, height: 720 };
 
 export type StepOutcome = "passed" | "failed" | "skipped";
 
@@ -113,6 +118,11 @@ export type ReproductionResult = {
   evidenceTruncation?: EvidenceTruncation;
   htmlTruncated?: boolean;
   originalHtmlLength?: number;
+  // Store-relative reference to the run's video recording (e.g.
+  // "videos/run.webm"), or null. Optional so loosely-shaped test fixtures
+  // remain valid. Set when automatic browser recording succeeds; recording
+  // failures degrade to null and never fail the run.
+  video?: string | null;
 };
 
 // Rolling evidence sink shared by the plan executor and live sessions
@@ -447,6 +457,13 @@ export async function executeSessionStep(
 
 export type ExecuteOptions = {
   probeTimeoutMs?: number;
+  // Internal/test override. Browser and mixed plans record by default;
+  // recording is always skipped for api-only plans (no page opens).
+  recordVideo?: boolean;
+  // Deterministic name for the harvested recording inside the store's
+  // videos/ directory (default "run.webm"; the post-fix verification uses
+  // "post-patch.webm" so the two proofs are distinguishable).
+  videoName?: string;
 };
 
 export async function executeReproductionPlan(
@@ -488,6 +505,7 @@ export async function executeReproductionPlan(
     events: evidence.events,
     html: "",
     evidenceTruncation: evidence.truncation,
+    video: null,
   };
 
   const probeTimeoutMs = options.probeTimeoutMs ?? BASE_URL_PROBE_TIMEOUT_MS;
@@ -499,17 +517,40 @@ export async function executeReproductionPlan(
     return result;
   }
 
+  // API-only plans never open a page: screenshots would be blank white
+  // frames that make the run look broken. Skip them and record why
+  // (docs/fable/11 observability); browser/mixed plans keep today's behavior.
+  // Video recording follows the same rule.
+  const planMode = getPlanMode(plan);
+  const wantVideo = options.recordVideo ?? true;
+  const videoFileName = options.videoName ?? "run.webm";
+
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  // Recording requires an explicit context (a video is only flushed when its
+  // context closes). The default path keeps today's browser.newPage() exactly;
+  // any recording setup failure falls back to the unrecorded path — video is
+  // evidence, never a reason for a run to fail.
+  let recordingContext: BrowserContext | null = null;
+
+  if (wantVideo && planMode !== "api-only") {
+    try {
+      await mkdir(path.join(store.dir, "videos"), { recursive: true });
+      recordingContext = await browser.newContext({
+        recordVideo: { dir: path.join(store.dir, "videos"), size: VIDEO_SIZE },
+      });
+    } catch {
+      recordingContext = null;
+    }
+  }
+
+  const page = recordingContext
+    ? await recordingContext.newPage()
+    : await browser.newPage();
   page.setDefaultTimeout(STEP_TIMEOUT_MS);
   page.setDefaultNavigationTimeout(STEP_TIMEOUT_MS);
 
   attachEvidenceListeners(page, evidence, plan.baseUrl);
 
-  // API-only plans never open a page: screenshots would be blank white
-  // frames that make the run look broken. Skip them and record why
-  // (docs/fable/11 observability); browser/mixed plans keep today's behavior.
-  const planMode = getPlanMode(plan);
   const visualEvidence =
     planMode === "api-only"
       ? {
@@ -519,7 +560,21 @@ export async function executeReproductionPlan(
       : { available: true, reason: `Plan mode: ${planMode}.` };
 
   await store
-    .writeJson("visual-evidence.json", { planMode, ...visualEvidence })
+    .writeJson("visual-evidence.json", {
+      planMode,
+      ...visualEvidence,
+      videoRecording: {
+        enabled: recordingContext !== null,
+        reason:
+          planMode === "api-only"
+            ? "API-only reproduction plan; nothing visual to record."
+            : wantVideo
+              ? recordingContext !== null
+                ? "Replay-evidence recording is active for this run."
+                : "Recording was requested but the recording context could not be created."
+              : "Video recording was disabled by an internal execution override.",
+      },
+    })
     .catch(() => {});
 
   const screenshot = async (name: string) => {
@@ -581,11 +636,54 @@ export async function executeReproductionPlan(
     result.outcome = "execution_failed";
     result.outcomeReason = `Unexpected Playwright error: ${formatError(error)}`;
   } finally {
+    result.video = await harvestVideo(page, recordingContext, store, videoFileName);
     await browser.close();
     result.finishedAt = new Date().toISOString();
   }
 
+  if (recordingContext !== null) {
+    await store
+      .writeJson("video-evidence.json", {
+        video: result.video,
+        reason:
+          result.video !== null
+            ? "Recording captured during the plan execution."
+            : "Recording was active but no video could be harvested.",
+      })
+      .catch(() => {});
+  }
+
   return result;
+}
+
+// Closes the recording context (which flushes the video file) and moves the
+// randomly-named capture to a deterministic name inside the store's videos/
+// directory. Every failure degrades to null: a lost recording must never
+// change a reproduction outcome.
+async function harvestVideo(
+  page: Page,
+  context: BrowserContext | null,
+  store: ArtifactStore,
+  fileName: string,
+): Promise<string | null> {
+  if (context === null) {
+    return null;
+  }
+
+  try {
+    const video = page.video();
+    await context.close();
+
+    if (!video) {
+      return null;
+    }
+
+    const capturedPath = await video.path();
+    await rename(capturedPath, path.join(store.dir, "videos", fileName));
+    return path.join("videos", fileName);
+  } catch {
+    return null;
+  }
 }
 
 // Strict-mode resolution of an intent target. Priority mirrors

@@ -110,7 +110,6 @@ export type WorkerDeps = {
       assertOwnership: () => Promise<void>;
     }) => ReturnType<DeliveryExecutorDeps["findTerminalComment"]>;
   };
-  failedArtifactRetentionMs?: number;
   log?: (message: string) => void;
 };
 
