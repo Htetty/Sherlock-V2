@@ -166,7 +166,14 @@ function opaqueQueueIdentity(parts: string[]): string {
 export type InvestigationQueueAdapter = {
   add: (
     payload: InvestigationJobPayload,
-    options?: { onClaim?: () => boolean | Promise<boolean> },
+    options?: {
+      onClaim?: () =>
+        | boolean
+        | "allow"
+        | "duplicate"
+        | "rate_limited"
+        | Promise<boolean | "allow" | "duplicate" | "rate_limited">;
+    },
   ) => Promise<{ jobId: string; deduplicated: boolean; rateLimited: boolean }>;
   close: () => Promise<void>;
 };
@@ -222,9 +229,16 @@ export function createInvestigationQueueAdapter(
         );
 
       try {
-        if (options?.onClaim && !(await options.onClaim())) {
-          await releaseClaim();
-          return { jobId, deduplicated: false, rateLimited: true };
+        if (options?.onClaim) {
+          const decision = await options.onClaim();
+          if (decision === "duplicate") {
+            await releaseClaim();
+            return { jobId, deduplicated: true, rateLimited: false };
+          }
+          if (decision === false || decision === "rate_limited") {
+            await releaseClaim();
+            return { jobId, deduplicated: false, rateLimited: true };
+          }
         }
 
         // BullMQ's deterministic job id remains a second safety layer.

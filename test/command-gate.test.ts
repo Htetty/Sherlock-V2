@@ -67,9 +67,16 @@ function createFakeQueue() {
 
       claims.add(jobId);
 
-      if (options?.onClaim && !(await options.onClaim())) {
-        claims.delete(jobId);
-        return { jobId, deduplicated: false, rateLimited: true };
+      if (options?.onClaim) {
+        const decision = await options.onClaim();
+        if (decision === "duplicate") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: true, rateLimited: false };
+        }
+        if (decision === false || decision === "rate_limited") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: false, rateLimited: true };
+        }
       }
 
       jobs.set(jobId, payload);

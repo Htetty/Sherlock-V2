@@ -15,6 +15,7 @@ import {
   type InvestigationQueueAdapter,
 } from "../backend/queue/investigation-queue.js";
 import type { InvestigationRateLimiter } from "../backend/services/rate-limit.js";
+import { createInMemoryProductDataStore } from "../backend/services/product-data.js";
 
 // Permissive limiter fake: these tests focus on queueing behavior, and the
 // default (injected only when absent) would open a real Redis connection.
@@ -41,6 +42,7 @@ function buildWebhookPayload(commentId: number) {
   return {
     action: "created",
     issue: {
+      id: 1001,
       number: 1,
       title: "Example bug",
       body: "Something broke",
@@ -49,10 +51,13 @@ function buildWebhookPayload(commentId: number) {
     comment: {
       id: commentId,
       body: "/sherlock investigate",
-      user: { login: "hiimbex" },
+      user: { id: 3003, login: "hiimbex" },
     },
     repository: {
+      id: 2002,
       name: "testing-things",
+      full_name: "hiimbex/testing-things",
+      private: true,
       html_url: "https://github.com/hiimbex/testing-things",
       default_branch: "main",
       owner: { login: "hiimbex" },
@@ -77,9 +82,16 @@ function createFakeQueue() {
 
       claims.add(jobId);
 
-      if (options?.onClaim && !(await options.onClaim())) {
-        claims.delete(jobId);
-        return { jobId, deduplicated: false, rateLimited: true };
+      if (options?.onClaim) {
+        const decision = await options.onClaim();
+        if (decision === "duplicate") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: true, rateLimited: false };
+        }
+        if (decision === false || decision === "rate_limited") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: false, rateLimited: true };
+        }
       }
 
       jobs.set(jobId, payload);
@@ -112,10 +124,12 @@ function mockGithub(expectedComments: number) {
 describe("Sherlock webhook (queued investigations)", () => {
   let probot: Probot;
   let fake: ReturnType<typeof createFakeQueue>;
+  let productData: ReturnType<typeof createInMemoryProductDataStore>;
 
   beforeEach(() => {
     nock.disableNetConnect();
     fake = createFakeQueue();
+    productData = createInMemoryProductDataStore();
     probot = new Probot({
       appId: 123,
       privateKey,
@@ -132,6 +146,7 @@ describe("Sherlock webhook (queued investigations)", () => {
         // focus on queueing behavior.
         getRepositoryRole: async () => ({ roleName: "write" }),
         rateLimiter: allowAllRateLimiter(),
+        productData,
       }),
     );
   });
@@ -164,6 +179,7 @@ describe("Sherlock webhook (queued investigations)", () => {
     expect(job.issueNumber).toBe(1);
     expect(job.triggeringCommentId).toBe(4242);
     expect(job.deliveryId).toBe("delivery-1");
+    expect(productData.snapshot().investigations).toHaveLength(1);
 
     // No secrets in the queue payload.
     const serialized = JSON.stringify(job).toLowerCase();

@@ -43,9 +43,10 @@ import {
   type InvestigationStateEventInput,
   type InvestigationStateStore,
 } from "../services/investigation-state-store.js";
-import type {
-  DeliveryJobPayload,
-  InvestigationJobPayload,
+import {
+  DELIVERY_RETRY_BACKOFF_MS,
+  type DeliveryJobPayload,
+  type InvestigationJobPayload,
 } from "./investigation-queue.js";
 
 export type InvestigationJobLike = {
@@ -81,7 +82,7 @@ export type WorkerDeps = {
     issueNumber: number;
     body: string;
     assertOwnership?: () => Promise<void>;
-  }) => Promise<void>;
+  }) => Promise<void | { id: number }>;
   updateIssueComment?: DeliveryExecutorDeps["updateIssueComment"];
   reportStage?: (stage: InvestigationStage) => void | Promise<void>;
   // Lifecycle state store. Worker-level writes (queued/running before the
@@ -89,6 +90,15 @@ export type WorkerDeps = {
   // go through here so an investigation that dies during token/auth setup still
   // leaves a state record. Optional and best-effort: never fails the job.
   stateStore?: InvestigationStateStore;
+  // Required product projection in configured deployments. It runs at the
+  // terminal callback while local artifacts still exist, before workspace
+  // cleanup can remove the exact diff and replay evidence.
+  persistResult?: (result: InvestigationPipelineResult) => Promise<void>;
+  recordDeliveryAttempt?: (
+    investigationId: string,
+    attemptCount: number,
+    nextRetryAt: string | null,
+  ) => Promise<void>;
   // GitHub delivery: durable state store, delivery-only retry job producer,
   // and the GitHub surfaces the idempotent delivery executor needs. See
   // services/delivery.ts for the contract.
@@ -122,6 +132,7 @@ export type DeliveryWorkerDeps = Pick<
   | "postIssueComment"
   | "updateIssueComment"
   | "stateStore"
+  | "recordDeliveryAttempt"
   | "delivery"
   | "log"
 >;
@@ -582,6 +593,7 @@ export async function processInvestigationJob(
   let pipelineResult: InvestigationPipelineResult | null = null;
   let pipelineStarted = false;
   let persistedDeliveryState: DeliveryState | null = null;
+  let persistedProductResult = false;
   let deliveryPersistenceError: unknown = null;
 
   const deliveryStateFor = (result: InvestigationPipelineResult) =>
@@ -652,6 +664,8 @@ export async function processInvestigationJob(
           // boundary can never trigger a contradictory worker-failure comment.
           pipelineResult = terminalResult;
           try {
+            await deps.persistResult?.(terminalResult);
+            persistedProductResult = true;
             const state = await deliveryStateFor(terminalResult);
             await deps.delivery.store.save(state);
             persistedDeliveryState = state;
@@ -662,6 +676,18 @@ export async function processInvestigationJob(
       },
     );
     pipelineResult = result;
+
+    // Compatibility for injected/legacy pipeline adapters that do not invoke
+    // onTerminalResult. Production persists at the callback above, while the
+    // artifact paths are still guaranteed to exist.
+    if (!persistedProductResult && deps.persistResult) {
+      try {
+        await deps.persistResult(result);
+        persistedProductResult = true;
+      } catch (error) {
+        deliveryPersistenceError = deliveryPersistenceError ?? error;
+      }
+    }
 
     // --- Delivery phase ----------------------------------------------------
     // Execution is terminal. Persist the durable delivery state first, so
@@ -856,6 +882,13 @@ export async function processDeliveryJob(
   const log = deps.log ?? (() => {});
   const attemptsAllowed = job.opts?.attempts ?? 1;
   const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
+  const attemptCount = job.attemptsMade + 1;
+  const nextRetryAt = isFinalAttempt
+    ? null
+    : new Date(
+        Date.now() +
+          DELIVERY_RETRY_BACKOFF_MS * 2 ** Math.max(0, job.attemptsMade),
+      ).toISOString();
 
   const recordState = async (event: InvestigationStateEventInput) => {
     try {
@@ -890,6 +923,12 @@ export async function processDeliveryJob(
       `[${payload.investigationId}] No delivery state was found; nothing can be delivered.`,
     );
   }
+
+  await deps.recordDeliveryAttempt?.(
+    payload.investigationId,
+    attemptCount,
+    nextRetryAt,
+  );
 
   // Defensive identity check: the job must only ever act on the repository
   // and issue the persisted state belongs to.

@@ -30,6 +30,11 @@ import {
   type InstallationEventDeps,
 } from "./installation-events.js";
 import type { InstallationLifecycleDeps } from "../backend/services/github-installations.js";
+import {
+  createProductDataStoreFromEnv,
+  type ProductDataStore,
+} from "../backend/services/product-data.js";
+import { toGitHubIdString } from "../backend/services/github-installations.js";
 
 const UNAUTHORIZED_COMMENT =
   "Sherlock investigations can only be started by users with write access or higher on this repository.";
@@ -73,6 +78,7 @@ export type SherlockAppDeps = {
   getRepositoryRole?: GetRepositoryRole;
   rateLimiter?: InvestigationRateLimiter;
   installationEvents?: InstallationEventDeps;
+  productData?: ProductDataStore | null;
 };
 
 // Default installation-lifecycle persistence: Supabase service-role stores,
@@ -125,6 +131,20 @@ export const createSherlockApp =
     let queue = deps.queue ?? null;
     let rateLimiter = deps.rateLimiter ?? null;
     const getRepositoryRole = deps.getRepositoryRole ?? defaultGetRepositoryRole;
+    let productDataPromise: Promise<ProductDataStore | null> | null = null;
+    const getProductData = () => {
+      if (deps.productData !== undefined) {
+        return Promise.resolve(deps.productData);
+      }
+      // Tests must never discover developer-machine credentials through
+      // dotenv and accidentally contact a live project. Product persistence
+      // remains explicitly injectable in integration tests.
+      if (process.env.NODE_ENV === "test") {
+        return Promise.resolve(null);
+      }
+      productDataPromise ??= createProductDataStoreFromEnv();
+      return productDataPromise;
+    };
 
     const getQueue = () => {
       queue ??= createInvestigationQueueAdapter();
@@ -218,6 +238,10 @@ export const createSherlockApp =
 
       const investigationId = createInvestigationId();
       const tenantId = deriveTenantIdFromInstallation(installationId);
+      const repositoryId = toGitHubIdString(context.payload.repository.id);
+      const issueId = toGitHubIdString(context.payload.issue.id);
+      const triggeringCommentId = toGitHubIdString(comment.id);
+      const actorId = toGitHubIdString(comment.user?.id);
 
       // Non-secret payload only: the worker mints its own installation
       // token from the GitHub App credentials.
@@ -248,7 +272,38 @@ export const createSherlockApp =
           const decision =
             await getRateLimiter().checkAndConsumeInvestigationRateLimit(tenantId);
 
-          return decision.allowed;
+          if (!decision.allowed) return "rate_limited";
+
+          const productData = await getProductData();
+          if (!productData) return "allow";
+
+          if (!repositoryId || !issueId || !triggeringCommentId || !actorId) {
+            throw new Error(
+              "GitHub returned an invalid numeric identity; durable investigation creation was refused.",
+            );
+          }
+
+          const claim = await productData.createInvestigation({
+            investigationId,
+            tenantId,
+            installationId: String(installationId),
+            repositoryId,
+            repositoryOwner: owner,
+            repositoryName: repo,
+            repositoryFullName: context.payload.repository.full_name,
+            repositoryPrivate: context.payload.repository.private,
+            githubIssueId: issueId,
+            issueNumber: context.payload.issue.number,
+            issueTitle: context.payload.issue.title,
+            issueUrl: context.payload.issue.html_url,
+            triggeringCommentId,
+            triggeredBy: username,
+            triggeredByGithubUserId: actorId,
+            sourceRef: context.payload.repository.default_branch ?? null,
+            createdAt: new Date().toISOString(),
+          });
+
+          return claim.created ? "allow" : "duplicate";
         },
       });
 

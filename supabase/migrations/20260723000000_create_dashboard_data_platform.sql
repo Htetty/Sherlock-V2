@@ -287,6 +287,9 @@ create table public.investigation_deliveries (
   retry_payload_bucket text,
   retry_payload_path text,
   retry_payload_sha256 text,
+  terminal_payload_bucket text,
+  terminal_payload_path text,
+  terminal_payload_sha256 text,
   terminal_comment_status text not null default 'pending'
     check (terminal_comment_status in ('pending', 'posted', 'failed')),
   terminal_comment_id text
@@ -298,12 +301,22 @@ create table public.investigation_deliveries (
     check (attempt_count >= 0),
   last_attempt_at timestamptz,
   next_retry_at timestamptz,
+  state jsonb,
+  terminal_failure jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint investigation_deliveries_retry_object_pair
     check (
       (retry_payload_bucket is null and retry_payload_path is null)
       or (retry_payload_bucket is not null and retry_payload_path is not null)
+    ),
+  constraint investigation_deliveries_terminal_object_pair
+    check (
+      (terminal_payload_bucket is null and terminal_payload_path is null)
+      or (
+        terminal_payload_bucket is not null
+        and terminal_payload_path is not null
+      )
     )
 );
 

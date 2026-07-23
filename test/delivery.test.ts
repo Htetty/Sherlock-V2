@@ -655,7 +655,7 @@ describe("delivery executor", () => {
 
     const row = rows.get(INV)!;
     expect(row.tenant_id).toBe("tenant-gh-2");
-    expect(row.installation_id).toBe(2);
+    expect(row.installation_id).toBe("2");
     expect(row.outcome).toBe("verified_fix");
     expect(row.record.originalOutcome).toBe("reproduced");
     expect(row.record.pullRequestStatus).toBe("created");

@@ -22,6 +22,7 @@
     "worker:check": "node ./lib/backend/worker-preflight.js",
     "worker:health": "node ./lib/backend/worker-health.js",
     "ops:check:prod": "node ./lib/backend/ops-check.js",
+    "cleanup:retention": "node ./lib/backend/retention-cleanup.js",
     "deploy:doctor:prod": "node scripts/deploy-doctor.mjs production",
     "deploy:doctor:staging": "node scripts/deploy-doctor.mjs staging",
     "deploy:smoke:prod": "node scripts/compose-smoke.mjs production",
