@@ -127,7 +127,10 @@ frontend (separate repository):
   (personal installations: installation account id must equal the user's
   GitHub id; organization installations: the verified `installation.created`
   webhook sender id must equal the user's GitHub id), records membership, and
-  redirects to `SHERLOCK_FRONTEND_URL`.
+  redirects to `SHERLOCK_FRONTEND_URL`. For `setup_action=update`, an
+  already-known installation may return without the one-time installation
+  nonce: the callback re-verifies it through GitHub and reconciles repository
+  access, but never creates or changes user membership on that path.
 
 Installation lifecycle webhooks (`installation.*`,
 `installation_repositories.*`) are persisted by the Probot process
@@ -153,7 +156,9 @@ none of them happen automatically:
    `SUPABASE_SERVICE_ROLE_KEY` only for trusted persistence.
 4. **GitHub App setup URL** — in the deployed GitHub App's settings, set the
    Setup URL to `https://<backend-origin>/api/github/installations/callback`
-   (and enable "Redirect on update" if org-level updates should round-trip).
+   and enable **Redirect on update** so adding or removing repository access
+   returns to Sherlock. `<backend-origin>` must be the same deployed origin
+   configured as the frontend's server-only `SHERLOCK_API_URL`.
 5. **GitHub App webhook events** — subscribe the deployed App to
    **Installation**, **Installation repositories**, and **Issue comment**.
    Editing `app.yml` alone does NOT change an existing GitHub App.

@@ -261,6 +261,125 @@ describe("callback validation", () => {
   });
 });
 
+describe("installation update callback", () => {
+  test("reconciles an existing installation without an install nonce", async () => {
+    const updatedRepositories = [
+      {
+        repositoryId: "88",
+        ownerLogin: "octo-dev",
+        name: "dashboard",
+        fullName: "octo-dev/dashboard",
+        private: true,
+      },
+    ];
+    const harness = await bootCallback({
+      snapshot: makeSnapshot({
+        accountType: "User",
+        accountId: "123456789",
+      }),
+      fetchInstallationRepositories: async () => updatedRepositories,
+    });
+    await applyInstallationCreated(
+      { store: harness.store, profiles: harness.profiles },
+      {
+        snapshot: makeSnapshot({
+          accountType: "User",
+          accountId: "123456789",
+        }),
+        senderGithubUserId: "123456789",
+        repositories: [
+          {
+            repositoryId: "77",
+            ownerLogin: "octo-dev",
+            name: "removed",
+            fullName: "octo-dev/removed",
+            private: true,
+          },
+        ],
+        eventAt: new Date().toISOString(),
+      },
+    );
+
+    const { status, location } = await invoke(harness.baseUrl, {
+      installation_id: "987654321",
+      setup_action: "update",
+    });
+
+    expect(status).toBe(302);
+    expect(location).toBe(SUCCESS);
+    expect(harness.store.snapshotRepositories()).toMatchObject([
+      { repositoryId: "77", status: "removed" },
+      { repositoryId: "88", status: "active" },
+    ]);
+    expect(harness.store.snapshotMemberships()).toEqual([]);
+  });
+
+  test("rejects a nonce-less update for an unknown installation", async () => {
+    const fetchInstallation = vi.fn();
+    const harness = await bootCallback({ fetchInstallation });
+
+    const { location } = await invoke(harness.baseUrl, {
+      installation_id: "987654321",
+      setup_action: "update",
+    });
+
+    expect(location).toBe(ONBOARDING);
+    expect(fetchInstallation).not.toHaveBeenCalled();
+    expect(harness.store.snapshotMemberships()).toEqual([]);
+  });
+
+  test("rejects an update when GitHub returns a different installation", async () => {
+    const harness = await bootCallback({
+      fetchInstallation: async () =>
+        makeSnapshot({ installationId: "111111111" }),
+      fetchInstallationRepositories: async () => [],
+    });
+    await applyInstallationCreated(
+      { store: harness.store, profiles: harness.profiles },
+      {
+        snapshot: makeSnapshot(),
+        senderGithubUserId: "123456789",
+        repositories: [],
+        eventAt: new Date().toISOString(),
+      },
+    );
+
+    const { location } = await invoke(harness.baseUrl, {
+      installation_id: "987654321",
+      setup_action: "update",
+    });
+
+    expect(location).toBe(ONBOARDING);
+    expect(harness.store.snapshotMemberships()).toEqual([]);
+  });
+
+  test("does not report success when direct repository reconciliation fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const harness = await bootCallback({
+      fetchInstallationRepositories: async () => {
+        throw new Error("GitHub unavailable");
+      },
+    });
+    await applyInstallationCreated(
+      { store: harness.store, profiles: harness.profiles },
+      {
+        snapshot: makeSnapshot(),
+        senderGithubUserId: "123456789",
+        repositories: [],
+        eventAt: new Date().toISOString(),
+      },
+    );
+
+    const { location } = await invoke(harness.baseUrl, {
+      installation_id: "987654321",
+      setup_action: "update",
+    });
+
+    expect(location).toBe(ONBOARDING);
+    expect(harness.store.snapshotMemberships()).toEqual([]);
+  });
+});
+
 describe("personal-account ownership", () => {
   test("account id match → membership + success redirect", async () => {
     const harness = await bootCallback({

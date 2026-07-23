@@ -136,7 +136,61 @@ export function createInstallationCallbackRouter(
       res.redirect(302, `${frontendBase}/dashboard?installation=success`);
 
     try {
+      const setupAction = singleQueryValue(req.query.setup_action);
       const state = singleQueryValue(req.query.state);
+
+      // GitHub's "Redirect on update" flow does not originate from Sherlock's
+      // nonce-bearing installation URL. It may therefore return without
+      // `state`. A state-less update is safe only for an installation already
+      // known to Sherlock: GitHub App authentication verifies the installation,
+      // reconciliation writes only GitHub's authoritative repository snapshot,
+      // and this path never creates user membership.
+      if (setupAction === "update" && state === null) {
+        const installationId = singleQueryValue(req.query.installation_id);
+
+        if (
+          installationId === null ||
+          !INSTALLATION_ID_PATTERN.test(installationId)
+        ) {
+          log("Setup update callback rejected: malformed installation id.");
+          redirectOnboarding();
+          return;
+        }
+
+        const store = await deps.getStore();
+        const existing = await store.getInstallation(installationId);
+
+        if (!existing || existing.status === "deleted") {
+          log("Setup update callback rejected: installation is unknown or deleted.");
+          redirectOnboarding();
+          return;
+        }
+
+        const [snapshot, repositories] = await Promise.all([
+          deps.fetchInstallation(installationId),
+          deps.fetchInstallationRepositories
+            ? deps.fetchInstallationRepositories(installationId)
+            : Promise.reject(
+                new Error("Repository reconciliation is not configured."),
+              ),
+        ]);
+
+        if (snapshot.installationId !== installationId) {
+          log("Setup update callback rejected: installation id mismatch.");
+          redirectOnboarding();
+          return;
+        }
+
+        const eventAt = now().toISOString();
+        await store.upsertInstallationSnapshot(snapshot, { eventAt });
+        await store.reconcileInstallationRepositories(
+          installationId,
+          repositories,
+          eventAt,
+        );
+        redirectSuccess();
+        return;
+      }
 
       if (state === null || !STATE_PATTERN.test(state)) {
         log("Setup callback rejected: missing or malformed state.");
@@ -165,8 +219,6 @@ export function createInstallationCallbackRouter(
         });
         redirectOnboarding();
       };
-
-      const setupAction = singleQueryValue(req.query.setup_action);
 
       if (setupAction === null || !SUPPORTED_SETUP_ACTIONS.has(setupAction)) {
         log("Setup callback rejected: unsupported setup_action.");
