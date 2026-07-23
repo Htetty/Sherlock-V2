@@ -90,6 +90,7 @@ type StateRow = {
   id: string;
   investigation_id: string;
   installation_id: string | null;
+  repository_id: string | null;
   issue_title: string | null;
   status: "running" | "finished";
   stage: string | null;
@@ -311,13 +312,14 @@ export function reduceTimeline(
   return timeline;
 }
 
-async function membershipAllows(
+export async function membershipAllows(
   supabase: SupabaseClient,
   userId: string,
   installationId: string | null,
+  repositoryId: string | null = null,
 ): Promise<boolean> {
   if (!installationId) return false;
-  const [membership, installation] = await Promise.all([
+  const [membership, installation, repository] = await Promise.all([
     supabase
       .from("user_installations")
       .select("installation_id")
@@ -329,15 +331,32 @@ async function membershipAllows(
       .select("status")
       .eq("installation_id", installationId)
       .maybeSingle(),
+    repositoryId
+      ? supabase
+          .from("installation_repositories")
+          .select("status")
+          .eq("installation_id", installationId)
+          .eq("repository_id", repositoryId)
+          .maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
   ]);
-  if (membership.error || installation.error) {
+  if (membership.error || installation.error || repository.error) {
     throw new Error(
       `Investigation authorization failed: ${
-        membership.error?.message ?? installation.error?.message
+        membership.error?.message ??
+        installation.error?.message ??
+        repository.error?.message
       }`,
     );
   }
-  return Boolean(membership.data && installation.data?.status === "active");
+  return Boolean(
+    membership.data &&
+      installation.data?.status === "active" &&
+      // Legacy rows predate repository ids; keep their existing
+      // installation-scoped readability. Every new row must retain active
+      // installation/repository membership.
+      (repositoryId === null || repository.data?.status === "active"),
+  );
 }
 
 async function signedObjectUrl(
@@ -411,7 +430,7 @@ export function createSupabaseProductReadStore(
     const { data, error } = await supabase
       .from("investigation_states")
       .select(
-        "id,investigation_id,installation_id,issue_title,status,stage,outcome,updated_at,version,record",
+        "id,investigation_id,installation_id,repository_id,issue_title,status,stage,outcome,updated_at,version,record",
       )
       .eq("investigation_id", investigationId)
       .maybeSingle();
@@ -421,7 +440,15 @@ export function createSupabaseProductReadStore(
 
   const authorizedState = async (userId: string, investigationId: string) => {
     const row = await readState(investigationId);
-    if (!row || !(await membershipAllows(supabase, userId, row.installation_id))) {
+    if (
+      !row ||
+      !(await membershipAllows(
+        supabase,
+        userId,
+        row.installation_id,
+        row.repository_id,
+      ))
+    ) {
       return null;
     }
     return row;
@@ -430,7 +457,12 @@ export function createSupabaseProductReadStore(
   return {
     async findIssueInvestigation(input) {
       if (
-        !(await membershipAllows(supabase, input.userId, input.installationId))
+        !(await membershipAllows(
+          supabase,
+          input.userId,
+          input.installationId,
+          input.repositoryId,
+        ))
       ) {
         return null;
       }

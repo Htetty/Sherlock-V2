@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { reduceTimeline } from "../backend/services/product-read.js";
+import {
+  membershipAllows,
+  reduceTimeline,
+} from "../backend/services/product-read.js";
+import type { SupabaseClient } from "@supabase/supabase-js";
 
 describe("dashboard timeline projection", () => {
   test("advances prior steps when a later stage becomes active", () => {
@@ -117,5 +121,50 @@ describe("dashboard timeline projection", () => {
       "skipped",
       "skipped",
     ]);
+  });
+});
+
+describe("investigation repository authorization", () => {
+  function client(repositoryStatus: "active" | "removed" | null) {
+    const rows: Record<string, unknown> = {
+      user_installations: { installation_id: "987" },
+      github_installations: { status: "active" },
+      installation_repositories:
+        repositoryStatus === null ? null : { status: repositoryStatus },
+    };
+    return {
+      from(table: string) {
+        const builder = {
+          select() {
+            return builder;
+          },
+          eq() {
+            return builder;
+          },
+          async maybeSingle() {
+            return { data: rows[table] ?? null, error: null };
+          },
+        };
+        return builder;
+      },
+    } as unknown as SupabaseClient;
+  }
+
+  test("requires an active repository for every new investigation row", async () => {
+    await expect(
+      membershipAllows(client("active"), "user-a", "987", "555"),
+    ).resolves.toBe(true);
+    await expect(
+      membershipAllows(client("removed"), "user-a", "987", "555"),
+    ).resolves.toBe(false);
+    await expect(
+      membershipAllows(client(null), "user-a", "987", "555"),
+    ).resolves.toBe(false);
+  });
+
+  test("keeps legacy rows without repository ids installation-scoped", async () => {
+    await expect(
+      membershipAllows(client(null), "user-a", "987", null),
+    ).resolves.toBe(true);
   });
 });
