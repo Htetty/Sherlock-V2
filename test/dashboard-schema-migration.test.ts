@@ -112,7 +112,7 @@ describe("dashboard data platform migration", () => {
       "grant execute on function public.mark_dashboard_investigation_enqueued",
     );
     expect(sql).toMatch(
-      /validate_dashboard_data_foreign_keys\(\)[\s\S]*security definer[\s\S]*set search_path = pg_catalog, public/,
+      /validate_dashboard_data_foreign_keys\(\)[\s\S]*security definer[\s\S]*set search_path = pg_catalog, public[\s\S]*set lock_timeout = '10s'/,
     );
     expect(sql).toContain(
       "grant execute on function public.validate_dashboard_data_foreign_keys()",

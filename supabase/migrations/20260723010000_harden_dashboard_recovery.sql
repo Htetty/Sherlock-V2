@@ -358,6 +358,7 @@ returns void
 language plpgsql
 security definer
 set search_path = pg_catalog, public
+set lock_timeout = '10s'
 as $$
 declare
   v_status jsonb;
