@@ -4,7 +4,7 @@
 // the pipeline itself runs in the separate BullMQ worker (backend/worker.ts).
 
 import { Probot } from "probot";
-import { createInvestigationId } from "../backend/services/artifacts.js";
+import { createWebhookInvestigationId } from "../backend/services/artifacts.js";
 import { deliveryCommentMarker } from "../backend/services/delivery.js";
 import { renderQueuedIssueReport } from "../backend/services/issue-report-renderer.js";
 import {
@@ -259,7 +259,10 @@ export const createSherlockApp =
         return;
       }
 
-      const investigationId = createInvestigationId();
+      const investigationId = createWebhookInvestigationId({
+        installationId,
+        triggeringCommentId: comment.id,
+      });
       const tenantId = deriveTenantIdFromInstallation(installationId);
       const repositoryId = toGitHubIdString(context.payload.repository.id);
       const issueId = toGitHubIdString(context.payload.issue.id);

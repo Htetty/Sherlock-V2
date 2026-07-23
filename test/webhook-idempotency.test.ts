@@ -1,6 +1,7 @@
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
 import { describe, expect, test } from "vitest";
+import { createWebhookInvestigationId } from "../backend/services/artifacts.js";
 import {
   INVESTIGATION_JOB_RETENTION,
   WEBHOOK_COMMAND_CLAIM_PREFIX,
@@ -68,6 +69,27 @@ function createQueueMock(addImpl?: () => Promise<void>) {
 }
 
 describe("webhook command Redis claim", () => {
+  test("webhook investigation ids are stable, opaque, and command-scoped", () => {
+    const first = createWebhookInvestigationId({
+      installationId: 2,
+      triggeringCommentId: 4242,
+    });
+    expect(
+      createWebhookInvestigationId({
+        installationId: "2",
+        triggeringCommentId: "4242",
+      }),
+    ).toBe(first);
+    expect(
+      createWebhookInvestigationId({
+        installationId: 2,
+        triggeringCommentId: 4243,
+      }),
+    ).not.toBe(first);
+    expect(first).toMatch(/^inv_[0-9A-F]{20}$/);
+    expect(first).not.toContain("4242");
+  });
+
   test("two concurrent attempts have exactly one winner", async () => {
     const { redis } = createRedisMock();
     const { queue, added } = createQueueMock(async () => Promise.resolve());
