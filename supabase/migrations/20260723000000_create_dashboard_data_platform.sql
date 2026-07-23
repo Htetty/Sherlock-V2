@@ -6,6 +6,12 @@
 -- normalized child tables. Browser roles remain denied: all access flows
 -- through the authenticated backend service.
 
+-- Fail rather than wait indefinitely behind production traffic. Operators
+-- must still use the documented maintenance window and may choose a tighter
+-- session-level timeout before applying this forward-only migration.
+set lock_timeout = '10s';
+set statement_timeout = '30min';
+
 -- --- Canonical investigation identity ----------------------------------------
 
 alter table public.investigation_states
@@ -365,3 +371,6 @@ set
   allowed_mime_types = excluded.allowed_mime_types;
 
 -- Service-role only. No storage.objects policies are intentionally created.
+
+reset lock_timeout;
+reset statement_timeout;

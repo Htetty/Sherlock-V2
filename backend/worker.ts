@@ -86,7 +86,9 @@ const stateStore = productData ?? createInvestigationStateStoreFromEnv();
 // connection: the worker connection is reserved for blocking commands.
 const localDeliveryStore = createFileDeliveryStateStore();
 const deliveryStore = productData
-  ? createProductBackedDeliveryStateStore(localDeliveryStore, productData)
+  ? createProductBackedDeliveryStateStore(localDeliveryStore, productData, {
+      log: (message) => console.error(message),
+    })
   : localDeliveryStore;
 const deliveryQueueConnection = createRedisConnection();
 const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
@@ -94,6 +96,16 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
   ...(productData
     ? {
+        acknowledgeInvestigationEnqueued: (
+          payload: InvestigationJobPayload,
+          queueJobId: string,
+        ) =>
+          productData.markInvestigationEnqueued({
+            installationId: String(payload.installationId),
+            triggeringCommentId: String(payload.triggeringCommentId),
+            investigationId: payload.investigationId,
+            queueJobId,
+          }),
         persistResult: (result) => productData.persistResult(result),
         recordDeliveryAttempt: (
           investigationId,

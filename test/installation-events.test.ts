@@ -342,6 +342,68 @@ describe("lifecycle application", () => {
     });
   });
 
+  test("authoritative repository reconciliation removes stale rows and restores current rows", async () => {
+    const { store, deps } = lifecycleDeps();
+    await applyInstallationCreated(deps, {
+      snapshot: makeSnapshot(),
+      senderGithubUserId: null,
+      repositories: [
+        {
+          repositoryId: "1",
+          ownerLogin: "SherlockHQ",
+          name: "old",
+          fullName: "SherlockHQ/old",
+          private: true,
+        },
+        {
+          repositoryId: "2",
+          ownerLogin: "SherlockHQ",
+          name: "kept",
+          fullName: "SherlockHQ/kept",
+          private: true,
+        },
+      ],
+      eventAt: AT,
+    });
+
+    await store.reconcileInstallationRepositories(
+      "987654321",
+      [
+        {
+          repositoryId: "2",
+          ownerLogin: "SherlockHQ",
+          name: "kept-renamed",
+          fullName: "SherlockHQ/kept-renamed",
+          private: false,
+        },
+        {
+          repositoryId: "3",
+          ownerLogin: "SherlockHQ",
+          name: "new",
+          fullName: "SherlockHQ/new",
+          private: true,
+        },
+      ],
+      LATER,
+    );
+
+    expect(
+      store.snapshotRepositories().sort((left, right) =>
+        left.repositoryId.localeCompare(right.repositoryId),
+      ),
+    ).toMatchObject([
+      { repositoryId: "1", status: "removed", removedAt: LATER },
+      {
+        repositoryId: "2",
+        name: "kept-renamed",
+        private: false,
+        status: "active",
+        removedAt: null,
+      },
+      { repositoryId: "3", status: "active", removedAt: null },
+    ]);
+  });
+
   test("pending claims reconcile on the webhook: match verifies, mismatch rejects", async () => {
     const { store, profiles, deps } = lifecycleDeps();
 

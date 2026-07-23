@@ -50,6 +50,7 @@ import {
 } from "./investigation-queue.js";
 
 export type InvestigationJobLike = {
+  id?: string | number;
   data: InvestigationJobPayload;
   // BullMQ: attempts already fully executed before this one.
   attemptsMade: number;
@@ -98,6 +99,10 @@ export type WorkerDeps = {
     investigationId: string,
     attemptCount: number,
     nextRetryAt: string | null,
+  ) => Promise<void>;
+  acknowledgeInvestigationEnqueued?: (
+    payload: InvestigationJobPayload,
+    queueJobId: string,
   ) => Promise<void>;
   // GitHub delivery: durable state store, delivery-only retry job producer,
   // and the GitHub surfaces the idempotent delivery executor needs. See
@@ -171,6 +176,27 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   /temporarily unavailable/i,
   /service unavailable/i,
 ];
+const PRODUCT_PERSISTENCE_DEADLINE_MS = 15_000;
+
+async function withProductPersistenceDeadline(
+  operation: () => Promise<void>,
+): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Product persistence timed out.")),
+          PRODUCT_PERSISTENCE_DEADLINE_MS,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // Transient infrastructure failures: temporary GitHub 5xx or rate limiting,
 // network/clone blips, temporary external-service failures.
@@ -450,6 +476,22 @@ export async function processInvestigationJob(
   const log = deps.log ?? (() => {});
   let latestStage: InvestigationStage = "queued";
 
+  // Repair the database outbox acknowledgement if the bot enqueued the job
+  // but lost its Supabase acknowledgement. This is best-effort and must never
+  // make investigation execution depend on dashboard persistence.
+  try {
+    const acknowledge = deps.acknowledgeInvestigationEnqueued;
+    if (job.id && acknowledge) {
+      await withProductPersistenceDeadline(() =>
+        acknowledge(payload, String(job.id)),
+      );
+    }
+  } catch (error) {
+    log(
+      `[${payload.investigationId}] Durable enqueue acknowledgement failed in worker; execution will continue: ${safeErrorMessage(error)}`,
+    );
+  }
+
   // Best-effort, non-fatal worker-level state writes. A failing store must
   // never fail the job (which would trigger a spurious retry).
   const recordState = async (event: InvestigationStateEventInput) => {
@@ -663,31 +705,33 @@ export async function processInvestigationJob(
           // Mark execution terminal before doing I/O so an error during this
           // boundary can never trigger a contradictory worker-failure comment.
           pipelineResult = terminalResult;
+          // The existing local delivery ledger is the reliability boundary.
+          // Persist it before attempting any dashboard projection so a slow
+          // or failed Supabase write cannot widen the crash window or suppress
+          // PR/comment recovery.
           try {
-            await deps.persistResult?.(terminalResult);
-            persistedProductResult = true;
             const state = await deliveryStateFor(terminalResult);
             await deps.delivery.store.save(state);
             persistedDeliveryState = state;
           } catch (error) {
             deliveryPersistenceError = error;
           }
+          if (deps.persistResult) {
+            try {
+              await withProductPersistenceDeadline(() =>
+                deps.persistResult!(terminalResult),
+              );
+              persistedProductResult = true;
+            } catch (error) {
+              log(
+                `[${payload.investigationId}] Product result persistence deferred; GitHub delivery will continue from local durable state: ${safeErrorMessage(error)}`,
+              );
+            }
+          }
         },
       },
     );
     pipelineResult = result;
-
-    // Compatibility for injected/legacy pipeline adapters that do not invoke
-    // onTerminalResult. Production persists at the callback above, while the
-    // artifact paths are still guaranteed to exist.
-    if (!persistedProductResult && deps.persistResult) {
-      try {
-        await deps.persistResult(result);
-        persistedProductResult = true;
-      } catch (error) {
-        deliveryPersistenceError = deliveryPersistenceError ?? error;
-      }
-    }
 
     // --- Delivery phase ----------------------------------------------------
     // Execution is terminal. Persist the durable delivery state first, so
@@ -730,6 +774,21 @@ export async function processInvestigationJob(
       throw new UnrecoverableError(
         `[${payload.investigationId}] Durable delivery state could not be persisted: ${message}`,
       );
+    }
+
+    // Compatibility for injected/legacy pipeline adapters that do not invoke
+    // onTerminalResult. The required local delivery ledger is already durable
+    // above; this optional product projection can fail without affecting
+    // GitHub delivery.
+    if (!persistedProductResult && deps.persistResult) {
+      try {
+        await withProductPersistenceDeadline(() => deps.persistResult!(result));
+        persistedProductResult = true;
+      } catch (error) {
+        log(
+          `[${payload.investigationId}] Product result persistence remains deferred; GitHub delivery will continue: ${safeErrorMessage(error)}`,
+        );
+      }
     }
 
     await reportStage("delivering");
@@ -883,12 +942,13 @@ export async function processDeliveryJob(
   const attemptsAllowed = job.opts?.attempts ?? 1;
   const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
   const attemptCount = job.attemptsMade + 1;
-  const nextRetryAt = isFinalAttempt
-    ? null
-    : new Date(
-        Date.now() +
-          DELIVERY_RETRY_BACKOFF_MS * 2 ** Math.max(0, job.attemptsMade),
-      ).toISOString();
+  // BullMQ stops scheduling after its final configured attempt, but durable
+  // recovery continues from Supabase. Keep a due time even on that last
+  // attempt; a successful terminal state clears it in saveDeliveryState().
+  const nextRetryAt = new Date(
+    Date.now() +
+      DELIVERY_RETRY_BACKOFF_MS * 2 ** Math.max(0, job.attemptsMade),
+  ).toISOString();
 
   const recordState = async (event: InvestigationStateEventInput) => {
     try {
@@ -924,12 +984,6 @@ export async function processDeliveryJob(
     );
   }
 
-  await deps.recordDeliveryAttempt?.(
-    payload.investigationId,
-    attemptCount,
-    nextRetryAt,
-  );
-
   // Defensive identity check: the job must only ever act on the repository
   // and issue the persisted state belongs to.
   if (
@@ -941,6 +995,22 @@ export async function processDeliveryJob(
   ) {
     throw new UnrecoverableError(
       `[${payload.investigationId}] Delivery state does not match the job payload; refusing to deliver.`,
+    );
+  }
+
+  try {
+    if (deps.recordDeliveryAttempt) {
+      await withProductPersistenceDeadline(() =>
+        deps.recordDeliveryAttempt!(
+          payload.investigationId,
+          attemptCount,
+          nextRetryAt,
+        ),
+      );
+    }
+  } catch (error) {
+    log(
+      `[${payload.investigationId}] Product delivery-attempt persistence deferred; GitHub delivery will continue from local durable state: ${safeErrorMessage(error)}`,
     );
   }
 

@@ -50,6 +50,7 @@ async function bootCallback(
   options: {
     snapshot?: InstallationSnapshot;
     fetchInstallation?: InstallationCallbackDeps["fetchInstallation"];
+    fetchInstallationRepositories?: InstallationCallbackDeps["fetchInstallationRepositories"];
     sleep?: (ms: number) => Promise<void>;
     env?: NodeJS.ProcessEnv;
   } = {},
@@ -66,6 +67,7 @@ async function bootCallback(
       getProfiles: async () => profiles,
       fetchInstallation:
         options.fetchInstallation ?? (async () => ({ ...snapshot })),
+      fetchInstallationRepositories: options.fetchInstallationRepositories,
       env: options.env ?? ({ SHERLOCK_FRONTEND_URL: FRONTEND } as NodeJS.ProcessEnv),
       sleep: options.sleep ?? (async () => {}),
       webhookWaitAttempts: 2,
@@ -284,6 +286,36 @@ describe("personal-account ownership", () => {
       },
     ]);
     expect(harness.store.snapshotNonces()[0].claimStatus).toBe("verified");
+  });
+
+  test("a verified callback reconciles the authoritative repository selection", async () => {
+    const harness = await bootCallback({
+      snapshot: makeSnapshot({
+        accountType: "User",
+        accountId: "123456789",
+      }),
+      fetchInstallationRepositories: async () => [
+        {
+          repositoryId: "88",
+          ownerLogin: "octo-dev",
+          name: "dashboard",
+          fullName: "octo-dev/dashboard",
+          private: true,
+        },
+      ],
+    });
+    await seedProfileAndNonce(harness, "123456789");
+
+    const { location } = await invoke(harness.baseUrl, VALID_PARAMS);
+
+    expect(location).toBe(SUCCESS);
+    expect(harness.store.snapshotRepositories()).toMatchObject([
+      {
+        installationId: "987654321",
+        repositoryId: "88",
+        status: "active",
+      },
+    ]);
   });
 
   test("account id mismatch → rejected, no membership", async () => {

@@ -110,6 +110,27 @@ export async function enqueueDeliveryJob(
   });
 }
 
+export async function enqueueInvestigationJob(
+  queue: Pick<Queue, "add">,
+  payload: InvestigationJobPayload,
+): Promise<string> {
+  const jobId = buildInvestigationJobId(payload);
+  const job = await queue.add(INVESTIGATION_JOB_NAME, payload, { jobId });
+  // A database-pending command can outlive a retained BullMQ job that already
+  // exhausted its retries before the enqueue acknowledgement committed. Queue
+  // add is idempotent by job id, but it does not revive a failed retained job;
+  // explicitly retry that state so durable recovery cannot falsely acknowledge
+  // a command that will never run. Completed jobs are deliberately untouched.
+  if (
+    job &&
+    typeof job.getState === "function" &&
+    (await job.getState()) === "failed"
+  ) {
+    await job.retry("failed");
+  }
+  return jobId;
+}
+
 // Deterministic, non-secret tenant identity for future B2B SaaS plans.
 // Deliberately the single indirection point for tenancy: when Sherlock gains
 // database-backed organizations, replace this lookup (installation ->
@@ -173,7 +194,24 @@ export type InvestigationQueueAdapter = {
         | "allow"
         | "duplicate"
         | "rate_limited"
-        | Promise<boolean | "allow" | "duplicate" | "rate_limited">;
+        | {
+            decision: "allow";
+            payload: InvestigationJobPayload;
+          }
+        | Promise<
+            | boolean
+            | "allow"
+            | "duplicate"
+            | "rate_limited"
+            | {
+                decision: "allow";
+                payload: InvestigationJobPayload;
+              }
+          >;
+      onEnqueued?: (
+        jobId: string,
+        payload: InvestigationJobPayload,
+      ) => void | Promise<void>;
     },
   ) => Promise<{ jobId: string; deduplicated: boolean; rateLimited: boolean }>;
   close: () => Promise<void>;
@@ -230,6 +268,7 @@ export function createInvestigationQueueAdapter(
         );
 
       try {
+        let queuedPayload = payload;
         if (options?.onClaim) {
           const decision = await options.onClaim();
           if (decision === "duplicate") {
@@ -240,10 +279,23 @@ export function createInvestigationQueueAdapter(
             await releaseClaim();
             return { jobId, deduplicated: false, rateLimited: true };
           }
+          if (
+            decision &&
+            typeof decision === "object" &&
+            decision.decision === "allow"
+          ) {
+            queuedPayload = decision.payload;
+          }
         }
 
         // BullMQ's deterministic job id remains a second safety layer.
-        await queue.add(INVESTIGATION_JOB_NAME, payload, { jobId });
+        const queuedJobId = await enqueueInvestigationJob(queue, queuedPayload);
+        if (queuedJobId !== jobId) {
+          throw new Error(
+            "Durable investigation payload identity did not match the webhook command.",
+          );
+        }
+        await options?.onEnqueued?.(queuedJobId, queuedPayload);
         return { jobId, deduplicated: false, rateLimited: false };
       } catch (error) {
         await releaseClaim();

@@ -7,6 +7,7 @@ import {
   WEBHOOK_COMMAND_CLAIM_TTL_SECONDS,
   buildInvestigationJobId,
   createInvestigationQueueAdapter,
+  enqueueInvestigationJob,
   type InvestigationJobPayload,
 } from "../backend/queue/investigation-queue.js";
 
@@ -57,7 +58,9 @@ function createQueueMock(addImpl?: () => Promise<void>) {
   const queue = {
     add: async (_name: string, data: InvestigationJobPayload, options: { jobId: string }) => {
       await addImpl?.();
-      added.push({ data, jobId: options.jobId });
+      if (!added.some((entry) => entry.jobId === options.jobId)) {
+        added.push({ data, jobId: options.jobId });
+      }
     },
     close: async () => {},
   };
@@ -156,5 +159,71 @@ describe("webhook command Redis claim", () => {
       rateLimited: false,
     });
     expect(attempts).toBe(2);
+  });
+
+  test("a pending command revives a retained failed investigation job", async () => {
+    let retried = 0;
+    const queue = {
+      add: async () =>
+        ({
+          getState: async () => "failed",
+          retry: async (state: string) => {
+            expect(state).toBe("failed");
+            retried += 1;
+          },
+        }) as never,
+    } as unknown as Pick<Queue, "add">;
+
+    await expect(enqueueInvestigationJob(queue, payload)).resolves.toBe(
+      buildInvestigationJobId(payload),
+    );
+    expect(retried).toBe(1);
+  });
+
+  test("a durable pending claim resumes the original payload after acknowledgement failure", async () => {
+    const { redis, values } = createRedisMock();
+    const { queue, added } = createQueueMock();
+    const adapter = createInvestigationQueueAdapter(redis, queue);
+    const original = { ...payload, investigationId: "inv_ORIGINAL12345" };
+    let acknowledged = false;
+    let acknowledgementAttempts = 0;
+    const options = {
+      onClaim: async () =>
+        acknowledged
+          ? "duplicate" as const
+          : { decision: "allow" as const, payload: original },
+      onEnqueued: async () => {
+        acknowledgementAttempts += 1;
+        if (acknowledgementAttempts === 1) {
+          throw new Error("Supabase acknowledgement unavailable");
+        }
+        acknowledged = true;
+      },
+    };
+
+    await expect(adapter.add(payload, options)).rejects.toThrow(
+      "Supabase acknowledgement unavailable",
+    );
+    expect(values.size).toBe(0);
+
+    await expect(adapter.add(payload, options)).resolves.toMatchObject({
+      deduplicated: false,
+      rateLimited: false,
+    });
+    expect(added).toEqual([
+      {
+        data: original,
+        jobId: buildInvestigationJobId(payload),
+      },
+    ]);
+    expect(acknowledged).toBe(true);
+
+    // Once acknowledged permanently, even a fresh Redis claim cannot enqueue.
+    values.clear();
+    await expect(adapter.add(payload, options)).resolves.toMatchObject({
+      deduplicated: true,
+      rateLimited: false,
+    });
+    expect(added).toHaveLength(1);
   });
 });

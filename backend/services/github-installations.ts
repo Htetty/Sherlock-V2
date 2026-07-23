@@ -129,6 +129,11 @@ export interface InstallationDataStore {
     repositories: RepositorySnapshot[],
     eventAt: string,
   ): Promise<void>;
+  reconcileInstallationRepositories(
+    installationId: string,
+    repositories: RepositorySnapshot[],
+    eventAt: string,
+  ): Promise<void>;
   markInstallationRepositoriesRemoved(
     installationId: string,
     repositoryIds: string[],
@@ -496,6 +501,20 @@ export function createInMemoryInstallationDataStore(): InstallationDataStore & {
       }
       void eventAt;
     },
+    async reconcileInstallationRepositories(installationId, repos, eventAt) {
+      const activeIds = new Set(repos.map((repo) => repo.repositoryId));
+      for (const repository of repositories.values()) {
+        if (
+          repository.installationId === installationId &&
+          repository.status === "active" &&
+          !activeIds.has(repository.repositoryId)
+        ) {
+          repository.status = "removed";
+          repository.removedAt = eventAt;
+        }
+      }
+      await this.upsertInstallationRepositories(installationId, repos, eventAt);
+    },
     async markInstallationRepositoriesRemoved(installationId, repositoryIds, eventAt) {
       for (const repositoryId of repositoryIds) {
         const existing = repositories.get(repoKey(installationId, repositoryId));
@@ -813,6 +832,7 @@ export function createSupabaseInstallationDataStore(
     },
 
     async upsertInstallationRepositories(installationId, repositories, eventAt) {
+      if (repositories.length === 0) return;
       const now = new Date().toISOString();
       const result = await supabase.from("installation_repositories").upsert(
         repositories.map((repo) => ({
@@ -830,6 +850,29 @@ export function createSupabaseInstallationDataStore(
       );
       assertNoError(result, "Repository upsert");
       void eventAt;
+    },
+
+    async reconcileInstallationRepositories(installationId, repositories, eventAt) {
+      await this.upsertInstallationRepositories(
+        installationId,
+        repositories,
+        eventAt,
+      );
+      const active = await supabase
+        .from("installation_repositories")
+        .select("repository_id")
+        .eq("installation_id", installationId)
+        .eq("status", "active");
+      assertNoError(active, "Repository reconciliation read");
+      const currentIds = new Set(repositories.map((repo) => repo.repositoryId));
+      const removedIds = ((active.data ?? []) as Array<{ repository_id: string }>)
+        .map((row) => row.repository_id)
+        .filter((repositoryId) => !currentIds.has(repositoryId));
+      await this.markInstallationRepositoriesRemoved(
+        installationId,
+        removedIds,
+        eventAt,
+      );
     },
 
     async markInstallationRepositoriesRemoved(installationId, repositoryIds, eventAt) {

@@ -33,8 +33,10 @@ import type { InstallationLifecycleDeps } from "../backend/services/github-insta
 import {
   createProductDataStoreFromEnv,
   type ProductDataStore,
+  type ProductInvestigationClaim,
 } from "../backend/services/product-data.js";
 import { toGitHubIdString } from "../backend/services/github-installations.js";
+import { redactSecrets } from "../backend/services/report.js";
 
 const UNAUTHORIZED_COMMENT =
   "Sherlock investigations can only be started by users with write access or higher on this repository.";
@@ -44,6 +46,27 @@ const PERMISSION_CHECK_FAILED_COMMENT =
 
 const RATE_LIMITED_COMMENT =
   "Sherlock has received too many investigation requests for this installation. Please try again later.";
+const DASHBOARD_CLAIM_DEADLINE_MS = 5_000;
+
+async function withDashboardClaimDeadline<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Dashboard command persistence timed out.")),
+          DASHBOARD_CLAIM_DEADLINE_MS,
+        );
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // Minimal octokit surface the gate needs; keeps the permission lookup
 // injectable for tests.
@@ -267,43 +290,141 @@ export const createSherlockApp =
       // The queue atomically claims this command before invoking onClaim.
       // Thus only an authorized claim winner (never a deduplicated
       // redelivery) consumes a rate-limit slot.
+      let durableEnqueue:
+        | {
+            productData: ProductDataStore;
+            installationId: string;
+            triggeringCommentId: string;
+            investigationId: string;
+          }
+        | null = null;
+      let effectiveInvestigationId = investigationId;
       const { jobId, deduplicated, rateLimited } = await getQueue().add(jobPayload, {
         onClaim: async () => {
+          let productData: ProductDataStore | null = null;
+          try {
+            productData = await getProductData();
+          } catch (error) {
+            console.error(
+              `Dashboard persistence unavailable before command claim; the existing queue path will continue: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+            );
+          }
+          if (
+            productData &&
+            (!repositoryId || !issueId || !triggeringCommentId || !actorId)
+          ) {
+            console.error(
+              "GitHub returned an invalid numeric identity; continuing through the existing queue path without a dashboard projection.",
+            );
+            productData = null;
+          }
+
+          // A durable claim that previously survived a queue/ack failure must
+          // be resumed without consuming (or being rejected by) a second
+          // rate-limit slot. New commands still pass the rate limiter before
+          // they create any durable command row.
+          if (productData) {
+            const currentProductData = productData;
+            let existing: ProductInvestigationClaim | null = null;
+            try {
+              existing = await withDashboardClaimDeadline(() =>
+                currentProductData.findInvestigationCommand({
+                  installationId: String(installationId),
+                  triggeringCommentId: triggeringCommentId!,
+                }),
+              );
+            } catch (error) {
+              console.error(
+                `Dashboard command lookup unavailable; the existing queue path will continue: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+              );
+              productData = null;
+            }
+            if (existing) {
+              if (!existing.shouldEnqueue) return "duplicate";
+              if (!existing.jobPayload) {
+                throw new Error(
+                  "A pending durable investigation command returned no queue payload.",
+                );
+              }
+              durableEnqueue = {
+                productData: currentProductData,
+                installationId: String(installationId),
+                triggeringCommentId: triggeringCommentId!,
+                investigationId: existing.investigationId,
+              };
+              effectiveInvestigationId = existing.investigationId;
+              return { decision: "allow", payload: existing.jobPayload };
+            }
+          }
+
           const decision =
             await getRateLimiter().checkAndConsumeInvestigationRateLimit(tenantId);
-
           if (!decision.allowed) return "rate_limited";
-
-          const productData = await getProductData();
           if (!productData) return "allow";
-
           if (!repositoryId || !issueId || !triggeringCommentId || !actorId) {
             throw new Error(
               "GitHub returned an invalid numeric identity; durable investigation creation was refused.",
             );
           }
 
-          const claim = await productData.createInvestigation({
-            investigationId,
-            tenantId,
-            installationId: String(installationId),
-            repositoryId,
-            repositoryOwner: owner,
-            repositoryName: repo,
-            repositoryFullName: context.payload.repository.full_name,
-            repositoryPrivate: context.payload.repository.private,
-            githubIssueId: issueId,
-            issueNumber: context.payload.issue.number,
-            issueTitle: context.payload.issue.title,
-            issueUrl: context.payload.issue.html_url,
-            triggeringCommentId,
-            triggeredBy: username,
-            triggeredByGithubUserId: actorId,
-            sourceRef: context.payload.repository.default_branch ?? null,
-            createdAt: new Date().toISOString(),
-          });
+          let claim;
+          try {
+            claim = await withDashboardClaimDeadline(() =>
+              productData.createInvestigation({
+                investigationId,
+                tenantId,
+                installationId: String(installationId),
+                repositoryId,
+                repositoryOwner: owner,
+                repositoryName: repo,
+                repositoryFullName: context.payload.repository.full_name,
+                repositoryPrivate: context.payload.repository.private,
+                githubIssueId: issueId,
+                issueNumber: context.payload.issue.number,
+                issueTitle: context.payload.issue.title,
+                issueUrl: context.payload.issue.html_url,
+                triggeringCommentId,
+                triggeredBy: username,
+                triggeredByGithubUserId: actorId,
+                sourceRef: context.payload.repository.default_branch ?? null,
+                createdAt: new Date().toISOString(),
+                jobPayload,
+              }),
+            );
+          } catch (error) {
+            console.error(
+              `Dashboard command creation unavailable; the existing queue path will continue: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+            );
+            return "allow";
+          }
 
-          return claim.created ? "allow" : "duplicate";
+          if (!claim.shouldEnqueue) return "duplicate";
+          if (!claim.jobPayload) {
+            throw new Error(
+              "A pending durable investigation command returned no queue payload.",
+            );
+          }
+
+          durableEnqueue = {
+            productData,
+            installationId: String(installationId),
+            triggeringCommentId,
+            investigationId: claim.investigationId,
+          };
+          effectiveInvestigationId = claim.investigationId;
+          return { decision: "allow", payload: claim.jobPayload };
+        },
+        onEnqueued: async (queuedJobId) => {
+          const enqueue = durableEnqueue;
+          if (!enqueue) return;
+          await withDashboardClaimDeadline(() =>
+            enqueue.productData.markInvestigationEnqueued({
+              installationId: enqueue.installationId,
+              triggeringCommentId: enqueue.triggeringCommentId,
+              investigationId: enqueue.investigationId,
+              queueJobId: queuedJobId,
+            }),
+          );
         },
       });
 
@@ -325,7 +446,7 @@ export const createSherlockApp =
       }
 
       console.log(
-        `[${investigationId}] Queued investigation job ${jobId}.`,
+        `[${effectiveInvestigationId}] Queued investigation job ${jobId}.`,
       );
 
       // The visible queued text carries no investigation id; the id lives
@@ -334,7 +455,7 @@ export const createSherlockApp =
       await postComment(
         [
           renderQueuedIssueReport(),
-          deliveryCommentMarker(investigationId),
+          deliveryCommentMarker(effectiveInvestigationId),
         ].join("\n\n"),
       );
     });

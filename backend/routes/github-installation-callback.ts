@@ -228,7 +228,7 @@ export function createInstallationCallbackRouter(
           try {
             const repositories =
               await deps.fetchInstallationRepositories(installationId);
-            await store.upsertInstallationRepositories(
+            await store.reconcileInstallationRepositories(
               installationId,
               repositories,
               now().toISOString(),

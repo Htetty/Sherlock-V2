@@ -75,6 +75,7 @@ function createFakeQueue() {
   const adapter: InvestigationQueueAdapter = {
     add: async (payload, options) => {
       const jobId = buildInvestigationJobId(payload);
+      let queuedPayload = payload;
 
       if (claims.has(jobId)) {
         return { jobId, deduplicated: true, rateLimited: false };
@@ -92,10 +93,23 @@ function createFakeQueue() {
           claims.delete(jobId);
           return { jobId, deduplicated: false, rateLimited: true };
         }
+        if (
+          decision &&
+          typeof decision === "object" &&
+          decision.decision === "allow"
+        ) {
+          queuedPayload = decision.payload;
+        }
       }
 
-      jobs.set(jobId, payload);
-      return { jobId, deduplicated: false, rateLimited: false };
+      try {
+        jobs.set(jobId, queuedPayload);
+        await options?.onEnqueued?.(jobId, queuedPayload);
+        return { jobId, deduplicated: false, rateLimited: false };
+      } catch (error) {
+        claims.delete(jobId);
+        throw error;
+      }
     },
     close: async () => {},
   };
@@ -200,6 +214,110 @@ describe("Sherlock webhook (queued investigations)", () => {
     // another comment, the single nock mock above would reject it.
     await probot.receive({
       id: "delivery-2",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("a pending durable command bypasses a second rate-limit decision after enqueue acknowledgement fails", async () => {
+    const mock = mockGithub(1);
+    const durableStore = createInMemoryProductDataStore();
+    let acknowledgementAttempts = 0;
+    let rateLimitSlots = 0;
+    const recoveryProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    recoveryProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: {
+          checkAndConsumeInvestigationRateLimit: async (tenantKey) => {
+            rateLimitSlots += 1;
+            return {
+              allowed: rateLimitSlots === 1,
+              tenantKey,
+              count: rateLimitSlots,
+              limit: 1,
+              windowSeconds: 3600,
+            };
+          },
+        },
+        productData: {
+          ...durableStore,
+          markInvestigationEnqueued: async (input) => {
+            acknowledgementAttempts += 1;
+            if (acknowledgementAttempts === 1) {
+              throw new Error("Supabase acknowledgement unavailable");
+            }
+            await durableStore.markInvestigationEnqueued(input);
+          },
+        },
+      }),
+    );
+
+    await expect(
+      recoveryProbot.receive({
+        id: "delivery-ack-failed",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+    ).rejects.toThrow("Supabase acknowledgement unavailable");
+
+    await recoveryProbot.receive({
+      id: "delivery-redelivery",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    await recoveryProbot.receive({
+      id: "delivery-permanent-duplicate",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(rateLimitSlots).toBe(1);
+    expect(acknowledgementAttempts).toBe(2);
+    expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("dashboard persistence unavailability cannot suppress the existing queue path", async () => {
+    const mock = mockGithub(1);
+    const unavailableProduct = createInMemoryProductDataStore();
+    const compatibilityProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    compatibilityProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: allowAllRateLimiter(),
+        productData: {
+          ...unavailableProduct,
+          findInvestigationCommand: async () => {
+            throw new Error("Supabase unavailable");
+          },
+        },
+      }),
+    );
+
+    await compatibilityProbot.receive({
+      id: "delivery-product-unavailable",
       name: "issue_comment",
       payload: buildWebhookPayload(4242) as any,
     });

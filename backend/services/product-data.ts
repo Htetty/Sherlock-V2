@@ -20,6 +20,10 @@ import {
   getSupabaseServiceRoleClient,
   missingSupabaseServiceEnv,
 } from "./supabase-clients.js";
+import type {
+  DeliveryJobPayload,
+  InvestigationJobPayload,
+} from "../queue/investigation-queue.js";
 
 export const PRIVATE_ARTIFACT_BUCKET = "sherlock-artifacts";
 const RESULT_RETENTION_DAYS = 90;
@@ -45,16 +49,44 @@ export type ProductInvestigationCreateInput = {
   triggeredByGithubUserId: string;
   sourceRef: string | null;
   createdAt: string;
+  jobPayload: InvestigationJobPayload;
 };
 
-export type ProductInvestigationClaim =
-  | { created: true; investigationId: string }
-  | { created: false; investigationId: string };
+export type ProductInvestigationClaim = {
+  created: boolean;
+  investigationId: string;
+  shouldEnqueue: boolean;
+  jobPayload: InvestigationJobPayload | null;
+};
+
+export type PendingInvestigationEnqueue = {
+  installationId: string;
+  triggeringCommentId: string;
+  investigationId: string;
+  jobPayload: InvestigationJobPayload;
+};
 
 export interface ProductDataStore extends InvestigationStateStore {
+  findInvestigationCommand(input: {
+    installationId: string;
+    triggeringCommentId: string;
+  }): Promise<ProductInvestigationClaim | null>;
   createInvestigation(
     input: ProductInvestigationCreateInput,
   ): Promise<ProductInvestigationClaim>;
+  markInvestigationEnqueued(input: {
+    installationId: string;
+    triggeringCommentId: string;
+    investigationId: string;
+    queueJobId: string;
+  }): Promise<void>;
+  listPendingInvestigationEnqueues(
+    limit?: number,
+  ): Promise<PendingInvestigationEnqueue[]>;
+  listPendingDeliveryRecoveries(
+    now?: Date,
+    limit?: number,
+  ): Promise<DeliveryJobPayload[]>;
   persistResult(result: InvestigationPipelineResult): Promise<void>;
   saveDeliveryState(state: DeliveryState): Promise<void>;
   loadDeliveryState(investigationId: string): Promise<DeliveryState | null>;
@@ -525,6 +557,34 @@ export function createSupabaseProductDataStore(
   ) => `${internalId}/delivery/${kind}/${sha256}.json`;
 
   return {
+    async findInvestigationCommand(input) {
+      const { data, error } = await supabase
+        .from("investigation_commands")
+        .select("investigation_id,queue_status,job_payload")
+        .eq("installation_id", input.installationId)
+        .eq("triggering_comment_id", input.triggeringCommentId)
+        .maybeSingle();
+      if (error) {
+        throw new Error(`Investigation command read failed: ${error.message}`);
+      }
+      if (!data) return null;
+      const shouldEnqueue = data.queue_status === "pending";
+      if (
+        shouldEnqueue &&
+        (!data.job_payload || typeof data.job_payload !== "object")
+      ) {
+        throw new Error("Pending investigation command has no valid job payload.");
+      }
+      return {
+        created: false,
+        investigationId: String(data.investigation_id),
+        shouldEnqueue,
+        jobPayload: shouldEnqueue
+          ? (data.job_payload as InvestigationJobPayload)
+          : null,
+      };
+    },
+
     async createInvestigation(input) {
       const createdEvent: InvestigationStateEvent = {
         type: "created",
@@ -541,69 +601,140 @@ export function createSupabaseProductDataStore(
         triggeredBy: input.triggeredBy,
       };
       const record = applyEvent(null, createdEvent);
-
-      const repositoryWrite = await supabase
-        .from("installation_repositories")
-        .upsert(
-          {
-            installation_id: input.installationId,
+      const persistedState = {
+        ...stateRow(record),
+        repository_id: input.repositoryId,
+        github_issue_id: input.githubIssueId,
+        triggering_comment_id: input.triggeringCommentId,
+        triggered_by_github_user_id: input.triggeredByGithubUserId,
+        issue_title: safeText(input.issueTitle),
+        issue_url: input.issueUrl,
+        source_commit_sha: input.sourceRef,
+      };
+      const { data, error } = await supabase.rpc(
+        "claim_dashboard_investigation",
+        {
+          p_installation_id: input.installationId,
+          p_triggering_comment_id: input.triggeringCommentId,
+          p_investigation_id: input.investigationId,
+          // This is the exact existing BullMQ payload, persisted only while
+          // the outbox is pending. Do not truncate issue/comment text: doing
+          // so would change investigation behavior after an enqueue retry.
+          p_job_payload: input.jobPayload,
+          p_repository: {
             repository_id: input.repositoryId,
             owner_login: input.repositoryOwner,
             name: input.repositoryName,
             full_name: input.repositoryFullName,
             private: input.repositoryPrivate,
-            status: "active",
-            removed_at: null,
           },
-          { onConflict: "installation_id,repository_id" },
-        );
-      if (repositoryWrite.error) {
-        throw new Error(
-          `Investigation repository snapshot failed: ${repositoryWrite.error.message}`,
-        );
+          p_state: {
+            ...persistedState,
+            record: sanitizeJson(persistedState.record),
+          },
+          p_event: {
+            occurred_at: createdEvent.at,
+            details: sanitizeJson(createdEvent),
+          },
+        },
+      );
+      if (error) {
+        throw new Error(`Investigation command claim failed: ${error.message}`);
       }
 
-      const { data, error } = await supabase
-        .from("investigation_states")
-        .insert({
-          ...stateRow(record),
-          repository_id: input.repositoryId,
-          github_issue_id: input.githubIssueId,
-          triggering_comment_id: input.triggeringCommentId,
-          triggered_by_github_user_id: input.triggeredByGithubUserId,
-          issue_title: safeText(input.issueTitle),
-          issue_url: input.issueUrl,
-          source_commit_sha: input.sourceRef,
-        })
-        .select("id, investigation_id, record")
-        .single();
+      const claim = data as {
+        created?: unknown;
+        investigation_id?: unknown;
+        should_enqueue?: unknown;
+        job_payload?: unknown;
+      } | null;
+      if (
+        !claim ||
+        typeof claim.created !== "boolean" ||
+        typeof claim.investigation_id !== "string" ||
+        typeof claim.should_enqueue !== "boolean"
+      ) {
+        throw new Error("Investigation command claim returned an invalid result.");
+      }
 
+      return {
+        created: claim.created,
+        investigationId: claim.investigation_id,
+        shouldEnqueue: claim.should_enqueue,
+        jobPayload: claim.should_enqueue
+          ? (claim.job_payload as InvestigationJobPayload)
+          : null,
+      };
+    },
+
+    async markInvestigationEnqueued(input) {
+      const { data, error } = await supabase.rpc(
+        "mark_dashboard_investigation_enqueued",
+        {
+          p_installation_id: input.installationId,
+          p_triggering_comment_id: input.triggeringCommentId,
+          p_investigation_id: input.investigationId,
+          p_queue_job_id: input.queueJobId,
+        },
+      );
       if (error) {
-        if (!isUniqueViolation(error)) {
-          throw new Error(`Investigation creation failed: ${error.message}`);
-        }
-        const existing = await supabase
-          .from("investigation_states")
-          .select("investigation_id")
-          .eq("installation_id", input.installationId)
-          .eq("triggering_comment_id", input.triggeringCommentId)
-          .maybeSingle();
-        if (existing.error || !existing.data) {
-          throw new Error(
-            `Investigation duplicate resolution failed: ${
-              existing.error?.message ?? "existing row was not found"
-            }`,
-          );
+        throw new Error(`Investigation enqueue acknowledgement failed: ${error.message}`);
+      }
+      if (data !== true) {
+        throw new Error("Investigation enqueue acknowledgement matched no command.");
+      }
+    },
+
+    async listPendingInvestigationEnqueues(limit = 100) {
+      const boundedLimit = Math.max(1, Math.min(1_000, Math.trunc(limit)));
+      const { data, error } = await supabase
+        .from("investigation_commands")
+        .select(
+          "installation_id,triggering_comment_id,investigation_id,job_payload",
+        )
+        .eq("queue_status", "pending")
+        .order("created_at", { ascending: true })
+        .limit(boundedLimit);
+      if (error) {
+        throw new Error(`Pending investigation enqueue read failed: ${error.message}`);
+      }
+      return (data ?? []).map((row) => {
+        if (!row.job_payload || typeof row.job_payload !== "object") {
+          throw new Error("Pending investigation enqueue has no valid job payload.");
         }
         return {
-          created: false,
-          investigationId: String(existing.data.investigation_id),
+          installationId: String(row.installation_id),
+          triggeringCommentId: String(row.triggering_comment_id),
+          investigationId: String(row.investigation_id),
+          jobPayload: row.job_payload as InvestigationJobPayload,
         };
-      }
+      });
+    },
 
-      const row = data as InvestigationRow;
-      await appendEvent(row, createdEvent);
-      return { created: true, investigationId: input.investigationId };
+    async listPendingDeliveryRecoveries(now = new Date(), limit = 100) {
+      const boundedLimit = Math.max(1, Math.min(1_000, Math.trunc(limit)));
+      const { data, error } = await supabase
+        .from("investigation_deliveries")
+        .select("state")
+        .not("state", "is", null)
+        .not("next_retry_at", "is", null)
+        .lte("next_retry_at", now.toISOString())
+        .order("next_retry_at", { ascending: true })
+        .limit(boundedLimit);
+      if (error) {
+        throw new Error(`Pending delivery recovery read failed: ${error.message}`);
+      }
+      return (data ?? []).map((row) => {
+        const state = row.state as DeliveryState;
+        return {
+          investigationId: state.investigationId,
+          tenantId: state.tenantId,
+          installationId: state.installationId,
+          repositoryOwner: state.repoOwner,
+          repositoryName: state.repoName,
+          issueNumber: state.issueNumber,
+        };
+      });
     },
 
     async record(event) {
@@ -783,7 +914,7 @@ export function createSupabaseProductDataStore(
       if (!row) throw new Error("Cannot persist delivery for unknown investigation.");
       const existingDelivery = await supabase
         .from("investigation_deliveries")
-        .select("pr_title")
+        .select("pr_title,next_retry_at")
         .eq("investigation_id", row.id)
         .maybeSingle();
       if (existingDelivery.error) {
@@ -799,6 +930,9 @@ export function createSupabaseProductDataStore(
         "terminal",
         state.terminalPayload.sha256,
       );
+      const deliveryTerminal =
+        state.pullRequest.status !== "pending" &&
+        state.terminalComment.status !== "pending";
       const { error } = await supabase.from("investigation_deliveries").upsert({
         investigation_id: row.id,
         execution_outcome: state.executionOutcome,
@@ -833,6 +967,9 @@ export function createSupabaseProductDataStore(
         terminal_reason: state.terminalComment.reason,
         state: sanitizeJson(state),
         terminal_failure: null,
+        next_retry_at: deliveryTerminal
+          ? null
+          : existingDelivery.data?.next_retry_at ?? new Date().toISOString(),
       });
       if (error) throw new Error(`Delivery state write failed: ${error.message}`);
     },
@@ -1131,7 +1268,16 @@ export function createInMemoryProductDataStore(): ProductDataStore & {
   };
 } {
   const investigations = new Map<string, InvestigationStateRecord>();
-  const triggerClaims = new Map<string, string>();
+  const triggerClaims = new Map<
+    string,
+    {
+      installationId: string;
+      triggeringCommentId: string;
+      investigationId: string;
+      jobPayload: InvestigationJobPayload | null;
+      enqueued: boolean;
+    }
+  >();
   const events: InvestigationStateEvent[] = [];
   const results = new Map<string, InvestigationPipelineResult>();
   const deliveries = new Map<string, DeliveryState>();
@@ -1147,11 +1293,40 @@ export function createInMemoryProductDataStore(): ProductDataStore & {
   };
 
   return {
+    async findInvestigationCommand(input) {
+      const command = triggerClaims.get(
+        `${input.installationId}:${input.triggeringCommentId}`,
+      );
+      if (!command) return null;
+      return {
+        created: false,
+        investigationId: command.investigationId,
+        shouldEnqueue: !command.enqueued,
+        jobPayload: command.jobPayload
+          ? structuredClone(command.jobPayload)
+          : null,
+      };
+    },
     async createInvestigation(input) {
       const key = `${input.installationId}:${input.triggeringCommentId}`;
       const existing = triggerClaims.get(key);
-      if (existing) return { created: false, investigationId: existing };
-      triggerClaims.set(key, input.investigationId);
+      if (existing) {
+        return {
+          created: false,
+          investigationId: existing.investigationId,
+          shouldEnqueue: !existing.enqueued,
+          jobPayload: existing.jobPayload
+            ? structuredClone(existing.jobPayload)
+            : null,
+        };
+      }
+      triggerClaims.set(key, {
+        installationId: input.installationId,
+        triggeringCommentId: input.triggeringCommentId,
+        investigationId: input.investigationId,
+        jobPayload: structuredClone(input.jobPayload),
+        enqueued: false,
+      });
       await record({
         type: "created",
         investigationId: input.investigationId,
@@ -1166,7 +1341,38 @@ export function createInMemoryProductDataStore(): ProductDataStore & {
         issueUrl: input.issueUrl,
         triggeredBy: input.triggeredBy,
       });
-      return { created: true, investigationId: input.investigationId };
+      return {
+        created: true,
+        investigationId: input.investigationId,
+        shouldEnqueue: true,
+        jobPayload: structuredClone(input.jobPayload),
+      };
+    },
+    async markInvestigationEnqueued(input) {
+      const key = `${input.installationId}:${input.triggeringCommentId}`;
+      const command = triggerClaims.get(key);
+      if (!command || command.investigationId !== input.investigationId) {
+        throw new Error("Investigation enqueue acknowledgement matched no command.");
+      }
+      command.enqueued = true;
+      command.jobPayload = null;
+    },
+    async listPendingInvestigationEnqueues() {
+      return [...triggerClaims.values()]
+        .filter(
+          (command): command is typeof command & {
+            jobPayload: InvestigationJobPayload;
+          } => !command.enqueued && command.jobPayload !== null,
+        )
+        .map((command) => ({
+          installationId: command.installationId,
+          triggeringCommentId: command.triggeringCommentId,
+          investigationId: command.investigationId,
+          jobPayload: structuredClone(command.jobPayload),
+        }));
+    },
+    async listPendingDeliveryRecoveries() {
+      return [];
     },
     record,
     async get(investigationId) {
@@ -1256,7 +1462,53 @@ export function createInMemoryProductDataStore(): ProductDataStore & {
 export function createProductBackedDeliveryStateStore(
   local: DeliveryStateStore,
   product: ProductDataStore,
+  options: { log?: (message: string) => void } = {},
 ): DeliveryStateStore {
+  const log = options.log ?? (() => {});
+  let replicationChain = Promise.resolve();
+  const deferProductReplication = (
+    investigationId: string,
+    description: string,
+    operation: () => Promise<void>,
+  ) => {
+    // Product persistence is a projection of the existing local delivery
+    // ledger. Never put Supabase on the critical path to GitHub delivery: a
+    // slow or unavailable product database must not delay or suppress a PR
+    // or terminal comment. A later save/load (or durable recovery run) retries
+    // the projection from the authoritative local payloads.
+    replicationChain = replicationChain
+      .then(operation)
+      .catch((error) => {
+        log(
+          `[${investigationId}] Product ${description} deferred; local delivery remains authoritative: ${safeText(error instanceof Error ? error.message : String(error))}`,
+        );
+      });
+  };
+  const replicateState = async (state: DeliveryState) => {
+    if (state.retryPlan) {
+      const payload = await local.loadPayload(
+        state.investigationId,
+        state.retryPlan.payload,
+      );
+      await product.persistDeliveryPayload(
+        state.investigationId,
+        "retry",
+        state.retryPlan.payload,
+        payload,
+      );
+    }
+    const terminalPayload = await local.loadPayload(
+      state.investigationId,
+      state.terminalPayload,
+    );
+    await product.persistDeliveryPayload(
+      state.investigationId,
+      "terminal",
+      state.terminalPayload,
+      terminalPayload,
+    );
+    await product.saveDeliveryState(state);
+  };
   const persistPayloadTracked = async (
     investigationId: string,
     kind: "retry" | "terminal",
@@ -1267,11 +1519,13 @@ export function createProductBackedDeliveryStateStore(
       kind,
       payload,
     );
-    await product.persistDeliveryPayload(
-      investigationId,
-      kind,
-      tracked.reference,
-      payload,
+    deferProductReplication(investigationId, "delivery-payload replication", () =>
+      product.persistDeliveryPayload(
+        investigationId,
+        kind,
+        tracked.reference,
+        payload,
+      ),
     );
     return tracked;
   };
@@ -1279,21 +1533,47 @@ export function createProductBackedDeliveryStateStore(
   return {
     async load(investigationId) {
       const localState = await local.load(investigationId);
-      return localState ?? product.loadDeliveryState(investigationId);
+      if (!localState) {
+        try {
+          return await product.loadDeliveryState(investigationId);
+        } catch (error) {
+          log(
+            `[${investigationId}] Product delivery-state fallback unavailable; treating the empty local ledger as authoritative for this attempt: ${safeText(error instanceof Error ? error.message : String(error))}`,
+          );
+          return null;
+        }
+      }
+
+      deferProductReplication(investigationId, "delivery-state repair", () =>
+        replicateState(localState),
+      );
+      return localState;
     },
     async save(state) {
       await local.save(state);
-      await product.saveDeliveryState(state);
+      deferProductReplication(state.investigationId, "delivery-state replication", () =>
+        replicateState(state),
+      );
     },
     async loadTerminalFailure(investigationId) {
-      return (
-        (await local.loadTerminalFailure(investigationId)) ??
-        (await product.loadTerminalFailure(investigationId))
-      );
+      const localFailure = await local.loadTerminalFailure(investigationId);
+      if (localFailure) return localFailure;
+      try {
+        return await product.loadTerminalFailure(investigationId);
+      } catch (error) {
+        log(
+          `[${investigationId}] Product terminal-failure fallback unavailable; treating the empty local ledger as authoritative for this attempt: ${safeText(error instanceof Error ? error.message : String(error))}`,
+        );
+        return null;
+      }
     },
     async saveTerminalFailure(record) {
       await local.saveTerminalFailure(record);
-      await product.saveTerminalFailure(record);
+      deferProductReplication(
+        record.investigationId,
+        "terminal-failure replication",
+        () => product.saveTerminalFailure(record),
+      );
     },
     async persistPayload(investigationId, kind, payload) {
       const tracked = await persistPayloadTracked(investigationId, kind, payload);
