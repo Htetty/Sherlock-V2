@@ -65,6 +65,12 @@ export type RepositorySnapshot = {
   private: boolean;
 };
 
+export type AuthorizedRepositoryRecord = RepositorySnapshot & {
+  installationId: string;
+  installationStatus: InstallationStatus;
+  ownerAvatarUrl: string | null;
+};
+
 export type VerificationMethod =
   | "personal_account_match"
   | "installation_webhook_sender";
@@ -123,6 +129,11 @@ export interface InstallationDataStore {
     repositories: RepositorySnapshot[],
     eventAt: string,
   ): Promise<void>;
+  reconcileInstallationRepositories(
+    installationId: string,
+    repositories: RepositorySnapshot[],
+    eventAt: string,
+  ): Promise<void>;
   markInstallationRepositoriesRemoved(
     installationId: string,
     repositoryIds: string[],
@@ -136,6 +147,7 @@ export interface InstallationDataStore {
   // Membership. upsert is idempotent; existing rows are preserved.
   upsertMembership(membership: MembershipRecord): Promise<void>;
   listInstallationsForUser(userId: string): Promise<InstallationRecord[]>;
+  listRepositoriesForUser(userId: string): Promise<AuthorizedRepositoryRecord[]>;
 
   // Nonces.
   supersedeUnclaimedNonces(userId: string): Promise<void>;
@@ -489,6 +501,20 @@ export function createInMemoryInstallationDataStore(): InstallationDataStore & {
       }
       void eventAt;
     },
+    async reconcileInstallationRepositories(installationId, repos, eventAt) {
+      const activeIds = new Set(repos.map((repo) => repo.repositoryId));
+      for (const repository of repositories.values()) {
+        if (
+          repository.installationId === installationId &&
+          repository.status === "active" &&
+          !activeIds.has(repository.repositoryId)
+        ) {
+          repository.status = "removed";
+          repository.removedAt = eventAt;
+        }
+      }
+      await this.upsertInstallationRepositories(installationId, repos, eventAt);
+    },
     async markInstallationRepositoriesRemoved(installationId, repositoryIds, eventAt) {
       for (const repositoryId of repositoryIds) {
         const existing = repositories.get(repoKey(installationId, repositoryId));
@@ -520,6 +546,38 @@ export function createInMemoryInstallationDataStore(): InstallationDataStore & {
         if (installation) result.push(installation);
       }
       return result;
+    },
+    async listRepositoriesForUser(userId) {
+      const installationById = new Map(
+        (await this.listInstallationsForUser(userId)).map((installation) => [
+          installation.installationId,
+          installation,
+        ]),
+      );
+      const result: AuthorizedRepositoryRecord[] = [];
+      for (const repository of repositories.values()) {
+        const installation = installationById.get(repository.installationId);
+        if (
+          !installation ||
+          installation.status !== "active" ||
+          repository.status !== "active"
+        ) {
+          continue;
+        }
+        result.push({
+          repositoryId: repository.repositoryId,
+          ownerLogin: repository.ownerLogin,
+          name: repository.name,
+          fullName: repository.fullName,
+          private: repository.private,
+          installationId: repository.installationId,
+          installationStatus: installation.status,
+          ownerAvatarUrl: installation.accountAvatarUrl,
+        });
+      }
+      return result.sort((left, right) =>
+        left.fullName.localeCompare(right.fullName),
+      );
     },
     async supersedeUnclaimedNonces(userId) {
       for (const nonce of nonces) {
@@ -774,6 +832,7 @@ export function createSupabaseInstallationDataStore(
     },
 
     async upsertInstallationRepositories(installationId, repositories, eventAt) {
+      if (repositories.length === 0) return;
       const now = new Date().toISOString();
       const result = await supabase.from("installation_repositories").upsert(
         repositories.map((repo) => ({
@@ -791,6 +850,29 @@ export function createSupabaseInstallationDataStore(
       );
       assertNoError(result, "Repository upsert");
       void eventAt;
+    },
+
+    async reconcileInstallationRepositories(installationId, repositories, eventAt) {
+      await this.upsertInstallationRepositories(
+        installationId,
+        repositories,
+        eventAt,
+      );
+      const active = await supabase
+        .from("installation_repositories")
+        .select("repository_id")
+        .eq("installation_id", installationId)
+        .eq("status", "active");
+      assertNoError(active, "Repository reconciliation read");
+      const currentIds = new Set(repositories.map((repo) => repo.repositoryId));
+      const removedIds = ((active.data ?? []) as Array<{ repository_id: string }>)
+        .map((row) => row.repository_id)
+        .filter((repositoryId) => !currentIds.has(repositoryId));
+      await this.markInstallationRepositoriesRemoved(
+        installationId,
+        removedIds,
+        eventAt,
+      );
     },
 
     async markInstallationRepositoriesRemoved(installationId, repositoryIds, eventAt) {
@@ -862,6 +944,47 @@ export function createSupabaseInstallationDataStore(
       }
 
       return installations;
+    },
+
+    async listRepositoriesForUser(userId) {
+      const installations = (
+        await this.listInstallationsForUser(userId)
+      ).filter((installation) => installation.status === "active");
+      const repositories = await Promise.all(
+        installations.map(async (installation) => {
+          const result = await supabase
+            .from("installation_repositories")
+            .select(
+              "repository_id, owner_login, name, full_name, private, status",
+            )
+            .eq("installation_id", installation.installationId)
+            .eq("status", "active");
+          assertNoError(result, "Repository membership read");
+          return ((result.data ?? []) as Array<{
+            repository_id: string;
+            owner_login: string;
+            name: string;
+            full_name: string;
+            private: boolean;
+            status: string;
+          }>).map(
+            (repository): AuthorizedRepositoryRecord => ({
+              repositoryId: repository.repository_id,
+              ownerLogin: repository.owner_login,
+              name: repository.name,
+              fullName: repository.full_name,
+              private: repository.private,
+              installationId: installation.installationId,
+              installationStatus: installation.status,
+              ownerAvatarUrl: installation.accountAvatarUrl,
+            }),
+          );
+        }),
+      );
+
+      return repositories
+        .flat()
+        .sort((left, right) => left.fullName.localeCompare(right.fullName));
     },
 
     async supersedeUnclaimedNonces(userId) {

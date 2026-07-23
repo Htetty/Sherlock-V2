@@ -121,6 +121,8 @@ describe("GET /api/installations", () => {
           },
           status: "active",
           repositorySelection: "selected",
+          manageUrl:
+            "https://github.com/organizations/SherlockHQ/settings/installations/987654321",
         },
       ],
     });

@@ -37,6 +37,10 @@ import {
 import { runInvestigationPipeline } from "./services/investigation.js";
 import { createInvestigationStateStoreFromEnv } from "./services/investigation-state-store.js";
 import {
+  createProductBackedDeliveryStateStore,
+  createProductDataStoreFromEnv,
+} from "./services/product-data.js";
+import {
   asScriptRunner,
   createInvestigationConcurrencyGate,
 } from "./services/rate-limit.js";
@@ -74,16 +78,47 @@ async function getInstallationOctokit(installationId: number) {
 
 // Lifecycle state store (selected by SHERLOCK_STATE_STORE; no-op default);
 // shared across jobs. Never carries secrets and never fails an investigation.
-const stateStore = createInvestigationStateStoreFromEnv();
+const productData = await createProductDataStoreFromEnv();
+const stateStore = productData ?? createInvestigationStateStoreFromEnv();
 
 // Durable delivery state under the artifacts volume, plus a queue producer
 // used to enqueue delivery-only retry jobs. The producer gets its own Redis
 // connection: the worker connection is reserved for blocking commands.
-const deliveryStore = createFileDeliveryStateStore();
+const localDeliveryStore = createFileDeliveryStateStore();
+const deliveryStore = productData
+  ? createProductBackedDeliveryStateStore(localDeliveryStore, productData, {
+      log: (message) => console.error(message),
+    })
+  : localDeliveryStore;
 const deliveryQueueConnection = createRedisConnection();
 const deliveryQueue = createInvestigationQueue(deliveryQueueConnection);
 const deps: Omit<WorkerDeps, "reportStage"> = {
   stateStore,
+  ...(productData
+    ? {
+        acknowledgeInvestigationEnqueued: (
+          payload: InvestigationJobPayload,
+          queueJobId: string,
+        ) =>
+          productData.markInvestigationEnqueued({
+            installationId: String(payload.installationId),
+            triggeringCommentId: String(payload.triggeringCommentId),
+            investigationId: payload.investigationId,
+            queueJobId,
+          }),
+        persistResult: (result) => productData.persistResult(result),
+        recordDeliveryAttempt: (
+          investigationId,
+          attemptCount,
+          nextRetryAt,
+        ) =>
+          productData.recordDeliveryAttempt(
+            investigationId,
+            attemptCount,
+            nextRetryAt,
+          ),
+      }
+    : {}),
   delivery: {
     store: deliveryStore,
     enqueue: (payload: DeliveryJobPayload) =>
@@ -149,12 +184,13 @@ const deps: Omit<WorkerDeps, "reportStage"> = {
   }) => {
     const octokit = await getInstallationOctokit(installationId);
     await assertOwnership?.();
-    await octokit.rest.issues.createComment({
+    const response = await octokit.rest.issues.createComment({
       owner,
       repo,
       issue_number: issueNumber,
       body,
     });
+    return { id: response.data.id };
   },
   updateIssueComment: async ({
     installationId,

@@ -62,6 +62,8 @@ export const apiErrors = {
     ),
   invalidRequest: (message = "The request is invalid.") =>
     new ApiError(400, "INVALID_REQUEST", message),
+  notFound: () =>
+    new ApiError(404, "NOT_FOUND", "The requested resource was not found."),
   installationStartRateLimited: (retryAfterSeconds: number) =>
     new ApiError(
       429,

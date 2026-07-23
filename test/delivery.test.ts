@@ -655,7 +655,7 @@ describe("delivery executor", () => {
 
     const row = rows.get(INV)!;
     expect(row.tenant_id).toBe("tenant-gh-2");
-    expect(row.installation_id).toBe(2);
+    expect(row.installation_id).toBe("2");
     expect(row.outcome).toBe("verified_fix");
     expect(row.record.originalOutcome).toBe("reproduced");
     expect(row.record.pullRequestStatus).toBe("created");
@@ -768,6 +768,8 @@ function makeWorkerDeps(options: {
   postCommentErrors?: unknown[];
   stateStore?: InvestigationStateStore;
   deliveryStore?: DeliveryStateStore;
+  persistResult?: WorkerDeps["persistResult"];
+  recordDeliveryAttempt?: WorkerDeps["recordDeliveryAttempt"];
 }) {
   const deliveryStore =
     options.deliveryStore ?? createInMemoryDeliveryStateStore();
@@ -804,6 +806,10 @@ function makeWorkerDeps(options: {
       if (error) throw error;
       comments.push(body);
     },
+    ...(options.persistResult ? { persistResult: options.persistResult } : {}),
+    ...(options.recordDeliveryAttempt
+      ? { recordDeliveryAttempt: options.recordDeliveryAttempt }
+      : {}),
   };
 
   return {
@@ -816,6 +822,92 @@ function makeWorkerDeps(options: {
 }
 
 describe("worker delivery decoupling", () => {
+  test("product result persistence failure cannot suppress GitHub delivery", async () => {
+    const fixture = makeWorkerDeps({
+      pipelineResult: verifiedPipelineResult(
+        pullRequestResult("created", {
+          pullRequestNumber: 7,
+          pullRequestUrl: "https://github.com/acme/app/pull/7",
+          reason: null,
+        }),
+      ),
+      persistResult: async () => {
+        throw new Error("Supabase storage unavailable");
+      },
+    });
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).resolves.toEqual({ investigationId: INV, outcome: "verified_fix" });
+
+    expect(fixture.pipelineCalls()).toBe(1);
+    expect(fixture.comments).toHaveLength(1);
+    expect(fixture.comments[0]).toContain(terminalCommentMarker(INV));
+    expect(await fixture.deliveryStore.load(INV)).toMatchObject({
+      terminalComment: { status: "posted" },
+    });
+  });
+
+  test("local delivery recovery is durable before product result persistence settles", async () => {
+    const productWrite = deferred();
+    const result = verifiedPipelineResult(
+      pullRequestResult("created", {
+        pullRequestNumber: 7,
+        pullRequestUrl: "https://github.com/acme/app/pull/7",
+        reason: null,
+      }),
+    );
+    const fixture = makeWorkerDeps({
+      pipelineResult: result,
+      persistResult: async () => productWrite.promise,
+    });
+    fixture.deps.runPipeline = async (_payload, options) => {
+      await options.onTerminalResult?.(result);
+      return result;
+    };
+
+    const processing = processInvestigationJob(
+      { data: investigationPayload, attemptsMade: 0, opts: { attempts: 3 } },
+      fixture.deps,
+    );
+    await vi.waitFor(async () => {
+      expect(await fixture.deliveryStore.load(INV)).not.toBeNull();
+    });
+    expect(fixture.comments).toHaveLength(0);
+
+    productWrite.resolve();
+    await expect(processing).resolves.toMatchObject({ outcome: "verified_fix" });
+    expect(fixture.comments).toHaveLength(1);
+  });
+
+  test("product attempt persistence failure cannot suppress delivery recovery", async () => {
+    const fixture = makeWorkerDeps({
+      recordDeliveryAttempt: async () => {
+        throw new Error("Supabase unavailable");
+      },
+    });
+    await fixture.deliveryStore.save(
+      await verifiedDeliveryState({
+        pullRequest: pullRequestResult("created", {
+          pullRequestNumber: 7,
+          pullRequestUrl: "https://github.com/acme/app/pull/7",
+          reason: null,
+        }),
+      }),
+    );
+
+    await expect(
+      processDeliveryJob(
+        { data: deliveryPayload, attemptsMade: 0, opts: { attempts: 4 } },
+        fixture.deps,
+      ),
+    ).resolves.toMatchObject({ outcome: "verified_fix" });
+    expect(fixture.comments).toHaveLength(1);
+  });
+
   test("a fully successful run delivers inline: no retry job, one marked comment", async () => {
     const fixture = makeWorkerDeps({
       pipelineResult: verifiedPipelineResult(
