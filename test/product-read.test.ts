@@ -105,4 +105,17 @@ describe("dashboard timeline projection", () => {
       "skipped",
     ]);
   });
+
+  test("projects a setup failure even when no stage event was active", () => {
+    const timeline = reduceTimeline([], "failed", false);
+
+    expect(timeline.map((step) => step.status)).toEqual([
+      "failed",
+      "skipped",
+      "skipped",
+      "skipped",
+      "skipped",
+      "skipped",
+    ]);
+  });
 });

@@ -1,6 +1,8 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { PRIVATE_ARTIFACT_BUCKET } from "./product-data.js";
 
+export const MEDIA_SIGNED_URL_TTL_SECONDS = 60 * 60;
+
 export type DashboardInvestigationStatus = "active" | "completed" | "failed";
 export type DashboardTimelineStatus =
   | "pending"
@@ -276,6 +278,7 @@ export function reduceTimeline(
     }
   } else if (status === "failed") {
     let activeIndex = -1;
+    let synthesizedFailureStage = false;
     for (let index = timeline.length - 1; index >= 0; index -= 1) {
       if (
         timeline[index].status === "active" ||
@@ -285,13 +288,22 @@ export function reduceTimeline(
         break;
       }
     }
-    if (activeIndex >= 0) {
-      timeline[activeIndex].status = "failed";
-      for (let index = activeIndex + 1; index < timeline.length; index += 1) {
-        if (timeline[index].status === "pending") {
-          timeline[index].status = "skipped";
-          timeline[index].message = "Skipped after the investigation failed.";
-        }
+    if (activeIndex < 0) {
+      const lastCompleted = timeline.reduce(
+        (last, item, index) => (item.status === "completed" ? index : last),
+        -1,
+      );
+      activeIndex = Math.min(lastCompleted + 1, timeline.length - 1);
+      synthesizedFailureStage = true;
+    }
+    timeline[activeIndex].status = "failed";
+    if (synthesizedFailureStage) {
+      timeline[activeIndex].message = "Investigation failed at this stage.";
+    }
+    for (let index = activeIndex + 1; index < timeline.length; index += 1) {
+      if (timeline[index].status === "pending") {
+        timeline[index].status = "skipped";
+        timeline[index].message = "Skipped after the investigation failed.";
       }
     }
   }
@@ -337,7 +349,7 @@ async function signedObjectUrl(
   }
   const { data, error } = await supabase.storage
     .from(row.bucket)
-    .createSignedUrl(row.object_path, 300);
+    .createSignedUrl(row.object_path, MEDIA_SIGNED_URL_TTL_SECONDS);
   if (error) throw new Error(`Artifact signing failed: ${error.message}`);
   return data.signedUrl;
 }
@@ -349,7 +361,11 @@ async function phaseEvidence(
 ): Promise<DashboardPhaseEvidence> {
   const phaseRows = rows.filter((row) => row.phase === phase);
   const video = phaseRows.find((row) => row.kind === "video");
-  const poster = phaseRows.find((row) => row.kind === "poster");
+  const poster =
+    phaseRows.find((row) => row.kind === "poster" && row.status === "ready") ??
+    phaseRows.find(
+      (row) => row.kind === "screenshot" && row.status === "ready",
+    );
   const [videoUrl, posterUrl] = await Promise.all([
     video ? signedObjectUrl(supabase, video) : undefined,
     poster ? signedObjectUrl(supabase, poster) : undefined,

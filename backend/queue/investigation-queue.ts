@@ -25,8 +25,9 @@ export const INVESTIGATION_RETRY_BACKOFF_MS = 5_000;
 // the original job is still in Redis, so completed/failed jobs must not be
 // removed immediately: webhook-redelivery idempotency holds only within this
 // retention window (GitHub redeliveries are typically minutes to hours).
-// Failed jobs are kept longer for debugging. Permanent idempotency will move
-// to a database record when Sherlock gains one.
+// Failed jobs are kept longer for debugging. Configured product deployments
+// additionally enforce permanent comment idempotency in investigation_states;
+// Redis remains the local-development and fast-path claim.
 export const INVESTIGATION_JOB_RETENTION = {
   removeOnComplete: { age: 3 * 24 * 60 * 60, count: 1_000 }, // 3 days
   removeOnFail: { age: 14 * 24 * 60 * 60, count: 5_000 }, // 14 days
