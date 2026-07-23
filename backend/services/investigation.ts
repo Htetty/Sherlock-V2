@@ -109,7 +109,7 @@ import {
 } from "./report.js";
 import {
   buildInvestigationReportData,
-  renderIssueReport,
+  renderIssueStatusComment,
   type InvestigationReportData,
   type ReportPullRequest,
 } from "./issue-report-renderer.js";
@@ -1316,6 +1316,23 @@ export async function runInvestigationPipeline(
       log("Fix verified; skipping analyzeIssue (fix attempt carries root cause and verification detail).");
     }
 
+    // Build comparison media before freezing the PR payload so the detailed
+    // pull-request description can include it. This remains non-fatal.
+    let replayEvidence: ReplayEvidenceUrls | null = null;
+    try {
+      replayEvidence = await prepareReplayEvidence({
+        store,
+        failingVideo: result.video ?? null,
+        fixAttemptDir:
+          fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
+        passingVideo:
+          fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
+        log,
+      });
+    } catch (error) {
+      log(`Replay evidence preparation failed (non-fatal): ${formatError(error)}`);
+    }
+
     // Verified fix -> capture a durable, credential-free delivery plan while
     // the verified workspace still exists. Branch push and PR creation happen
     // only after the pipeline returns, in the separately retried delivery
@@ -1343,6 +1360,7 @@ export async function runInvestigationPipeline(
           issueNumber: payload.issueNumber,
           issueTitle: payload.issueTitle,
           plan,
+          replayEvidence,
           github: null,
           pushUrl: null,
           abortSignal: options.signal,
@@ -1581,26 +1599,6 @@ export async function runInvestigationPipeline(
       ...(reproductionMode ? { reproductionMode } : {}),
     };
 
-    // Replay evidence (docs/FABLE_REPLAY_EVIDENCE_PROMPT.md): build and host
-    // the comparison media from the recordings the runs already produced.
-    // Everything inside is flag-gated and degrades to null; it must never
-    // change the investigation outcome or block delivery.
-    let replayEvidence: ReplayEvidenceUrls | null = null;
-
-    try {
-      replayEvidence = await prepareReplayEvidence({
-        store,
-        failingVideo: result.video ?? null,
-        fixAttemptDir:
-          fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
-        passingVideo:
-          fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
-        log,
-      });
-    } catch (error) {
-      log(`Replay evidence preparation failed (non-fatal): ${formatError(error)}`);
-    }
-
     // Structured report data replaces the old preformatted comment sections.
     // GitHub delivery rerenders it against the final pull-request state; the
     // diagnostic analysis is only ever surfaced when no fix was verified.
@@ -1664,7 +1662,7 @@ export async function runInvestigationPipeline(
       investigationId,
       outcome: "execution_failed",
       summary,
-      githubComment: renderIssueReport(
+      githubComment: renderIssueStatusComment(
         buildInvestigationReportData({ summary }),
         null,
       ),
@@ -1871,7 +1869,7 @@ async function finishInvestigation(
   report: InvestigationReportData | null = null,
 ): Promise<InvestigationPipelineResult> {
   const reportData = report ?? buildInvestigationReportData({ summary });
-  const githubComment = renderIssueReport(
+  const githubComment = renderIssueStatusComment(
     reportData,
     pipelineReportPullRequest(summary),
   );

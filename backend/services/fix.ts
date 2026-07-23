@@ -43,6 +43,7 @@ import {
   classifyPostPatchRun,
   classifyPrePatchRun,
   extractRegressionFailureMarker,
+  getNodeRegressionUnsupportedReason,
   type AppNetworkTarget,
   hashTestContents,
   materializeTest,
@@ -319,8 +320,11 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     });
 
   let provenRegressionTest: RegressionTestProposal | null = null;
+  const unsupportedRegressionReason = getNodeRegressionUnsupportedReason(input.plan);
 
-  if (!input.generateRegressionTest) {
+  if (unsupportedRegressionReason) {
+    regressionSummary.reason = unsupportedRegressionReason;
+  } else if (!input.generateRegressionTest) {
     regressionSummary.reason =
       "No regression-test generator is available for this investigation.";
   } else {

@@ -78,6 +78,25 @@ export type RegressionTestSummary = {
   reason: string | null;
 };
 
+// The generated runner is a plain Node process. It can faithfully exercise
+// API response assertions, but it cannot observe browser DOM or console state.
+// Keep this as an allowlist so any future assertion type fails closed until a
+// runner with matching observation semantics is implemented.
+const NODE_REGRESSION_ASSERTIONS = new Set<ReproductionPlan["assertion"]["type"]>([
+  "response_status",
+  "response_body",
+]);
+
+export function getNodeRegressionUnsupportedReason(
+  plan: ReproductionPlan,
+): string | null {
+  if (NODE_REGRESSION_ASSERTIONS.has(plan.assertion.type)) {
+    return null;
+  }
+
+  return `Generated Node regression tests cannot faithfully assert browser-only "${plan.assertion.type}" behavior. The exact Playwright replay remains authoritative.`;
+}
+
 const MAX_TEST_CHARS = 20_000;
 const MAX_NAME_CHARS = 80;
 const TEST_PATH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\.mjs$/;

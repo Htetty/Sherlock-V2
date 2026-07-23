@@ -233,6 +233,8 @@ describe("replay evidence rendering", () => {
     });
     const rendered = renderIssueReport(report, { status: "created", url: null });
 
+    expect(rendered).toContain("### Fix");
+    expect(rendered).toContain(report.fixSummary);
     expect(rendered).toContain("### Replay evidence");
     expect(rendered).toContain("failing before the fix");
     expect(rendered).toContain("![Sherlock replay evidence](https://example.supabase.co/");

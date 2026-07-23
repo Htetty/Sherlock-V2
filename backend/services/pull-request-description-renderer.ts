@@ -15,6 +15,7 @@
 // truncated as a whole and its Markdown structure stays valid.
 
 import {
+  canonicalEvidenceUrl,
   safeInlineCode,
   sanitizeCommandField,
   sanitizeInlineCodeField,
@@ -70,6 +71,10 @@ export type PullRequestDescriptionData = {
   // advisory/failed checks, validation gaps). Empty means the section is
   // omitted entirely — never filled with generic advice.
   reviewFocus: string[];
+  replayEvidence: {
+    gifUrl: string | null;
+    videoUrl: string | null;
+  } | null;
   // GitHub's native compare view for this branch. The PR number does not
   // exist yet when the protected retry payload is captured, so the
   // repository compare URL is the stable native diff link.
@@ -147,6 +152,10 @@ export type PullRequestDescriptionInput = {
   // Validated reporting fields from the persisted fix proposal, when
   // trustworthy structured data is available; null otherwise.
   proposal: PullRequestReportingProposal | null;
+  replayEvidence?: {
+    gifUrl: string | null;
+    videoUrl: string | null;
+  } | null;
 };
 
 export function buildCompareUrl(input: {
@@ -292,6 +301,7 @@ export function buildPullRequestDescriptionData(
     },
     limitations,
     reviewFocus,
+    replayEvidence: input.replayEvidence ?? null,
     compareUrl: buildCompareUrl(input),
   };
 }
@@ -474,6 +484,19 @@ export function renderPullRequestDescription(
     );
   }
 
+  const gifUrl = canonicalEvidenceUrl(data.replayEvidence?.gifUrl);
+  const videoUrl = canonicalEvidenceUrl(data.replayEvidence?.videoUrl);
+  if (gifUrl || videoUrl) {
+    const evidenceLines = [
+      "## Replay evidence",
+      "",
+      "Sherlock recorded both runs. Left: the reproduction failing before the fix. Right: the identical reproduction plan passing after the fix.",
+    ];
+    if (gifUrl) evidenceLines.push("", `![Sherlock replay evidence](${gifUrl})`);
+    if (videoUrl) evidenceLines.push("", `[Watch the full comparison video](${videoUrl})`);
+    sections.push(evidenceLines.join("\n"));
+  }
+
   // --- Limitations -----------------------------------------------------------
   const limitations = data.limitations
     .slice(0, MAX_LIMITATIONS)
@@ -485,7 +508,7 @@ export function renderPullRequestDescription(
     );
   }
 
-  // --- Review focus (omitted entirely when no trustworthy signals exist) ------
+  // --- Review focus ----------------------------------------------------------
   const reviewFocus = data.reviewFocus
     .slice(0, MAX_REVIEW_FOCUS_ITEMS)
     .map((item) => inlineField(item, MAX_REVIEW_FOCUS_CHARS))

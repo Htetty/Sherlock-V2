@@ -219,6 +219,40 @@ describe("deterministic reproduction", () => {
   );
 
   test(
+    "classifies missing expected page text as the reproduced failure",
+    { timeout: 60_000 },
+    async () => {
+      const baseUrl = await startFixtureApp({ buggy: false });
+      const store = await makeStore();
+      const validation = validateReproductionPlan({
+        version: REPRODUCTION_PLAN_VERSION,
+        baseUrl,
+        steps: [{ id: "step-1", action: "goto", path: "/" }],
+        expectedBehavior: "The submitted note appears in the visible page text.",
+        failureCondition: "The submitted note is absent from the visible page text.",
+        assertion: {
+          type: "page_text",
+          contains: "Reproduce bug note",
+          failureWhen: "absent",
+        },
+      });
+
+      expect(validation.ok).toBe(true);
+
+      if (!validation.ok) {
+        return;
+      }
+
+      const result = await executeReproductionPlan(validation.plan, store);
+
+      expect(result.outcome).toBe("reproduced");
+      expect(result.assertion?.matchedFailure).toBe(true);
+      expect(result.assertion?.matchedExpected).toBe(false);
+      expect(result.assertion?.detail).toContain("failure condition is text absent");
+    },
+  );
+
+  test(
     "reproduces an API-only bug with wait and response_body assertion",
     { timeout: 60_000 },
     async () => {

@@ -59,6 +59,11 @@ export type PlanAssertion =
       contains: string;
     }
   | {
+      type: "page_text";
+      contains: string;
+      failureWhen: "present" | "absent";
+    }
+  | {
       type: "element_text";
       selector: string;
       contains: string;
@@ -108,9 +113,9 @@ const MAX_STEPS = 30;
 const MAX_WAIT_MS = 10_000;
 
 // Steps that drive a real browser page. Assertions that read browser state
-// (console errors, element text) are vacuous without at least one of these.
+// (console errors, page/element text) are vacuous without at least one of these.
 const BROWSER_ACTIONS = new Set(["goto", "click", "fill", "waitForSelector"]);
-const BROWSER_ONLY_ASSERTIONS = new Set(["console_error", "element_text"]);
+const BROWSER_ONLY_ASSERTIONS = new Set(["console_error", "page_text", "element_text"]);
 
 export function validateReproductionPlan(value: unknown): PlanValidationResult {
   const errors: string[] = [];
@@ -317,6 +322,18 @@ function validateAssertion(value: unknown): string[] {
         !assertion.contains
       ) {
         return ["console_error assertion must have a non-empty string contains."];
+      }
+      return [];
+    case "page_text":
+      if (
+        !hasOnlyKeys(assertion, ["type", "contains", "failureWhen"]) ||
+        typeof assertion.contains !== "string" ||
+        !assertion.contains ||
+        (assertion.failureWhen !== "present" && assertion.failureWhen !== "absent")
+      ) {
+        return [
+          'page_text assertion must have a non-empty string contains and failureWhen set to "present" or "absent".',
+        ];
       }
       return [];
     case "element_text": {

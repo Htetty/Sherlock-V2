@@ -101,6 +101,10 @@ export type PullRequestInput = {
   issueNumber: number;
   issueTitle: string;
   plan: ReproductionPlan;
+  replayEvidence?: {
+    gifUrl: string | null;
+    videoUrl: string | null;
+  } | null;
   github: GitHubClient | null;
   // Remote used for collision checks and push. Production may pass an
   // x-access-token URL; it is normalized before any git argv is built.
@@ -552,6 +556,7 @@ export async function buildPullRequestBody(
       })),
     },
     proposal,
+    replayEvidence: input.replayEvidence ?? null,
   });
 
   return renderPullRequestDescription(data);

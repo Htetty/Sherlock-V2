@@ -372,6 +372,10 @@ describe("verified fix -> pull request", () => {
 
   test("the PR body presents structured evidence without internal ids, paths, or plan dumps", async () => {
     const { workspace, attempt, input } = await buildInput();
+    input.replayEvidence = {
+      gifUrl: "https://example.supabase.co/evidence.gif",
+      videoUrl: "https://example.supabase.co/evidence.mp4",
+    };
 
     const body = await buildPullRequestBody(input, "sherlock/fix-42-login-abc123");
 
@@ -390,6 +394,8 @@ describe("verified fix -> pull request", () => {
     expect(body).toContain("| Repository tests | Passed |");
     expect(body).toContain("`login-does-not-return-500`");
     expect(body).toContain("| Targeted check: `node check-login.mjs` | Passed |");
+    expect(body).toContain("![Sherlock replay evidence](https://example.supabase.co/evidence.gif)");
+    expect(body).toContain("[Watch the full comparison video](https://example.supabase.co/evidence.mp4)");
 
     // Native diff link instead of any diff or artifact dump.
     expect(body).toContain(

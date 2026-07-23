@@ -131,11 +131,12 @@ The "assertion" describes how to detect the reported failure. It must be exactly
 { "type": "response_body", "pathPattern": "/api/path", "method": "GET", "failureContains": "text present only when the bug occurs", "expectedContains": "text present only when behavior is correct" }
   (checks the body of the LAST matching "request" step response; pathPattern, method, and expectedContains are optional)
 { "type": "console_error", "contains": "substring of the expected error message" }
-{ "type": "element_text", "target": { "text": "unique text of the element" }, "contains": "text shown when the bug occurs" }
+{ "type": "page_text", "contains": "exact visible text", "failureWhen": "present" }
+  (failureWhen is "present" when seeing the text proves the bug, or "absent" when missing text proves the bug)
 
 Assertion rules:
-- "console_error" and "element_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
-- "element_text" targets must resolve to exactly one element; target the specific content in question (e.g. the exact task title), never a shared word.
+- "console_error" and "page_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
+- Use page_text with failureWhen "absent" when the reported bug is that expected content never appears. The contains text must be the exact visible content whose presence or absence distinguishes correct and buggy behavior.
 - Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
 - The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
 ${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}

@@ -197,13 +197,22 @@ describe("pull request title", () => {
 });
 
 describe("pull request description", () => {
-  test("full output for a proven fix without proposal reporting data", () => {
+  test("keeps the detailed investigation and comparison media in the PR", () => {
     const rendered = renderPullRequestDescription(
-      buildPullRequestDescriptionData(baseInput()),
+      buildPullRequestDescriptionData(baseInput({
+        replayEvidence: {
+          gifUrl: "https://example.supabase.co/evidence.gif",
+          videoUrl: "https://example.supabase.co/evidence.mp4",
+        },
+      })),
     );
 
     expect(rendered).toContain("## Summary");
     expect(rendered).toContain("## Root cause");
+    expect(rendered).toContain("Expected:");
+    expect(rendered).toContain("Observed before the fix:");
+    expect(rendered).toContain("## Limitations");
+    expect(rendered).not.toContain("## Review focus");
     expect(rendered).toContain("- `src/auth/login.ts`");
     expect(rendered).toContain("| Check | Result |");
     expect(rendered).toContain("| Original failure reproduced | Passed |");
@@ -212,6 +221,9 @@ describe("pull request description", () => {
     expect(rendered).toContain("| Repository tests | Passed |");
     expect(rendered).toContain("| Generated regression test (`login-does-not-return-500`) | Proven");
     expect(rendered).toContain("| Targeted check: `node check-login.mjs` | Passed |");
+    expect(rendered).toContain("## Replay evidence");
+    expect(rendered).toContain("![Sherlock replay evidence](https://example.supabase.co/evidence.gif)");
+    expect(rendered).toContain("[Watch the full comparison video](https://example.supabase.co/evidence.mp4)");
     expect(rendered).toContain("[View the full diff on GitHub](https://github.com/acme/app/compare/main...sherlock%2Ffix-42-login-abc123)");
     expect(rendered).not.toMatch(/\b(?:PASS|FAIL|ADVISORY)\b/);
     expect(rendered).not.toContain("-> exit");
@@ -256,21 +268,11 @@ describe("pull request description", () => {
     );
 
     expect(rendered).toContain("## Review focus");
-    expect(rendered).toContain("- The fixer assessed this change as medium risk.");
-    expect(rendered).toContain(
-      "- Assumption: Only the login route returns this error.",
-    );
-    expect(rendered).toContain(
-      "- No proven regression test accompanies this change",
-    );
-    expect(rendered).toContain(
-      "- Lint was not configured.",
-    );
+    expect(rendered).toContain("The fixer assessed this change as medium risk");
+    expect(rendered).toContain("Assumption: Only the login route returns this error");
+    expect(rendered).toContain("## Limitations");
     expect(rendered).toContain(
       "| Generated regression test | Inconclusive — before: Failed as expected, after: Failed |",
-    );
-    expect(rendered).toContain(
-      "The generated regression test could not prove the fix",
     );
     expectPrivateDescription(rendered);
   });
@@ -310,14 +312,7 @@ describe("pull request description", () => {
       buildPullRequestDescriptionData(input),
     );
 
-    for (const section of [
-      "## Summary",
-      "## Root cause",
-      "## Changes",
-      "## Validation",
-      "## Limitations",
-      "[View the full diff on GitHub]",
-    ]) {
+    for (const section of ["## Summary", "## Root cause", "## Changes", "## Validation", "## Limitations", "[View the full diff on GitHub]"]) {
       expect(rendered).toContain(section);
     }
     expect(rendered).toContain("R".repeat(1_000) + "…");

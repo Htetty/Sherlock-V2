@@ -816,6 +816,48 @@ function makeWorkerDeps(options: {
 }
 
 describe("worker delivery decoupling", () => {
+  test("a rejected fix attempt delivers the reproduced result without a fix identity", async () => {
+    const summary: InvestigationSummary = {
+      investigationId: INV,
+      outcome: "reproduced",
+    };
+    const fixture = makeWorkerDeps({
+      pipelineResult: {
+        ...verifiedPipelineResult(null),
+        outcome: "reproduced",
+        summary,
+        githubComment: "Sherlock reproduced the reported failure.",
+        fixAttempt: {
+          outcome: "rejected_regression_test_failed",
+          fixAttemptId: FIX,
+        } as FixAttemptResult,
+        pullRequest: null,
+        commentSections: {
+          analysis: "The bug was reproduced, but no fix passed verification.",
+          fix: null,
+        },
+        pullRequestRetryPlan: null,
+      },
+    });
+
+    await expect(
+      processInvestigationJob(
+        { data: investigationPayload, attemptsMade: 0, opts: { attempts: 3 } },
+        fixture.deps,
+      ),
+    ).resolves.toEqual({ investigationId: INV, outcome: "reproduced" });
+
+    await expect(fixture.deliveryStore.load(INV)).resolves.toMatchObject({
+      executionOutcome: "reproduced",
+      fixVerified: false,
+      fixAttemptId: null,
+      pullRequest: { status: "not_applicable" },
+      terminalComment: { status: "posted" },
+    });
+    expect(fixture.comments).toHaveLength(1);
+    expect(fixture.comments[0]).toContain("reproduced the reported failure");
+  });
+
   test("a fully successful run delivers inline: no retry job, one marked comment", async () => {
     const fixture = makeWorkerDeps({
       pipelineResult: verifiedPipelineResult(
@@ -1651,8 +1693,8 @@ describe("structured v2 terminal payloads", () => {
     expect(comments).toHaveLength(1);
     const comment = comments[0];
     expect(comment).toContain("**Fix verified**");
-    expect(comment).toContain("### Root cause");
-    expect(comment).toContain("### Validation");
+    expect(comment).not.toContain("### Root cause");
+    expect(comment).not.toContain("### Validation");
     expect(comment).toContain("opened the verified fix");
     expect(comment).toContain("https://github.com/acme/app/pull/7");
     expect(comment).toContain(terminalCommentMarker(INV));
@@ -1747,7 +1789,8 @@ describe("structured v2 terminal payloads", () => {
     });
     expect(v2Run.complete).toBe(true);
     expect(v2.comments).toHaveLength(1);
-    expect(v2.comments[0]).toContain("### Validation");
+    expect(v2.comments[0]).toContain("**Fix verified**");
+    expect(v2.comments[0]).not.toContain("### Validation");
     expect(v2.comments[0]).not.toContain("Outcome: verified_fix");
   });
 });

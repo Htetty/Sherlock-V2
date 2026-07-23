@@ -851,6 +851,34 @@ async function evaluateAssertion(
           : `No console/page error contained "${assertion.contains}".`,
       };
     }
+    case "page_text": {
+      const text = await page
+        .locator("body")
+        .innerText({ timeout: STEP_TIMEOUT_MS })
+        .catch(() => null);
+
+      if (text === null) {
+        return {
+          assertion,
+          observed: null,
+          matchedFailure: false,
+          matchedExpected: false,
+          detail: "The page body was unavailable for text assertion evaluation.",
+        };
+      }
+
+      const isPresent = text.includes(assertion.contains);
+      const matchedFailure =
+        assertion.failureWhen === "present" ? isPresent : !isPresent;
+
+      return {
+        assertion,
+        observed: text.slice(0, 500),
+        matchedFailure,
+        matchedExpected: !matchedFailure,
+        detail: `Page text ${isPresent ? "contained" : "did not contain"} "${assertion.contains}"; failure condition is text ${assertion.failureWhen}.`,
+      };
+    }
     case "response_body": {
       const matches = result.apiResponses.filter((response) => {
         if (assertion.method && response.method !== assertion.method) {

@@ -596,7 +596,10 @@ export async function processInvestigationJob(
       outcome: result.outcome,
       summary: result.summary,
       fixVerified: result.fixAttempt?.outcome === "verified",
-      fixAttemptId: result.fixAttempt?.fixAttemptId ?? null,
+      fixAttemptId:
+        result.fixAttempt?.outcome === "verified"
+          ? result.fixAttempt.fixAttemptId
+          : null,
       analysisComment: result.commentSections?.analysis ?? null,
       fixComment: result.commentSections?.fix ?? null,
       report: result.report ?? null,

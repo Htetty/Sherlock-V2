@@ -388,11 +388,11 @@ const PLAN_STEP_SCHEMA = {
 const ASSERTION_SCHEMA = {
   type: "object" as const,
   description:
-    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"element_text", target, contains}. console_error/element_text require at least one browser step in the plan.',
+    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"page_text", contains, failureWhen:"present"|"absent"}. page_text checks the visible page body; use failureWhen:"absent" when expected text failing to appear is the bug. console_error/page_text require at least one browser step in the plan.',
   properties: {
     type: {
       type: "string",
-      enum: ["response_status", "response_body", "console_error", "element_text"],
+      enum: ["response_status", "response_body", "console_error", "page_text"],
     },
     pathPattern: { type: "string" },
     method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
@@ -401,7 +401,7 @@ const ASSERTION_SCHEMA = {
     failureContains: { type: "string" },
     expectedContains: { type: "string" },
     contains: { type: "string" },
-    target: TARGET_SCHEMA,
+    failureWhen: { type: "string", enum: ["present", "absent"] },
   },
   required: ["type"],
 };
@@ -1959,7 +1959,7 @@ ${context.runSteps ? `- Use run_steps to execute a sequence you are already conf
 - The frozen plan replays against a FRESH app instance: it must not depend on state your exploration created. Include every setup step the plan needs (create the data it asserts about).
 - After async work (202 responses, queued jobs, background saves), insert an explicit "wait" step long enough for the work to finish — your interactive timing will not carry over to the replay.
 - The assertion must detect the reported failure using evidence you actually observed: copy exact strings from responses and errors you saw. Never invent error text.
-- A "console_error" or "element_text" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
+- A "console_error" or "page_text" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step). For a UI bug where expected text fails to appear, use page_text with failureWhen "absent"; do not attach the expected text to a button or input target.
 - Use browser actions (goto/click/fill) for UI/user-facing bugs. Use request actions for API/backend bugs. If your reproduction is API-only, make that intentional and assert against response_status or response_body. Do not open a blank page just to create a screenshot - screenshots are only meaningful when the bug is visible on a page.
 - Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.
