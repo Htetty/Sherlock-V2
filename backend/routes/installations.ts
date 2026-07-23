@@ -69,6 +69,18 @@ export function buildInstallationUrl(appSlug: string, state: string): string {
   return url.toString();
 }
 
+export function buildManageInstallationUrl(input: {
+  installationId: string;
+  accountLogin: string;
+  accountType: "User" | "Organization";
+}): string {
+  const base =
+    input.accountType === "Organization"
+      ? `https://github.com/organizations/${encodeURIComponent(input.accountLogin)}/settings/installations`
+      : "https://github.com/settings/installations";
+  return `${base}/${encodeURIComponent(input.installationId)}`;
+}
+
 export type InstallationsRouterDeps = {
   requireAuth: express.RequestHandler;
   getStore: () => Promise<InstallationDataStore>;
@@ -106,6 +118,7 @@ export function createInstallationsRouter(
           },
           status: installation.status,
           repositorySelection: installation.repositorySelection,
+          manageUrl: buildManageInstallationUrl(installation),
         })),
       });
     } catch (error) {

@@ -39,6 +39,11 @@ import {
 } from "./middleware/require-auth.js";
 import { createMeRouter } from "./routes/me.js";
 import {
+  createRepositoriesRouter,
+  type GitHubIssueReader,
+} from "./routes/repositories.js";
+import { createInvestigationsRouter } from "./routes/investigations.js";
+import {
   createInstallationsRouter,
   isValidGitHubAppSlug,
 } from "./routes/installations.js";
@@ -51,6 +56,7 @@ import {
   toGitHubIdString,
   type InstallationDataStore,
   type InstallationSnapshot,
+  type RepositorySnapshot,
 } from "./services/github-installations.js";
 import {
   createSupabaseProfileStore,
@@ -63,6 +69,10 @@ import {
   missingSupabaseAuthEnv,
   missingSupabaseServiceEnv,
 } from "./services/supabase-clients.js";
+import {
+  createSupabaseProductReadStore,
+  type ProductReadStore,
+} from "./services/product-read.js";
 import {
   createInstallationStartRateLimiter,
   asScriptRunner,
@@ -231,6 +241,11 @@ export type ProductApiDeps = {
   getProfileStore: () => Promise<ProfileStore>;
   getRateLimiter: () => Promise<InstallationStartRateLimiter>;
   fetchInstallation: (installationId: string) => Promise<InstallationSnapshot>;
+  fetchInstallationRepositories: (
+    installationId: string,
+  ) => Promise<RepositorySnapshot[]>;
+  getProductReadStore: () => Promise<ProductReadStore>;
+  listGitHubIssues: GitHubIssueReader;
 };
 
 // Normalize GitHub's GET /app/installations/{id} response into the snapshot
@@ -298,6 +313,7 @@ function createDefaultProductApiDeps(env: NodeJS.ProcessEnv): ProductApiDeps {
   let serviceStores: Promise<{
     installations: InstallationDataStore;
     profiles: ProfileStore;
+    productRead: ProductReadStore;
   }> | null = null;
 
   const getServiceStores = () => {
@@ -308,6 +324,7 @@ function createDefaultProductApiDeps(env: NodeJS.ProcessEnv): ProductApiDeps {
       profiles: createSupabaseProfileStore(
         client as unknown as Parameters<typeof createSupabaseProfileStore>[0],
       ),
+      productRead: createSupabaseProductReadStore(client),
     }));
     return serviceStores;
   };
@@ -318,6 +335,9 @@ function createDefaultProductApiDeps(env: NodeJS.ProcessEnv): ProductApiDeps {
   // credential handling — no second private-key parsing system, and no
   // installation access token is minted or persisted here.
   let appAuth: Promise<{ auth: () => Promise<unknown> }> | null = null;
+  let installationAuth:
+    | Promise<{ auth: (installationId: number) => Promise<unknown> }>
+    | null = null;
 
   return {
     getAuthDeps: async () => {
@@ -339,6 +359,7 @@ function createDefaultProductApiDeps(env: NodeJS.ProcessEnv): ProductApiDeps {
     },
     getInstallationStore: async () => (await getServiceStores()).installations,
     getProfileStore: async () => (await getServiceStores()).profiles,
+    getProductReadStore: async () => (await getServiceStores()).productRead,
     getRateLimiter: async () => {
       if (!rateLimiter) {
         const { createRedisConnection } = await import(
@@ -372,6 +393,144 @@ function createDefaultProductApiDeps(env: NodeJS.ProcessEnv): ProductApiDeps {
       );
 
       return snapshotFromAppApiInstallation(data);
+    },
+    fetchInstallationRepositories: async (installationId: string) => {
+      const numericId = Number(installationId);
+      if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+        throw new Error("Installation id is outside the safe integer range.");
+      }
+      installationAuth ??= import("probot").then(({ createProbot }) =>
+        createProbot({ env }),
+      );
+      const probot = await installationAuth;
+      const octokit = (await probot.auth(numericId)) as {
+        rest: {
+          apps: {
+            listReposAccessibleToInstallation(input: {
+              page: number;
+              per_page: number;
+            }): Promise<{
+              data: {
+                repositories: Array<{
+                  id: unknown;
+                  name: string;
+                  full_name: string;
+                  private: boolean;
+                  owner: { login?: string } | null;
+                }>;
+              };
+            }>;
+          };
+        };
+      };
+      const repositories: RepositorySnapshot[] = [];
+      for (let page = 1; page <= 100; page += 1) {
+        const response =
+          await octokit.rest.apps.listReposAccessibleToInstallation({
+            page,
+            per_page: 100,
+          });
+        for (const repository of response.data.repositories) {
+          const repositoryId = toGitHubIdString(repository.id);
+          const ownerLogin = repository.owner?.login;
+          if (!repositoryId || !ownerLogin) {
+            throw new Error("GitHub returned an invalid repository identity.");
+          }
+          repositories.push({
+            repositoryId,
+            ownerLogin,
+            name: repository.name,
+            fullName: repository.full_name,
+            private: repository.private,
+          });
+        }
+        if (response.data.repositories.length < 100) break;
+      }
+      return repositories;
+    },
+    listGitHubIssues: async ({
+      installationId,
+      owner,
+      repository,
+      state,
+      page,
+      perPage,
+    }) => {
+      const numericId = Number(installationId);
+      if (!Number.isSafeInteger(numericId) || numericId <= 0) {
+        throw new Error("Installation id is outside the safe integer range.");
+      }
+      installationAuth ??= import("probot").then(({ createProbot }) =>
+        createProbot({ env }),
+      );
+      const probot = await installationAuth;
+      const octokit = (await probot.auth(numericId)) as {
+        rest: {
+          issues: {
+            listForRepo(input: {
+              owner: string;
+              repo: string;
+              state: "open" | "closed" | "all";
+              page: number;
+              per_page: number;
+              sort: "created";
+              direction: "desc";
+            }): Promise<{
+              data: Array<{
+                id: unknown;
+                number: number;
+                title: string;
+                body: string | null;
+                state: string;
+                html_url: string;
+                user: { login?: string; avatar_url?: string } | null;
+                labels: Array<string | { name?: string }>;
+                created_at: string;
+                updated_at: string;
+                pull_request?: unknown;
+              }>;
+              headers: { link?: string };
+            }>;
+          };
+        };
+      };
+      const response = await octokit.rest.issues.listForRepo({
+        owner,
+        repo: repository,
+        state,
+        page,
+        per_page: perPage,
+        sort: "created",
+        direction: "desc",
+      });
+      return {
+        issues: response.data
+          .filter((issue) => !issue.pull_request)
+          .map((issue) => {
+            const id = toGitHubIdString(issue.id);
+            if (!id) throw new Error("GitHub returned an invalid issue id.");
+            return {
+              id,
+              number: issue.number,
+              title: issue.title,
+              body: issue.body,
+              state: issue.state === "closed" ? "closed" as const : "open" as const,
+              htmlUrl: issue.html_url,
+              author: {
+                login: issue.user?.login ?? "ghost",
+                avatarUrl: issue.user?.avatar_url ?? null,
+              },
+              labels: issue.labels
+                .map((label) =>
+                  typeof label === "string" ? label : label.name ?? "",
+                )
+                .filter(Boolean),
+              createdAt: issue.created_at,
+              updatedAt: issue.updated_at,
+            };
+          }),
+        hasNextPage: /rel="next"/.test(response.headers.link ?? ""),
+      };
     },
   };
 }
@@ -449,7 +608,24 @@ export function createApp(
       getStore: deps.getInstallationStore,
       getProfiles: deps.getProfileStore,
       fetchInstallation: deps.fetchInstallation,
+      fetchInstallationRepositories: deps.fetchInstallationRepositories,
       env,
+    }),
+  );
+  app.use(
+    "/api/repositories",
+    createRepositoriesRouter({
+      requireAuth,
+      getInstallationStore: deps.getInstallationStore,
+      getProductReadStore: deps.getProductReadStore,
+      listGitHubIssues: deps.listGitHubIssues,
+    }),
+  );
+  app.use(
+    "/api/investigations",
+    createInvestigationsRouter({
+      requireAuth,
+      getProductReadStore: deps.getProductReadStore,
     }),
   );
 

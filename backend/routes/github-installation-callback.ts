@@ -26,6 +26,7 @@ import {
   type InstallationSnapshot,
   type NonceRecord,
   type ProfileStore,
+  type RepositorySnapshot,
 } from "../services/github-installations.js";
 
 // Bounded base64url shape for the state parameter (the minted state is 43
@@ -90,6 +91,9 @@ export type InstallationCallbackDeps = {
   // Fetch the authoritative installation from GitHub's App API using the
   // existing GitHub App credentials. Must throw when the lookup fails.
   fetchInstallation: (installationId: string) => Promise<InstallationSnapshot>;
+  fetchInstallationRepositories?: (
+    installationId: string,
+  ) => Promise<RepositorySnapshot[]>;
   env?: NodeJS.ProcessEnv;
   sleep?: (ms: number) => Promise<void>;
   now?: () => Date;
@@ -220,6 +224,24 @@ export function createInstallationCallbackRouter(
       const finalizeVerified = async (
         method: "personal_account_match" | "installation_webhook_sender",
       ) => {
+        if (deps.fetchInstallationRepositories) {
+          try {
+            const repositories =
+              await deps.fetchInstallationRepositories(installationId);
+            await store.upsertInstallationRepositories(
+              installationId,
+              repositories,
+              now().toISOString(),
+            );
+          } catch (error) {
+            // Ownership remains valid even if GitHub's repository-list API is
+            // temporarily unavailable. Installation/repository webhooks and a
+            // later setup callback can reconcile the projection.
+            log(
+              `Setup callback repository reconciliation deferred (${error instanceof Error ? error.name : "error"}).`,
+            );
+          }
+        }
         await store.upsertMembership({
           userId: profile.id,
           installationId,
