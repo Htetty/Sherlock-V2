@@ -152,7 +152,7 @@ type DeliveryRow = {
 const timelineTemplate: DashboardInvestigation["timeline"] = [
   {
     id: "open_preview",
-    label: "Open repository preview",
+    label: "Open preview",
     status: "pending",
     message: "Waiting to open the repository.",
     startedAt: null,
@@ -160,7 +160,7 @@ const timelineTemplate: DashboardInvestigation["timeline"] = [
   },
   {
     id: "reproduce",
-    label: "Reproduce reported issue",
+    label: "Reproduce",
     status: "pending",
     message: "Waiting to reproduce the issue.",
     startedAt: null,
@@ -168,7 +168,7 @@ const timelineTemplate: DashboardInvestigation["timeline"] = [
   },
   {
     id: "diagnose",
-    label: "Diagnose root cause",
+    label: "Diagnose",
     status: "pending",
     message: "Waiting for diagnosis.",
     startedAt: null,
@@ -184,7 +184,7 @@ const timelineTemplate: DashboardInvestigation["timeline"] = [
   },
   {
     id: "verify",
-    label: "Verify fix",
+    label: "Verify",
     status: "pending",
     message: "Waiting for verification.",
     startedAt: null,
