@@ -686,42 +686,52 @@ async function harvestVideo(
   }
 }
 
-// Strict-mode resolution of an intent target. Priority mirrors
-// docs/fable/07: testId, then role(+name), then label, placeholder, text,
-// then bare name as a button. No `.first()` anywhere - ambiguity must throw.
-function resolveTarget(page: Page, target: DomTargetIntent): Locator {
+// Strict-mode resolution of an intent target. `within` first resolves a
+// unique ancestor/container, then resolves the control inside that scope.
+// No `.first()` anywhere - ambiguity must throw.
+export function resolveTarget(page: Page, target: DomTargetIntent): Locator {
+  const scope = target.within
+    ? resolveUnscopedTarget(page, target.within)
+    : page;
+
+  return resolveUnscopedTarget(scope, target);
+}
+
+function resolveUnscopedTarget(
+  root: Page | Locator,
+  target: DomTargetIntent,
+): Locator {
+  let locator: Locator;
+
   if (target.testId) {
-    return page.getByTestId(target.testId);
-  }
-
-  if (target.id) {
-    return page.locator(`#${target.id}`);
-  }
-
-  if (target.role) {
-    return page.getByRole(target.role as Parameters<Page["getByRole"]>[0], {
+    locator = root.getByTestId(target.testId);
+  } else if (target.id) {
+    locator = root.locator(`#${target.id}`);
+  } else if (target.role) {
+    locator = root.getByRole(target.role as Parameters<Page["getByRole"]>[0], {
       name: target.name,
       exact: false,
     });
+  } else if (target.label) {
+    locator = root.getByLabel(target.label);
+  } else if (target.placeholder) {
+    locator = root.getByPlaceholder(target.placeholder);
+  } else if (target.text) {
+    locator = root.getByText(target.text);
+  } else if (target.name) {
+    locator = root.getByRole("button", { name: target.name });
+  } else {
+    throw new Error(`Intent target has no usable keys: ${JSON.stringify(target)}`);
   }
 
-  if (target.label) {
-    return page.getByLabel(target.label);
+  // `text` can disambiguate a role/test-id ancestor without replacing the
+  // primary locator. This is what makes role=listitem + task title useful as
+  // a stable scope for repeated controls.
+  if (target.text && (target.role || target.testId || target.id)) {
+    locator = locator.filter({ hasText: target.text });
   }
 
-  if (target.placeholder) {
-    return page.getByPlaceholder(target.placeholder);
-  }
-
-  if (target.text) {
-    return page.getByText(target.text);
-  }
-
-  if (target.name) {
-    return page.getByRole("button", { name: target.name });
-  }
-
-  throw new Error(`Intent target has no usable keys: ${JSON.stringify(target)}`);
+  return locator;
 }
 
 // Per-key match counts for a failed target, plus cross-checks for the two
@@ -879,6 +889,34 @@ async function evaluateAssertion(
         detail: `Page text ${isPresent ? "contained" : "did not contain"} "${assertion.contains}"; failure condition is text ${assertion.failureWhen}.`,
       };
     }
+    case "input_value": {
+      const targetLabel = JSON.stringify(assertion.target);
+      const value = await resolveTarget(page, assertion.target)
+        .inputValue({ timeout: STEP_TIMEOUT_MS })
+        .catch(() => null);
+
+      if (value === null) {
+        return {
+          assertion,
+          observed: null,
+          matchedFailure: false,
+          matchedExpected: false,
+          detail: `Input ${targetLabel} was not found, was not a form control, or did not resolve to exactly one element.`,
+        };
+      }
+
+      const equals = value === assertion.value;
+      const matchedFailure =
+        assertion.failureWhen === "equals" ? equals : !equals;
+
+      return {
+        assertion,
+        observed: value.slice(0, 500),
+        matchedFailure,
+        matchedExpected: !matchedFailure,
+        detail: `Input value ${equals ? "equaled" : "did not equal"} "${assertion.value}" for ${targetLabel}; failure condition is value ${assertion.failureWhen}.`,
+      };
+    }
     case "response_body": {
       const matches = result.apiResponses.filter((response) => {
         if (assertion.method && response.method !== assertion.method) {
@@ -905,13 +943,19 @@ async function evaluateAssertion(
         };
       }
 
-      const matchedFailure = lastMatch.body.includes(assertion.failureContains);
+      const matchedFailure = matchesResponseBodyAssertion(
+        lastMatch.body,
+        assertion.failureContains,
+      );
       const maybeTruncated = lastMatch.bodyTruncated === true;
       const matchedExpected =
         !matchedFailure &&
         !maybeTruncated &&
         (assertion.expectedContains
-          ? lastMatch.body.includes(assertion.expectedContains)
+          ? matchesResponseBodyAssertion(
+              lastMatch.body,
+              assertion.expectedContains,
+            )
           : true);
       const truncationNote =
         maybeTruncated && !matchedFailure
@@ -966,6 +1010,108 @@ async function evaluateAssertion(
       };
     }
   }
+}
+
+// Response-body assertions remain ordinary substring checks for text, but
+// JSON object fragments are matched structurally as a subset anywhere in the
+// decoded response. This keeps model-generated fragments stable when APIs add
+// fields or serialize object keys in a different order.
+export function matchesResponseBodyAssertion(
+  body: string,
+  expected: string,
+): boolean {
+  if (body.includes(expected)) {
+    return true;
+  }
+
+  const decodedBody = parseJson(body);
+  const decodedFragment =
+    parseJson(expected) ?? parseJson(`{${expected}}`);
+
+  if (
+    decodedBody === null ||
+    decodedFragment === null ||
+    !isJsonObject(decodedFragment)
+  ) {
+    return false;
+  }
+
+  return containsJsonSubset(decodedBody, decodedFragment);
+}
+
+function parseJson(value: string): unknown | null {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function containsJsonSubset(
+  value: unknown,
+  expected: Record<string, unknown>,
+): boolean {
+  if (isJsonObject(value) && isJsonSubset(value, expected)) {
+    return true;
+  }
+
+  if (Array.isArray(value)) {
+    return value.some((item) => containsJsonSubset(item, expected));
+  }
+
+  if (isJsonObject(value)) {
+    return Object.values(value).some((item) =>
+      containsJsonSubset(item, expected),
+    );
+  }
+
+  return false;
+}
+
+function isJsonSubset(
+  value: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  return Object.entries(expected).every(([key, expectedValue]) => {
+    if (!Object.hasOwn(value, key)) {
+      return false;
+    }
+
+    const actualValue = value[key];
+
+    if (isJsonObject(expectedValue)) {
+      return isJsonObject(actualValue) &&
+        isJsonSubset(actualValue, expectedValue);
+    }
+
+    if (Array.isArray(expectedValue)) {
+      return Array.isArray(actualValue) &&
+        expectedValue.length === actualValue.length &&
+        expectedValue.every((item, index) =>
+          isJsonValueEqual(actualValue[index], item),
+        );
+    }
+
+    return Object.is(actualValue, expectedValue);
+  });
+}
+
+function isJsonValueEqual(actual: unknown, expected: unknown): boolean {
+  if (isJsonObject(expected)) {
+    return isJsonObject(actual) && isJsonSubset(actual, expected);
+  }
+
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual) &&
+      expected.length === actual.length &&
+      expected.every((item, index) => isJsonValueEqual(actual[index], item));
+  }
+
+  return Object.is(actual, expected);
 }
 
 async function saveScreenshot(
@@ -1125,7 +1271,7 @@ export function computePageSnapshotDelta(
 // Interactive elements described in the exact vocabulary DomTargetIntent
 // accepts (role, name, label, placeholder, testId, id, text) - what the agent
 // sees is what it can target. Capping/truncation is the caller's job.
-async function buildPageSnapshot(page: Page): Promise<PageSnapshot> {
+export async function buildPageSnapshot(page: Page): Promise<PageSnapshot> {
   const url = page.url();
   const title = await page.title().catch(() => "");
 
@@ -1158,6 +1304,22 @@ async function buildPageSnapshot(page: Page): Promise<PageSnapshot> {
         if (testId) parts.push(`testId="${testId}"`);
         if (el.id) parts.push(`id="${el.id}"`);
         if (placeholder) parts.push(`placeholder="${placeholder}"`);
+
+        const exposesValue =
+          tag === "textarea" ||
+          tag === "select" ||
+          (tag === "input" &&
+            !["hidden", "password", "checkbox", "radio", "file", "submit", "button"]
+              .includes(type ?? "text"));
+
+        if (exposesValue) {
+          const value = (el as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement)
+            .value
+            .replace(/\s+/g, " ")
+            .replace(/"/g, "&quot;")
+            .slice(0, 120);
+          parts.push(`value="${value}"`);
+        }
 
         let label = ariaLabel ?? "";
 

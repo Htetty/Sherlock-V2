@@ -384,14 +384,19 @@ export function renderPullRequestDescription(
     if (failure) summaryLines.push(`- Observed before the fix: ${failure}`);
     const mode = data.reproduction.mode === "browser"
       ? "browser"
-      : data.reproduction.mode === "api"
+      : data.reproduction.mode === "api" || data.reproduction.mode === "api-only"
         ? "API"
-        : data.reproduction.mode === "browser_and_api"
+        : data.reproduction.mode === "browser_and_api" || data.reproduction.mode === "mixed"
           ? "browser and API"
           : null;
     summaryLines.push(
       `- Verified by replaying the recorded ${mode ? `${mode} ` : ""}reproduction (${data.reproduction.stepCount} step${data.reproduction.stepCount === 1 ? "" : "s"}) against the patched application.`,
     );
+    if (data.reproduction.mode === "api-only" && data.replayEvidence === null) {
+      summaryLines.push(
+        "- No visual comparison is available because the accepted reproduction was API-only, so no browser session was recorded.",
+      );
+    }
   }
   sections.push(`## Summary\n\n${summaryLines.join("\n")}`);
 

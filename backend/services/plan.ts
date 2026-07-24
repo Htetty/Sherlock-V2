@@ -13,7 +13,7 @@ export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 // zero or multiple matches fail the step instead of guessing. The model-facing
 // prompt only teaches targets; raw selectors remain valid for saved-plan
 // replay compatibility.
-export type DomTargetIntent = {
+export type DomTargetScope = {
   role?: string;
   name?: string;
   label?: string;
@@ -23,6 +23,12 @@ export type DomTargetIntent = {
   testId?: string;
   // HTML id attribute value.
   id?: string;
+};
+
+export type DomTargetIntent = DomTargetScope & {
+  // Scope this target to a grounded ancestor/container, e.g. the delete
+  // button within the list item whose text names the task.
+  within?: DomTargetScope;
 };
 
 export type ReproductionStep =
@@ -62,6 +68,12 @@ export type PlanAssertion =
       type: "page_text";
       contains: string;
       failureWhen: "present" | "absent";
+    }
+  | {
+      type: "input_value";
+      target: DomTargetIntent;
+      value: string;
+      failureWhen: "equals" | "not_equals";
     }
   | {
       type: "element_text";
@@ -115,7 +127,12 @@ const MAX_WAIT_MS = 10_000;
 // Steps that drive a real browser page. Assertions that read browser state
 // (console errors, page/element text) are vacuous without at least one of these.
 const BROWSER_ACTIONS = new Set(["goto", "click", "fill", "waitForSelector"]);
-const BROWSER_ONLY_ASSERTIONS = new Set(["console_error", "page_text", "element_text"]);
+const BROWSER_ONLY_ASSERTIONS = new Set([
+  "console_error",
+  "page_text",
+  "input_value",
+  "element_text",
+]);
 
 export function validateReproductionPlan(value: unknown): PlanValidationResult {
   const errors: string[] = [];
@@ -336,6 +353,19 @@ function validateAssertion(value: unknown): string[] {
         ];
       }
       return [];
+    case "input_value":
+      if (
+        !hasOnlyKeys(assertion, ["type", "target", "value", "failureWhen"]) ||
+        !isDomTargetIntent(assertion.target) ||
+        typeof assertion.value !== "string" ||
+        (assertion.failureWhen !== "equals" &&
+          assertion.failureWhen !== "not_equals")
+      ) {
+        return [
+          'input_value assertion must have a valid target, a string value, and failureWhen set to "equals" or "not_equals".',
+        ];
+      }
+      return [];
     case "element_text": {
       const bySelector =
         hasOnlyKeys(assertion, ["type", "selector", "contains"]) &&
@@ -424,20 +454,30 @@ const TARGET_KEYS = [
   "text",
   "testId",
   "id",
+  "within",
 ] as const;
 
 export function isDomTargetIntent(value: unknown): value is DomTargetIntent {
+  return isTargetObject(value, true);
+}
+
+function isTargetObject(value: unknown, allowWithin: boolean): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }
 
   const target = value as Record<string, unknown>;
   const keys = Object.keys(target);
+  const selectorKeys = keys.filter((key) => key !== "within");
 
   return (
-    keys.length > 0 &&
+    selectorKeys.length > 0 &&
     keys.every((key) => (TARGET_KEYS as readonly string[]).includes(key)) &&
-    keys.every((key) => typeof target[key] === "string" && target[key] !== "")
+    selectorKeys.every(
+      (key) => typeof target[key] === "string" && target[key] !== "",
+    ) &&
+    (target.within === undefined ||
+      (allowWithin && isTargetObject(target.within, false)))
   );
 }
 

@@ -33,6 +33,12 @@ describe("reproducer fallback routing", () => {
     expect(shouldRunReproducerFallback("not_reproduced", true)).toBe(true);
   });
 
+  test("indeterminate one-shot assertions always escalate", () => {
+    expect(
+      shouldRunReproducerFallback("not_reproduced", false, false),
+    ).toBe(true);
+  });
+
   test("environment failures do not invoke the reproducer fallback", () => {
     expect(shouldRunReproducerFallback("environment_failed", true)).toBe(false);
   });

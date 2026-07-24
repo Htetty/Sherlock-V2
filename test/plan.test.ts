@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { buildReproductionPlanPrompt } from "../backend/services/claude.js";
 import {
   validateReproductionPlan,
   REPRODUCTION_PLAN_VERSION,
@@ -197,5 +198,32 @@ describe("validateReproductionPlan", () => {
     expect(validateReproductionPlan(null).ok).toBe(false);
     expect(validateReproductionPlan("plan").ok).toBe(false);
     expect(validateReproductionPlan([validPlan]).ok).toBe(false);
+  });
+});
+
+describe("reproduction plan prompt", () => {
+  test("requires browser-first reproduction when the issue provides grounded UI steps", () => {
+    const prompt = buildReproductionPlanPrompt({
+      issueTitle: "Empty notes can be created",
+      issueBody: "Leave the input empty, click Add, then refresh.",
+      repoUrl: "https://github.com/acme/notes",
+      defaultBranch: "main",
+      fileTree: ["public/app.js", "server.js"],
+      packageJson: null,
+      readme: null,
+      sourceFiles: [],
+      sandboxResult: {
+        baseUrl: "http://localhost:3000",
+        stdout: "",
+        stderr: "",
+      },
+    } as never);
+
+    expect(prompt).toContain("Browser-first reproduction policy");
+    expect(prompt).toContain("MUST reproduce through those browser controls first");
+    expect(prompt).toContain("Direct API requests are a fallback");
+    expect(prompt).toContain(
+      "response_status assertion may observe a request triggered by a browser click",
+    );
   });
 });

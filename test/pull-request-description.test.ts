@@ -232,6 +232,24 @@ describe("pull request description", () => {
     expectPrivateDescription(rendered);
   });
 
+  test("explains why an API-only reproduction has no visual comparison", () => {
+    const rendered = renderPullRequestDescription(
+      buildPullRequestDescriptionData(baseInput({
+        plan: {
+          ...baseInput().plan,
+          mode: "api-only",
+        },
+        replayEvidence: null,
+      })),
+    );
+
+    expect(rendered).toContain(
+      "No visual comparison is available because the accepted reproduction was API-only",
+    );
+    expect(rendered).toContain("recorded API reproduction");
+    expect(rendered).toContain("no browser session was recorded");
+  });
+
   test("review focus derives only from explicit structured signals", () => {
     const rendered = renderPullRequestDescription(
       buildPullRequestDescriptionData(

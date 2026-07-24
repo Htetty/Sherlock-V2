@@ -97,7 +97,7 @@ const REPRODUCER_SHARED_LIMITS = {
 
 export const STANDARD_REPRODUCER_BUDGETS = {
   ...REPRODUCER_SHARED_LIMITS,
-  maxModelTurns: 16,
+  maxModelTurns: 25,
   maxBrowserActions: 8, // goto/click/fill/wait combined
   maxRequestCalls: 8,
   maxReadPageCalls: 5,
@@ -350,18 +350,30 @@ export type ReproducerAgentDeps = {
 
 // --- Tools -------------------------------------------------------------------------
 
+const TARGET_PROPERTIES = {
+  role: { type: "string" as const },
+  name: { type: "string" as const },
+  label: { type: "string" as const },
+  placeholder: { type: "string" as const },
+  text: { type: "string" as const },
+  testId: { type: "string" as const },
+  id: { type: "string" as const },
+};
+
+const TARGET_SCOPE_SCHEMA = {
+  type: "object" as const,
+  description:
+    "Grounded ancestor/container used to scope a repeated control. Use one or more of: role, name, label, placeholder, text, testId, id.",
+  properties: TARGET_PROPERTIES,
+};
+
 const TARGET_SCHEMA = {
   type: "object" as const,
   description:
-    'Intent target, never a CSS selector. One or more of: role, name, label, placeholder, text, testId (data-testid attribute ONLY), id (HTML id attribute). All values non-empty strings that you have seen via read_page.',
+    'Intent target, never a CSS selector. One or more of: role, name, label, placeholder, text, testId (data-testid attribute ONLY), id (HTML id attribute). Use optional "within" to scope a repeated control to a grounded ancestor. All values must be non-empty strings seen via read_page.',
   properties: {
-    role: { type: "string" },
-    name: { type: "string" },
-    label: { type: "string" },
-    placeholder: { type: "string" },
-    text: { type: "string" },
-    testId: { type: "string" },
-    id: { type: "string" },
+    ...TARGET_PROPERTIES,
+    within: TARGET_SCOPE_SCHEMA,
   },
 };
 
@@ -388,11 +400,17 @@ const PLAN_STEP_SCHEMA = {
 const ASSERTION_SCHEMA = {
   type: "object" as const,
   description:
-    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"page_text", contains, failureWhen:"present"|"absent"}. page_text checks the visible page body; use failureWhen:"absent" when expected text failing to appear is the bug. console_error/page_text require at least one browser step in the plan.',
+    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"page_text", contains, failureWhen:"present"|"absent"} | {type:"input_value", target, value, failureWhen:"equals"|"not_equals"}. page_text checks visible body text and never reads input values; use input_value for input/textarea/select state. Browser-state assertions require at least one browser step.',
   properties: {
     type: {
       type: "string",
-      enum: ["response_status", "response_body", "console_error", "page_text"],
+      enum: [
+        "response_status",
+        "response_body",
+        "console_error",
+        "page_text",
+        "input_value",
+      ],
     },
     pathPattern: { type: "string" },
     method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
@@ -401,7 +419,12 @@ const ASSERTION_SCHEMA = {
     failureContains: { type: "string" },
     expectedContains: { type: "string" },
     contains: { type: "string" },
-    failureWhen: { type: "string", enum: ["present", "absent"] },
+    target: TARGET_SCHEMA,
+    value: { type: "string" },
+    failureWhen: {
+      type: "string",
+      enum: ["present", "absent", "equals", "not_equals"],
+    },
   },
   required: ["type"],
 };
@@ -419,7 +442,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "click",
     description:
-      "Click an element in the live browser. Strict mode: an ambiguous target fails with per-key match diagnostics.",
+      'Click an element in the live browser. Strict mode: an ambiguous target fails with per-key match diagnostics. For repeated controls, scope the target with "within" to the row/card/list item whose text identifies it.',
     input_schema: {
       type: "object" as const,
       properties: { target: TARGET_SCHEMA },
@@ -461,7 +484,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "read_page",
     description:
-      "Digest of the CURRENT page (URL, title, interactive elements in target vocabulary) plus console/network/API evidence recorded since your last read_page.",
+      "Digest of the CURRENT page (URL, title, interactive elements in target vocabulary, and current non-secret form values) plus console/network/API evidence recorded since your last read_page.",
     input_schema: { type: "object" as const, properties: {} },
   },
   {
@@ -1955,11 +1978,14 @@ const buildReproducerSystemPrompt = (
 
 Rules:
 - Ground every target in read_page output — target only elements you have seen, using the most specific unique key (testId > role+name > label/placeholder > id > unique text). Never use CSS selectors. Ambiguous targets fail; use the returned diagnostics to pick a unique key.
+- For repeated controls, scope the target to a grounded container with "within", for example: {"role":"button","name":"✕","within":{"role":"listitem","text":"Set up CI pipeline"}}.
+- read_page reports current values for non-secret form controls. Use those values to verify that text remains attached to the correct row after an action; password values are intentionally hidden.
 ${context.runSteps ? `- Use run_steps to execute a sequence you are already confident about (login flow, form fill, navigating to a known route) in ONE call: it runs 2-6 goto/click/fill/wait/request actions sequentially, stops at the first failure, and returns per-step outcomes plus the accumulated evidence. Each step still consumes its normal action budget — run_steps saves turns, not actions. Use single actions when you genuinely need to observe the page between steps.\n` : ""}${context.actionDeltas ? `- Successful goto/click/fill results include a bounded PAGE DELTA (URL/title changes, elements that appeared or disappeared). Use it to decide your next action without a separate read_page; call read_page only when you need the full element list. Deltas do NOT satisfy the mandatory read_page look before submitting.\n` : ""}
 - The frozen plan replays against a FRESH app instance: it must not depend on state your exploration created. Include every setup step the plan needs (create the data it asserts about).
 - After async work (202 responses, queued jobs, background saves), insert an explicit "wait" step long enough for the work to finish — your interactive timing will not carry over to the replay.
 - The assertion must detect the reported failure using evidence you actually observed: copy exact strings from responses and errors you saw. Never invent error text.
-- A "console_error" or "page_text" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step). For a UI bug where expected text fails to appear, use page_text with failureWhen "absent"; do not attach the expected text to a button or input target.
+- A "console_error", "page_text", or "input_value" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
+- page_text checks body.innerText and NEVER includes the current value of an input, textarea, or select. For form state use input_value with a grounded target and failureWhen "equals" or "not_equals". For other visible text that fails to appear, use page_text with failureWhen "absent".
 - Use browser actions (goto/click/fill) for UI/user-facing bugs. Use request actions for API/backend bugs. If your reproduction is API-only, make that intentional and assert against response_status or response_body. Do not open a blank page just to create a screenshot - screenshots are only meaningful when the bug is visible on a page.
 - Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.

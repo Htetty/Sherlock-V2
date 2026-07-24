@@ -49,6 +49,7 @@ import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
   boundFixDiff,
+  findReplayCandidate,
   findStaleFile,
   hashRepoFilesAtCommit,
   loadMemory,
@@ -234,11 +235,13 @@ export type ReproducerFallbackCase =
 export function shouldRunReproducerFallback(
   fallbackCase: ReproducerFallbackCase,
   escalateNotReproduced: boolean,
+  assertionMatchedExpected = true,
 ): boolean {
   return (
     fallbackCase === "plan_failed" ||
     fallbackCase === "execution_failed" ||
-    (fallbackCase === "not_reproduced" && escalateNotReproduced)
+    (fallbackCase === "not_reproduced" &&
+      (escalateNotReproduced || !assertionMatchedExpected))
   );
 }
 
@@ -617,6 +620,7 @@ export async function runInvestigationPipeline(
         );
 
         await appendMemory(payload.repoUrl, {
+          issueNumber: payload.issueNumber,
           issueTitle: payload.issueTitle,
           issueTerms: issueTerms.slice(0, 8),
           commitSha: repoContext!.commit,
@@ -765,7 +769,21 @@ export async function runInvestigationPipeline(
     // A stored plan from a past verified/reproduced investigation is replayed
     // from scratch. A stale-but-attempted replay is safe (it just fails and
     // falls through); the hash check only skips obviously wasteful attempts.
-    const replayCandidate = pastEntries.find((entry) => entry.reproductionPlan);
+    const replayCandidate = findReplayCandidate(
+      pastEntries,
+      payload.issueNumber,
+      payload.issueTitle,
+    );
+
+    if (
+      !forceReproducerAgent &&
+      !replayCandidate &&
+      pastEntries.some((entry) => entry.reproductionPlan)
+    ) {
+      log(
+        "Memory plans matched repository context but belonged to different issues; using them as planning context instead of direct replay.",
+      );
+    }
 
     if (!forceReproducerAgent && replayCandidate?.reproductionPlan) {
       log("Memory replay candidate found.");
@@ -915,12 +933,22 @@ export async function runInvestigationPipeline(
           reproductionPath = "one_shot";
           await costShape.update({ oneShotPlanSucceeded: true });
         } else if (
-          shouldRunReproducerFallback(oneShotResult.outcome, escalateNotReproduced)
+          shouldRunReproducerFallback(
+            oneShotResult.outcome,
+            escalateNotReproduced,
+            oneShotResult.assertion?.matchedExpected === true,
+          )
         ) {
           if (oneShotResult.outcome === "not_reproduced") {
-            log(
-              "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
-            );
+            if (oneShotResult.assertion?.matchedExpected === true) {
+              log(
+                "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
+              );
+            } else {
+              log(
+                "One-shot reproduction assertion matched neither failure nor expected behavior; falling back to reproducer agent.",
+              );
+            }
           } else {
             log(
               "One-shot reproduction execution failed; falling back to reproducer agent.",
@@ -1537,6 +1565,7 @@ export async function runInvestigationPipeline(
       }
 
       await appendMemory(payload.repoUrl, {
+        issueNumber: payload.issueNumber,
         issueTitle: payload.issueTitle,
         issueTerms: memoryFields.issueTerms,
         commitSha: repoContext.commit,

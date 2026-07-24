@@ -9,6 +9,7 @@ import {
   appendMemory,
   boundFixDiff,
   findStaleFile,
+  findReplayCandidate,
   hashRepoFilesAtCommit,
   loadMemory,
   matchMemory,
@@ -73,6 +74,61 @@ describe("appendMemory", () => {
       "utf8",
     );
     expect(JSON.parse(raw)).toHaveLength(5);
+  });
+});
+
+describe("direct memory replay eligibility", () => {
+  const addNotePlan = {
+    version: 1,
+    baseUrl: "http://localhost:3000",
+    steps: [{ id: "step-1", action: "goto", path: "/" }],
+    expectedBehavior: "The added note appears immediately.",
+    failureCondition: "The added note stays hidden.",
+    assertion: {
+      type: "page_text",
+      contains: "Buy milk",
+      failureWhen: "absent",
+    },
+  } as MemoryEntry["reproductionPlan"];
+
+  test("does not directly replay a plan from a different issue with overlapping terms", () => {
+    const prior: MemoryEntry = {
+      ...entry(1),
+      issueNumber: 6,
+      issueTitle: "New note does not appear after Add",
+      issueTerms: ["note", "add", "appear"],
+      reproductionPlan: addNotePlan,
+    };
+
+    expect(
+      findReplayCandidate([prior], 8, "Delete removes the wrong note"),
+    ).toBeNull();
+    expect(matchMemory([prior], ["delete", "removes", "wrong", "note"])).toContain(prior);
+  });
+
+  test("allows replay for the same normalized issue title", () => {
+    const prior: MemoryEntry = {
+      ...entry(1),
+      issueNumber: 8,
+      issueTitle: "  New note DOES not appear after Add  ",
+      reproductionPlan: addNotePlan,
+    };
+
+    expect(
+      findReplayCandidate([prior], 8, "new note does not appear after add"),
+    ).toBe(prior);
+  });
+
+  test("keeps legacy entries without an issue number as context only", () => {
+    const prior: MemoryEntry = {
+      ...entry(1),
+      issueTitle: "New note does not appear after Add",
+      reproductionPlan: addNotePlan,
+    };
+
+    expect(
+      findReplayCandidate([prior], 8, "New note does not appear after Add"),
+    ).toBeNull();
   });
 });
 
