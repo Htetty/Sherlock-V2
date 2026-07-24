@@ -21,8 +21,6 @@ dist
 # Local tool output
 fable
 
-docs
-docs/
 # OS files
 .DS_Store
 
@@ -35,5 +33,4 @@ _state
 PROJECT_OVERVIEW.md
 LOCAL_AGENT_IMPLEMENTATION_PLAN.md
 .claude/
-docs/
 supabase/.temp/

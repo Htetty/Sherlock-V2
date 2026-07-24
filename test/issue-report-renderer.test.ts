@@ -502,39 +502,43 @@ describe("validation and limitation variants", () => {
 });
 
 describe("section-level bounds and Markdown integrity", () => {
-  test("oversized fields are truncated per section, never the whole document", () => {
-    const attempt = verifiedFixAttempt();
-    attempt.rootCause = "R".repeat(5_000);
-    attempt.summary = "S".repeat(5_000);
-    const report = buildInvestigationReportData({
-      summary: verifiedSummary({
-        observed: "O".repeat(5_000),
-        error: "E".repeat(50_000),
-      }),
-      fixAttempt: attempt,
-    });
-    const rendered = renderIssueReport(report, { status: "created", url: null });
+  test(
+    "oversized fields are truncated per section, never the whole document",
+    () => {
+      const attempt = verifiedFixAttempt();
+      attempt.rootCause = "R".repeat(5_000);
+      attempt.summary = "S".repeat(5_000);
+      const report = buildInvestigationReportData({
+        summary: verifiedSummary({
+          observed: "O".repeat(5_000),
+          error: "E".repeat(50_000),
+        }),
+        fixAttempt: attempt,
+      });
+      const rendered = renderIssueReport(report, { status: "created", url: null });
 
-    // Every section survives the oversized fields.
-    for (const section of [
-      "### Root cause",
-      "### Fix",
-      "### Validation",
-      "### Limitations",
-      "### Pull request",
-      "<details>",
-      "</details>",
-    ]) {
-      expect(rendered).toContain(section);
-    }
-    expect(rendered).toContain("R".repeat(700) + "…");
-    expect(rendered).not.toContain("R".repeat(701));
-    expect(rendered.length).toBeLessThan(10_000);
-    // The details block is closed after truncation.
-    expect(rendered.indexOf("</details>")).toBeGreaterThan(
-      rendered.indexOf("<details>"),
-    );
-  });
+      // Every section survives the oversized fields.
+      for (const section of [
+        "### Root cause",
+        "### Fix",
+        "### Validation",
+        "### Limitations",
+        "### Pull request",
+        "<details>",
+        "</details>",
+      ]) {
+        expect(rendered).toContain(section);
+      }
+      expect(rendered).toContain("R".repeat(700) + "…");
+      expect(rendered).not.toContain("R".repeat(701));
+      expect(rendered.length).toBeLessThan(10_000);
+      // The details block is closed after truncation.
+      expect(rendered.indexOf("</details>")).toBeGreaterThan(
+        rendered.indexOf("<details>"),
+      );
+    },
+    10_000,
+  );
 
   test("field text cannot inject HTML, markers, or details tags", () => {
     const attempt = verifiedFixAttempt();

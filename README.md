@@ -90,8 +90,6 @@ for details.
 Sherlock can record the reproduction run (where the bug fails) and the
 post-fix verification run (where the exact saved plan passes), build a
 side-by-side comparison, and embed it in the GitHub comment as visual proof.
-See [docs/FABLE_REPLAY_EVIDENCE_PROMPT.md](docs/FABLE_REPLAY_EVIDENCE_PROMPT.md)
-for the design.
 
 - Browser and mixed reproduction plans automatically record `videos/run.webm`
   and `videos/post-patch.webm`. API-only plans have nothing visual to record;
@@ -173,8 +171,6 @@ none of them happen automatically:
 ## Contributing
 
 If you have suggestions for how sherlock-backend could be improved, or want to report a bug, open an issue! We'd love all and any contributions.
-
-For more, check out the [Contributing Guide](CONTRIBUTING.md).
 
 ## License
 
