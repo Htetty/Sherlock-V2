@@ -5,11 +5,12 @@
     "module": "node18",
     "declaration": true,
     "sourceMap": true,
-    "rootDir": "./src",
+    "rootDir": ".",
     "outDir": "./lib",
 
     /* Strict Type-Checking Options */
     "strict": true,
+    "skipLibCheck": true,
 
     /* Additional Checks */
     "noUnusedLocals": true,
@@ -21,5 +22,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"]
+  "include": ["src", "backend", "evals"]
 }

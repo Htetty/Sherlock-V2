@@ -1,13 +1,35 @@
+// Webhook behavior with the Redis-backed queue: "/sherlock investigate" must
+// enqueue a job and post a "queued" comment — never run the investigation
+// pipeline inline. The queue adapter is injected, so no Redis is needed.
 import nock from "nock";
-// Requiring our app implementation
-import myProbotApp from "../src/index.js";
+import { createSherlockApp } from "../src/index.js";
 import { Probot, ProbotOctokit } from "probot";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, beforeEach, afterEach, test, expect } from "vitest";
-// Requiring our fixtures
-import payload from "./fixtures/issues.opened.json" with { type: "json" };
+import {
+  buildInvestigationJobId,
+  deriveTenantIdFromInstallation,
+  type InvestigationJobPayload,
+  type InvestigationQueueAdapter,
+} from "../backend/queue/investigation-queue.js";
+import type { InvestigationRateLimiter } from "../backend/services/rate-limit.js";
+import { createInMemoryProductDataStore } from "../backend/services/product-data.js";
+
+// Permissive limiter fake: these tests focus on queueing behavior, and the
+// default (injected only when absent) would open a real Redis connection.
+function allowAllRateLimiter(): InvestigationRateLimiter {
+  return {
+    checkAndConsumeInvestigationRateLimit: async (tenantKey) => ({
+      allowed: true,
+      tenantKey,
+      count: 1,
+      limit: 10,
+      windowSeconds: 3600,
+    }),
+  };
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,62 +38,404 @@ const privateKey = fs.readFileSync(
   "utf-8",
 );
 
-const issueCreatedBody = { body: "Thanks for opening this issue!" };
+function buildWebhookPayload(commentId: number) {
+  return {
+    action: "created",
+    issue: {
+      id: 1001,
+      number: 1,
+      title: "Example bug",
+      body: "Something broke",
+      html_url: "https://github.com/hiimbex/testing-things/issues/1",
+    },
+    comment: {
+      id: commentId,
+      body: "/sherlock investigate",
+      user: { id: 3003, login: "hiimbex" },
+    },
+    repository: {
+      id: 2002,
+      name: "testing-things",
+      full_name: "hiimbex/testing-things",
+      private: true,
+      html_url: "https://github.com/hiimbex/testing-things",
+      default_branch: "main",
+      owner: { login: "hiimbex" },
+    },
+    installation: { id: 2 },
+  };
+}
 
-describe("My Probot app", () => {
-  let probot: any;
+// In-memory queue with the same deterministic-id dedupe semantics as the
+// real BullMQ adapter.
+function createFakeQueue() {
+  const jobs = new Map<string, InvestigationJobPayload>();
+  const claims = new Set<string>();
+
+  const adapter: InvestigationQueueAdapter = {
+    add: async (payload, options) => {
+      const jobId = buildInvestigationJobId(payload);
+      let queuedPayload = payload;
+
+      if (claims.has(jobId)) {
+        return { jobId, deduplicated: true, rateLimited: false };
+      }
+
+      claims.add(jobId);
+
+      if (options?.onClaim) {
+        const decision = await options.onClaim();
+        if (decision === "duplicate") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: true, rateLimited: false };
+        }
+        if (decision === false || decision === "rate_limited") {
+          claims.delete(jobId);
+          return { jobId, deduplicated: false, rateLimited: true };
+        }
+        if (
+          decision &&
+          typeof decision === "object" &&
+          decision.decision === "allow"
+        ) {
+          queuedPayload = decision.payload;
+        }
+      }
+
+      try {
+        jobs.set(jobId, queuedPayload);
+        await options?.onEnqueued?.(jobId, queuedPayload);
+        return { jobId, deduplicated: false, rateLimited: false };
+      } catch (error) {
+        claims.delete(jobId);
+        throw error;
+      }
+    },
+    close: async () => {},
+  };
+
+  return { adapter, jobs };
+}
+
+function mockGithub(expectedComments: number) {
+  return nock("https://api.github.com")
+    .post("/app/installations/2/access_tokens")
+    .reply(200, { token: "test", permissions: { issues: "write" } })
+    .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
+      expect(body.body).toContain("**Investigation queued**");
+      // The investigation id lives only inside the hidden delivery marker;
+      // the visible text never shows it.
+      expect(body.body).toMatch(
+        /<!-- sherlock-delivery-comment:inv_[0-9A-Z]{10,} -->/,
+      );
+      expect(body.body).not.toMatch(/Investigation: inv_/);
+      return true;
+    })
+    .times(expectedComments)
+    .reply(200);
+}
+
+describe("Sherlock webhook (queued investigations)", () => {
+  let probot: Probot;
+  let fake: ReturnType<typeof createFakeQueue>;
+  let productData: ReturnType<typeof createInMemoryProductDataStore>;
 
   beforeEach(() => {
     nock.disableNetConnect();
+    fake = createFakeQueue();
+    productData = createInMemoryProductDataStore();
     probot = new Probot({
       appId: 123,
       privateKey,
-      // disable request throttling and retries for testing
-      Octokit: ProbotOctokit.defaults((instanceOptions: {}) => ({
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
         ...instanceOptions,
         retry: { enabled: false },
         throttle: { enabled: false },
       })),
     });
-    // Load our app into probot
-    probot.load(myProbotApp);
-  });
-
-  test("creates a comment when an issue is opened", async () => {
-    const mock = nock("https://api.github.com")
-      // Test that we correctly return a test token
-      .post("/app/installations/2/access_tokens")
-      .reply(200, {
-        token: "test",
-        permissions: {
-          issues: "write",
-        },
-      })
-
-      // Test that a comment is posted
-      .post("/repos/hiimbex/testing-things/issues/1/comments", (body: any) => {
-        expect(body).toMatchObject(issueCreatedBody);
-        return true;
-      })
-      .reply(200);
-
-    // Receive a webhook event
-    await probot.receive({ name: "issues", payload });
-
-    expect(mock.pendingMocks()).toStrictEqual([]);
+    probot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        // Authorization is covered in command-gate.test.ts; these tests
+        // focus on queueing behavior.
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: allowAllRateLimiter(),
+        productData,
+      }),
+    );
   });
 
   afterEach(() => {
     nock.cleanAll();
     nock.enableNetConnect();
   });
+
+  test("enqueues a job and posts a queued comment instead of running the pipeline inline", async () => {
+    const mock = mockGithub(1);
+
+    // disableNetConnect guarantees this fails loudly if the webhook tries to
+    // call the investigation backend (the old inline behavior).
+    await probot.receive({
+      id: "delivery-1",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(mock.pendingMocks()).toStrictEqual([]);
+    expect(fake.jobs.size).toBe(1);
+
+    const job = [...fake.jobs.values()][0];
+    expect(job.investigationId).toMatch(/^inv_[0-9A-Z]{10,}$/);
+    expect(job.tenantId).toBe("tenant-gh-2");
+    expect(job.installationId).toBe(2);
+    expect(job.repositoryOwner).toBe("hiimbex");
+    expect(job.repositoryName).toBe("testing-things");
+    expect(job.issueNumber).toBe(1);
+    expect(job.triggeringCommentId).toBe(4242);
+    expect(job.deliveryId).toBe("delivery-1");
+    expect(productData.snapshot().investigations).toHaveLength(1);
+
+    // No secrets in the queue payload.
+    const serialized = JSON.stringify(job).toLowerCase();
+    expect(serialized).not.toContain("token");
+    expect(serialized).not.toContain("apikey");
+    expect(serialized).not.toContain("private");
+  });
+
+  test("duplicate delivery of the same comment creates only one job and one comment", async () => {
+    const mock = mockGithub(1);
+
+    await probot.receive({
+      id: "delivery-1",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    // Same comment redelivered (e.g. webhook retry): if this tried to post
+    // another comment, the single nock mock above would reject it.
+    await probot.receive({
+      id: "delivery-2",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("a pending durable command bypasses a second rate-limit decision after enqueue acknowledgement fails", async () => {
+    const mock = mockGithub(1);
+    const durableStore = createInMemoryProductDataStore();
+    let acknowledgementAttempts = 0;
+    let rateLimitSlots = 0;
+    const recoveryProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    recoveryProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: {
+          checkAndConsumeInvestigationRateLimit: async (tenantKey) => {
+            rateLimitSlots += 1;
+            return {
+              allowed: rateLimitSlots === 1,
+              tenantKey,
+              count: rateLimitSlots,
+              limit: 1,
+              windowSeconds: 3600,
+            };
+          },
+        },
+        productData: {
+          ...durableStore,
+          markInvestigationEnqueued: async (input) => {
+            acknowledgementAttempts += 1;
+            if (acknowledgementAttempts === 1) {
+              throw new Error("Supabase acknowledgement unavailable");
+            }
+            await durableStore.markInvestigationEnqueued(input);
+          },
+        },
+      }),
+    );
+
+    await expect(
+      recoveryProbot.receive({
+        id: "delivery-ack-failed",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+    ).rejects.toThrow("Supabase acknowledgement unavailable");
+
+    await recoveryProbot.receive({
+      id: "delivery-redelivery",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    await recoveryProbot.receive({
+      id: "delivery-permanent-duplicate",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(rateLimitSlots).toBe(1);
+    expect(acknowledgementAttempts).toBe(2);
+    expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("dashboard persistence unavailability cannot suppress the existing queue path", async () => {
+    const mock = mockGithub(1);
+    const unavailableProduct = createInMemoryProductDataStore();
+    const compatibilityProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    compatibilityProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: allowAllRateLimiter(),
+        productData: {
+          ...unavailableProduct,
+          findInvestigationCommand: async () => {
+            throw new Error("Supabase unavailable");
+          },
+        },
+      }),
+    );
+
+    await compatibilityProbot.receive({
+      id: "delivery-product-unavailable",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+
+    expect(fake.jobs.size).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("concurrent duplicate deliveries queue once and consume one rate-limit slot", async () => {
+    const mock = mockGithub(1);
+    let rateLimitSlots = 0;
+    const concurrentProbot = new Probot({
+      appId: 123,
+      privateKey,
+      Octokit: ProbotOctokit.defaults((instanceOptions: object) => ({
+        ...instanceOptions,
+        retry: { enabled: false },
+        throttle: { enabled: false },
+      })),
+    });
+    concurrentProbot.load(
+      createSherlockApp({
+        queue: fake.adapter,
+        getRepositoryRole: async () => ({ roleName: "write" }),
+        rateLimiter: {
+          checkAndConsumeInvestigationRateLimit: async (tenantKey) => {
+            rateLimitSlots += 1;
+            return {
+              allowed: true,
+              tenantKey,
+              count: rateLimitSlots,
+              limit: 10,
+              windowSeconds: 3600,
+            };
+          },
+        },
+      }),
+    );
+
+    await Promise.all([
+      concurrentProbot.receive({
+        id: "delivery-concurrent-1",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+      concurrentProbot.receive({
+        id: "delivery-concurrent-2",
+        name: "issue_comment",
+        payload: buildWebhookPayload(4242) as any,
+      }),
+    ]);
+
+    expect(fake.jobs.size).toBe(1);
+    expect(rateLimitSlots).toBe(1);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("the same delivery id does not collapse different comment commands", async () => {
+    const mock = mockGithub(2);
+
+    await probot.receive({
+      id: "delivery-shared",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    await probot.receive({
+      id: "delivery-shared",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4343) as any,
+    });
+
+    expect(fake.jobs.size).toBe(2);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+  });
+
+  test("a distinct later comment on the same issue creates a new job", async () => {
+    const mock = mockGithub(2);
+
+    await probot.receive({
+      id: "delivery-1",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4242) as any,
+    });
+    await probot.receive({
+      id: "delivery-3",
+      name: "issue_comment",
+      payload: buildWebhookPayload(4343) as any,
+    });
+
+    expect(fake.jobs.size).toBe(2);
+    expect(mock.pendingMocks()).toStrictEqual([]);
+
+    const jobIds = [...fake.jobs.keys()];
+    expect(jobIds[0]).not.toBe(jobIds[1]);
+  });
+
+  test("tenant id derives from the installation while the deterministic job id stays opaque", () => {
+    expect(deriveTenantIdFromInstallation(2)).toBe("tenant-gh-2");
+    expect(deriveTenantIdFromInstallation(2)).toBe(deriveTenantIdFromInstallation(2));
+
+    const jobId = buildInvestigationJobId({
+      tenantId: "tenant-gh-2",
+      repositoryOwner: "hiimbex",
+      repositoryName: "testing-things",
+      issueNumber: 1,
+      triggeringCommentId: 4242,
+    });
+
+    expect(jobId).toMatch(/^investigate_[0-9a-f]{64}$/);
+    expect(jobId).not.toContain(":");
+    for (const marker of [
+      "tenant-gh-2",
+      "hiimbex",
+      "testing-things",
+      "issue-1",
+      "comment-4242",
+    ]) {
+      expect(jobId).not.toContain(marker);
+    }
+  });
 });
-
-// For more information about testing with Jest see:
-// https://facebook.github.io/jest/
-
-// For more information about using TypeScript in your tests, Jest recommends:
-// https://github.com/kulshekhar/ts-jest
-
-// For more information about testing with Nock see:
-// https://github.com/nock/nock

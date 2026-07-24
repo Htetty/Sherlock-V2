@@ -1,0 +1,2331 @@
+// Bounded tool-using reproducer agent (docs/fable/11).
+//
+// Plan AUTHORING is agentic: the model drives a real browser/API session
+// against the live sandbox and observes actual outcomes. The REPRODUCED
+// VERDICT is deterministic: a submitted plan is validated by
+// validateReproductionPlan() and replayed FROM SCRATCH by
+// executeReproductionPlan() against a pristine workspace and restarted
+// sandbox. Only that clean replay can mark the issue "reproduced" - the
+// model's live observations count for nothing until the frozen plan
+// reproduces on its own.
+//
+// Loop conventions mirror backend/agents/fixer.ts: native tool use, one tool
+// call per turn, per-call message snapshots, one nudge on a non-tool
+// response, injectable deps, full artifact transcript, hard budgets.
+
+import { execFile } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
+import type Anthropic from "@anthropic-ai/sdk";
+import { createCompactor } from "./compaction.js";
+import {
+  createArtifactStore,
+  rebaseExecutionArtifactPaths,
+} from "../services/artifacts.js";
+import {
+  MODEL,
+  formatGraphSection,
+  formatPastSection,
+} from "../services/claude.js";
+import { runInference, type InferenceTelemetry } from "../services/inference.js";
+import type { RestartResult } from "../services/fix.js";
+import type { GraphContext } from "../services/graphContext.js";
+import {
+  REPRODUCTION_PLAN_VERSION,
+  getPlanMode,
+  hashPlanBehavior,
+  validateReproductionPlan,
+  validateStep,
+  type PlanAssertion,
+  type PlanMode,
+  type ReproductionPlan,
+  type ReproductionStep,
+} from "../services/plan.js";
+import {
+  computeReproducerDivergence,
+  formatReproducerDivergence,
+  hasDivergence,
+  type ReproducerDivergence,
+} from "../services/reproduction-divergence.js";
+import {
+  computePageSnapshotDelta,
+  evaluateLiveAssertion,
+  executeReproductionPlan,
+  formatPageSnapshot,
+  openLiveSession,
+  type LiveSession,
+  type PageSnapshot,
+  type ReproductionResult,
+  type StepRecord,
+} from "../services/playwright.js";
+import {
+  resolveEfficiencyPolicy,
+  type EfficiencyPolicy,
+} from "../services/efficiency-policy.js";
+import type { SourceFile } from "../services/repo.js";
+import { redactSecrets } from "../services/report.js";
+import {
+  summarizeReproductionEvidence,
+  truncateUtf8Bytes,
+  type ReproductionEvidenceSummary,
+} from "../services/reproduction-evidence.js";
+import type { CreateModelMessage } from "./fixer.js";
+
+const execFileAsync = promisify(execFile);
+
+// --- Budgets (docs/fable/11) --------------------------------------------------
+//
+// Two profiles: cost-conscious "standard" (default) and quality-oriented
+// "deep" behind SHERLOCK_DEEP_INVESTIGATION=true. Every tool call consumes a
+// model turn, so maxModelTurns must cover the plausible tool-call budget plus
+// terminal turns. First-pass numbers — tune from cost-shape.json.
+
+// Limits shared by both profiles (safety caps, not cost knobs).
+const REPRODUCER_SHARED_LIMITS = {
+  maxWallTimeMs: 10 * 60_000,
+  maxResponseTokens: 4_000,
+  // Per read_page result.
+  maxDigestBytes: 16 * 1024,
+  // Cumulative tool-result bytes returned to the model.
+  maxEvidenceBytes: 300 * 1024,
+  // Per action-delta digest appended to goto/click/fill results (fable/16).
+  maxActionDeltaBytes: 2 * 1024,
+  // run_steps batch size (fable/16).
+  maxRunStepsPerCall: 6,
+  // Rendered prior-attempt (warm start) section in the initial message.
+  maxPriorAttemptBytes: 4 * 1024,
+};
+
+export const STANDARD_REPRODUCER_BUDGETS = {
+  ...REPRODUCER_SHARED_LIMITS,
+  maxModelTurns: 16,
+  maxBrowserActions: 8, // goto/click/fill/wait combined
+  maxRequestCalls: 8,
+  maxReadPageCalls: 5,
+  maxPlanSubmissions: 2, // invalid submissions count
+};
+
+export const DEEP_REPRODUCER_BUDGETS = {
+  ...REPRODUCER_SHARED_LIMITS,
+  maxModelTurns: 40,
+  maxBrowserActions: 30,
+  maxRequestCalls: 15,
+  maxReadPageCalls: 15,
+  maxPlanSubmissions: 3,
+};
+
+export type ReproducerBudgets = typeof STANDARD_REPRODUCER_BUDGETS;
+
+// Stable alias for existing imports; the agent runtime selects a profile via
+// getReproducerBudgets() at run start instead of using this directly.
+export const REPRODUCER_BUDGETS = STANDARD_REPRODUCER_BUDGETS;
+
+export function getBudgetProfileName(): "standard" | "deep" {
+  return process.env.SHERLOCK_DEEP_INVESTIGATION === "true" ? "deep" : "standard";
+}
+
+export function getReproducerBudgets(): ReproducerBudgets {
+  return getBudgetProfileName() === "deep"
+    ? DEEP_REPRODUCER_BUDGETS
+    : STANDARD_REPRODUCER_BUDGETS;
+}
+
+// --- Public interface -----------------------------------------------------------
+
+export type ReproducerAgentInput = {
+  investigationId: string;
+  investigationDir: string;
+  repoPath: string;
+  sourceCommit: string;
+  issueTitle: string;
+  issueBody: string;
+  repoUrl: string;
+  defaultBranch: string;
+  fileTree: string[];
+  packageJson: string | null;
+  readme: string | null;
+  sandboxResult: { baseUrl: string; stdout: string; stderr: string };
+  graphContext: GraphContext;
+  initialSourceFiles: SourceFile[];
+  pastInvestigations: string;
+  abortSignal?: AbortSignal;
+  // Plan-behavior hashes that failed to reproduce in PREVIOUS investigations
+  // of this issue (from memory failedPlans). COMMIT-SCOPED: the guard only
+  // blocks a hash whose recorded commitSha equals the current sourceCommit —
+  // an old failure on a different commit informs (via rendered memory) but
+  // never blocks.
+  knownFailedPlans?: Array<{
+    planHash: string;
+    commitSha: string;
+    failureReason: string;
+  }>;
+  // Restart the sandbox (fresh container) and return the new base URL.
+  restart: () => Promise<RestartResult>;
+  // Inference telemetry (FABLE_IMPLEMENTATION_PROMPT.md Phase 1.1). Optional:
+  // absent means calls run untelemetered, exactly as before the gateway.
+  telemetry?: InferenceTelemetry | null;
+  // Per-task policy overrides (Phase 2.5). Absent: env-flag defaults.
+  budgetProfile?: "standard" | "deep";
+  compaction?: boolean;
+  // Resolved per-investigation efficiency policy (fable/16). Immutable for
+  // the whole run. Absent (tests/direct callers): resolved from env once at
+  // run start — never re-read mid-run.
+  efficiency?: EfficiencyPolicy;
+  // Warm start (fable/16): the structured trace of a scripted reproduction
+  // attempt (one-shot plan or memory replay) that EXECUTED but did not
+  // reproduce. Only populated when a plan actually ran — never fabricated
+  // for plan-generation or validation failures.
+  priorAttempt?: PriorReproductionAttempt | null;
+};
+
+// --- Warm start (fable/16) -----------------------------------------------------
+
+export type PriorAttemptStep = {
+  id: string;
+  action: string;
+  outcome: string;
+  error?: string | null;
+};
+
+export type PriorReproductionAttempt = {
+  source: "one_shot" | "memory_replay";
+  // The executed plan's steps, exactly as replayed.
+  planSteps: ReproductionStep[];
+  // Per-step outcomes from the execution, in order.
+  executedSteps: PriorAttemptStep[];
+  // The first failed step (null when every step passed but the assertion
+  // did not match).
+  failedStep: PriorAttemptStep | null;
+  // Bounded rendering of summarizeReproductionEvidence() for the failed run.
+  evidenceSummary: string;
+  // The already-validated assertion from that replay. Live exploration may
+  // use it only to stop searching; the pristine replay remains authoritative.
+  assertion?: PlanAssertion;
+};
+
+export type ReproducerAgentStatus =
+  | "reproduced" // official clean replay matched the failure
+  | "not_reproduced" // final valid plan replayed cleanly, showed expected behavior
+  | "plan_failed" // no valid plan produced / agent declared not reproducible
+  | "environment_failed"
+  | "exhausted"
+  | "failed";
+
+// Exploration mode (docs/fable/11 observability): which kind of tools the
+// agent actually used. Distinct from the submitted plan's mode - the agent
+// may explore in the browser and submit an API-only plan, or vice versa.
+export type ReproductionMode = "api-only" | "browser" | "mixed" | "unknown";
+
+export type PlanSubmissionRecord = {
+  index: number;
+  valid: boolean;
+  // Canonical behavior hash (hashPlanBehavior over the submitted steps +
+  // assertion), present for every submission — invalid ones included, hashed
+  // over the raw submitted values.
+  planHash: string;
+  validationErrors?: string[];
+  // Origin-free evidence signature of this submission's replay; null when the
+  // submission never reached replay (invalid).
+  replaySignature?: string | null;
+  // What the agent had explored with UP TO this submission. Exploration can
+  // be broader than the frozen proof (e.g. mixed exploration, api-only plan).
+  explorationModeAtSubmission?: ReproductionMode;
+  // Mode of the SUBMITTED plan (from its steps), present for valid plans.
+  planMode?: PlanMode;
+  replayOutcome?: string;
+  replayReason?: string;
+};
+
+export type ReproducerAgentResult = {
+  plan: ReproductionPlan | null; // the frozen plan (when submitted + valid)
+  result: ReproductionResult | null; // from the OFFICIAL clean replay only
+  status: ReproducerAgentStatus;
+  reason: string;
+  // How the agent explored (may be broader than the accepted plan's mode).
+  explorationMode: ReproductionMode;
+  submissions: PlanSubmissionRecord[];
+  // Bounded, deterministic live-exploration observations (Change 4). Hints
+  // for the fixer, never proof — the official replay stays authoritative.
+  findings: ReproducerFinding[];
+  // Deterministic failure classification (REPRODUCER_LOOP_UPGRADE_PROMPT.md).
+  // Null on "reproduced" and "not_reproduced" — the latter is a truthful
+  // negative result, not a failure.
+  failureCode: ReproducerFailureCode | null;
+  failureEvidence: ReproducerFailureEvidence | null;
+  // Cost-shape observability (artifacts/<inv_id>/cost-shape.json).
+  turns: number;
+  compactionEvents: number;
+  // fable/16 efficiency observability.
+  efficiencyCounters: {
+    runStepsCalls: number;
+    batchedActions: number;
+    actionDeltaBytes: number;
+    readPageCalls: number;
+    eligibleBatches: number;
+    avoidableUnbatchedCalls: number;
+    estimatedTurnsSaved: number;
+  };
+};
+
+// --- Failure taxonomy (REPRODUCER_LOOP_UPGRADE_PROMPT.md, Change 1) -----------
+
+export type ReproducerFailureCode =
+  | "reproducer_no_submission"           // budgets exhausted before any submit_plan
+  | "reproducer_all_submissions_invalid" // every submission failed validation
+  | "reproducer_replay_diverged"         // failure observed live, but no replay reproduced it
+  | "reproducer_no_failure_signal"       // failure never observed, live or replayed
+  | "reproducer_repeated_plan"           // duplicate-plan cap hit (Change 3)
+  | "reproducer_ambiguity_loop"          // >= 3 ambiguous-target step failures, no valid submission accepted
+  | "reproducer_environment";            // environment_failed terminal state
+
+export type ReproducerFailureEvidence = {
+  code: ReproducerFailureCode;
+  failureObservedLive: boolean;
+  // One entry per submission, in order (bounded by maxPlanSubmissions).
+  submissions: Array<{
+    planHash: string;
+    valid: boolean;
+    invalidReasons?: string[];
+    replaySignature: string | null;
+    replayOutcome: string | null;
+  }>;
+  // Shared bounded summary of the LAST failed replay (null if none ran).
+  lastReplayEvidence: ReproductionEvidenceSummary | null;
+  // Structured divergence from Change 4 (null when not computable).
+  divergence: ReproducerDivergence | null;
+};
+
+// True when live exploration observed the failure itself: a runtime error, or
+// a response finding carrying a 4xx/5xx status. Shared by the failure
+// classifier and future consumers (e.g. plan_mismatch routing).
+export function failureObservedLive(findings: ReproducerFinding[]): boolean {
+  return liveFailureReason(findings) !== null;
+}
+
+export function liveFailureReason(
+  findings: ReproducerFinding[],
+): "runtime_error" | "http_error" | "validated_semantic_assertion" | null {
+  if (findings.some((finding) => finding.kind === "semantic_failure")) {
+    return "validated_semantic_assertion";
+  }
+  if (findings.some((finding) => finding.kind === "runtime_error")) {
+    return "runtime_error";
+  }
+  if (
+    findings.some(
+      (finding) =>
+        finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation),
+    )
+  ) {
+    return "http_error";
+  }
+  return null;
+}
+
+// --- Structured findings (AGENT_LOOP_UPGRADE_PROMPT.md, Change 4) -------------
+//
+// Deterministic summaries of actual tool observations, built at tool-execution
+// time. Never model-generated prose, never byte-count metadata.
+
+export type ReproducerFinding = {
+  kind:
+    | "route"
+    | "element"
+    | "response"
+    | "runtime_error"
+    | "semantic_failure"
+    | "tool_failure";
+  observation: string;
+  sourceTool: string;
+  sourceStepId: string | null;
+  evidenceClass: "live_exploration";
+};
+
+export const MAX_REPRODUCER_FINDINGS = 30;
+export const MAX_REPRODUCER_FINDING_BYTES = 300;
+export const MAX_RENDERED_REPRODUCER_FINDINGS_BYTES = 2 * 1024;
+
+// Final cap selection: prefer recent runtime errors and route/response
+// findings, then fill with the rest (newest first). Chronological order is
+// preserved in the returned array.
+export function selectReproducerFindings(
+  all: ReproducerFinding[],
+): ReproducerFinding[] {
+  if (all.length <= MAX_REPRODUCER_FINDINGS) {
+    return [...all];
+  }
+
+  const priority = new Set(["runtime_error", "semantic_failure", "route", "response"]);
+  const selected = new Set<ReproducerFinding>();
+
+  for (let index = all.length - 1; index >= 0; index -= 1) {
+    if (selected.size >= MAX_REPRODUCER_FINDINGS) break;
+    if (priority.has(all[index].kind)) selected.add(all[index]);
+  }
+
+  for (let index = all.length - 1; index >= 0; index -= 1) {
+    if (selected.size >= MAX_REPRODUCER_FINDINGS) break;
+    selected.add(all[index]);
+  }
+
+  return all.filter((finding) => selected.has(finding));
+}
+
+export type ReproducerAgentDeps = {
+  createMessage: CreateModelMessage;
+  openLiveSession: typeof openLiveSession;
+  executeReproductionPlan: typeof executeReproductionPlan;
+};
+
+// --- Tools -------------------------------------------------------------------------
+
+const TARGET_PROPERTIES = {
+  role: { type: "string" as const },
+  name: { type: "string" as const },
+  label: { type: "string" as const },
+  placeholder: { type: "string" as const },
+  text: { type: "string" as const },
+  testId: { type: "string" as const },
+  id: { type: "string" as const },
+};
+
+const TARGET_SCOPE_SCHEMA = {
+  type: "object" as const,
+  description:
+    "Grounded ancestor/container used to scope a repeated control. Use one or more of: role, name, label, placeholder, text, testId, id.",
+  properties: TARGET_PROPERTIES,
+};
+
+const TARGET_SCHEMA = {
+  type: "object" as const,
+  description:
+    'Intent target, never a CSS selector. One or more of: role, name, label, placeholder, text, testId (data-testid attribute ONLY), id (HTML id attribute). Use optional "within" to scope a repeated control to a grounded ancestor. All values must be non-empty strings seen via read_page.',
+  properties: {
+    ...TARGET_PROPERTIES,
+    within: TARGET_SCOPE_SCHEMA,
+  },
+};
+
+const PLAN_STEP_SCHEMA = {
+  type: "object" as const,
+  description:
+    'One reproduction step. Shapes: {id, action:"goto", path} | {id, action:"click"|"waitForSelector", target} | {id, action:"fill", target, value} | {id, action:"wait", ms<=10000} | {id, action:"screenshot"} | {id, action:"request", method, path, body?}. Paths are relative and start with "/".',
+  properties: {
+    id: { type: "string" },
+    action: {
+      type: "string",
+      enum: ["goto", "click", "fill", "waitForSelector", "screenshot", "wait", "request"],
+    },
+    path: { type: "string" },
+    target: TARGET_SCHEMA,
+    value: { type: "string" },
+    ms: { type: "number" },
+    method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+    body: { type: "object" },
+  },
+  required: ["id", "action"],
+};
+
+const ASSERTION_SCHEMA = {
+  type: "object" as const,
+  description:
+    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"page_text", contains, failureWhen:"present"|"absent"} | {type:"input_value", target, value, failureWhen:"equals"|"not_equals"}. page_text checks visible body text and never reads input values; use input_value for input/textarea/select state. Browser-state assertions require at least one browser step.',
+  properties: {
+    type: {
+      type: "string",
+      enum: [
+        "response_status",
+        "response_body",
+        "console_error",
+        "page_text",
+        "input_value",
+      ],
+    },
+    pathPattern: { type: "string" },
+    method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+    expected: { type: "number" },
+    failureValue: { type: "number" },
+    failureContains: { type: "string" },
+    expectedContains: { type: "string" },
+    contains: { type: "string" },
+    target: TARGET_SCHEMA,
+    value: { type: "string" },
+    failureWhen: {
+      type: "string",
+      enum: ["present", "absent", "equals", "not_equals"],
+    },
+  },
+  required: ["type"],
+};
+
+const TOOLS: Anthropic.Messages.Tool[] = [
+  {
+    name: "goto",
+    description: "Navigate the live browser to a path (relative to the sandbox, starts with \"/\").",
+    input_schema: {
+      type: "object" as const,
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+  {
+    name: "click",
+    description:
+      'Click an element in the live browser. Strict mode: an ambiguous target fails with per-key match diagnostics. For repeated controls, scope the target with "within" to the row/card/list item whose text identifies it.',
+    input_schema: {
+      type: "object" as const,
+      properties: { target: TARGET_SCHEMA },
+      required: ["target"],
+    },
+  },
+  {
+    name: "fill",
+    description: "Fill a form field in the live browser.",
+    input_schema: {
+      type: "object" as const,
+      properties: { target: TARGET_SCHEMA, value: { type: "string" } },
+      required: ["target", "value"],
+    },
+  },
+  {
+    name: "request",
+    description:
+      "Send an HTTP request to the sandbox app (relative path). Returns status and body.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+        path: { type: "string" },
+        body: { type: "object" },
+      },
+      required: ["method", "path"],
+    },
+  },
+  {
+    name: "wait",
+    description: "Pause the live session (max 10000 ms) to let async work settle.",
+    input_schema: {
+      type: "object" as const,
+      properties: { ms: { type: "number" } },
+      required: ["ms"],
+    },
+  },
+  {
+    name: "read_page",
+    description:
+      "Digest of the CURRENT page (URL, title, interactive elements in target vocabulary, and current non-secret form values) plus console/network/API evidence recorded since your last read_page.",
+    input_schema: { type: "object" as const, properties: {} },
+  },
+  {
+    name: "submit_plan",
+    description:
+      "Freeze your reproduction plan. It is validated, then replayed FROM SCRATCH against a pristine workspace and freshly restarted app - your live session state does not carry over. Only that clean replay decides reproduction. You receive the replay result.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        steps: { type: "array", items: PLAN_STEP_SCHEMA },
+        expectedBehavior: { type: "string", description: "One sentence: correct behavior." },
+        failureCondition: { type: "string", description: "One sentence: the reported failure." },
+        assertion: ASSERTION_SCHEMA,
+      },
+      required: ["steps", "expectedBehavior", "failureCondition", "assertion"],
+    },
+  },
+  {
+    name: "submit_not_reproducible",
+    description:
+      "Declare that the reported issue cannot be reproduced in this app (e.g. the described behavior/elements do not exist). Ends the session.",
+    input_schema: {
+      type: "object" as const,
+      properties: { reason: { type: "string" } },
+      required: ["reason"],
+    },
+  },
+];
+
+const BROWSER_ACTION_TOOLS = new Set(["goto", "click", "fill", "wait"]);
+
+// run_steps (fable/16): appended to the tool list only when the resolved
+// efficiency policy enables it, fixed at run start so tool definitions stay
+// byte-identical across every turn (cache prefix stability).
+const RUN_STEPS_TOOL: Anthropic.Messages.Tool = {
+  name: "run_steps",
+  description:
+    "Execute 2-6 actions (goto | click | fill | wait | request) SEQUENTIALLY in one call. Execution stops at the first failed step; unreached steps are skipped. Each executed step consumes its normal budget — this saves turns, not actions. You receive per-step outcomes, the stop index, and one accumulated evidence delta. Use it for sequences you are already confident about (login flows, form fills, navigating to a known route); use single actions when you need to observe the page between steps. read_page and submit_* are not allowed as steps.",
+  input_schema: {
+    type: "object" as const,
+    properties: {
+      steps: {
+        type: "array",
+        minItems: 2,
+        maxItems: 6,
+        items: {
+          type: "object",
+          description:
+            'One action. Shapes: {action:"goto", path} | {action:"click", target} | {action:"fill", target, value} | {action:"wait", ms<=10000} | {action:"request", method, path, body?}.',
+          properties: {
+            action: {
+              type: "string",
+              enum: ["goto", "click", "fill", "wait", "request"],
+            },
+            path: { type: "string" },
+            target: TARGET_SCHEMA,
+            value: { type: "string" },
+            ms: { type: "number" },
+            method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
+            body: { type: "object" },
+          },
+          required: ["action"],
+        },
+      },
+    },
+    required: ["steps"],
+  },
+};
+
+// --- UI-first policy ---------------------------------------------------------------
+// The agent must look at the running app (at least one successful goto and
+// one read_page) before submitting a plan or declaring the issue not
+// reproducible - UNLESS the issue or past memory clearly identifies an API
+// endpoint failure. Returns the matched signal (for artifacts/logs) or null.
+
+export function detectApiIssueSignal(text: string): string | null {
+  const methodPath = text.match(/\b(GET|POST|PUT|PATCH|DELETE)\s+\/[^\s"'`)]+/);
+
+  if (methodPath) {
+    return `explicit request "${methodPath[0]}"`;
+  }
+
+  const apiPath = text.match(/(?:^|[\s"'`(])(\/api\/[^\s"'`)]+)/);
+
+  if (apiPath) {
+    return `API route "${apiPath[1]}"`;
+  }
+
+  const hasStatusCode = /\b[45]\d{2}\b/.test(text);
+
+  if (hasStatusCode && /\b(api|endpoint|route|request|response)\b/i.test(text)) {
+    return "HTTP status code mentioned together with an API/endpoint/request reference";
+  }
+
+  if (/\bendpoint\b/i.test(text)) {
+    return 'the word "endpoint"';
+  }
+
+  return null;
+}
+
+// --- Agent loop -----------------------------------------------------------------------
+
+export async function runReproducerAgent(
+  input: ReproducerAgentInput,
+  deps: Partial<ReproducerAgentDeps> = {},
+): Promise<ReproducerAgentResult> {
+  // Efficiency policy (fable/16): resolved once per investigation and passed
+  // in; resolved from env exactly once here only for tests/direct callers.
+  const efficiency = input.efficiency ?? resolveEfficiencyPolicy();
+  const createMessage =
+    deps.createMessage ??
+    ((params) =>
+      runInference(
+        {
+          phase: "reproduce",
+          telemetry: input.telemetry ?? null,
+          policy: { cacheMode: efficiency.promptCacheMode },
+        },
+        params,
+      ));
+  const openSession = deps.openLiveSession ?? openLiveSession;
+  const replayPlan = deps.executeReproductionPlan ?? executeReproductionPlan;
+  // Fixed at run start: tool list and system prompt must be byte-identical
+  // on every turn of the run (cache prefix stability).
+  const tools = efficiency.reproducerRunSteps ? [...TOOLS, RUN_STEPS_TOOL] : TOOLS;
+  const systemPrompt = buildReproducerSystemPrompt({
+    runSteps: efficiency.reproducerRunSteps,
+    actionDeltas: efficiency.reproducerActionDeltas,
+  });
+
+  // Budget profile is selected once at run start and used for the whole run.
+  // Per-task policy override first (Phase 2.5), env default second.
+  const budgetProfile = input.budgetProfile ?? getBudgetProfileName();
+  const budgets =
+    budgetProfile === "deep" ? DEEP_REPRODUCER_BUDGETS : STANDARD_REPRODUCER_BUDGETS;
+
+  const log = (message: string) => {
+    console.log(`[${input.investigationId}] Reproducer: ${message}`);
+  };
+
+  log(`Reproducer budget profile: ${budgetProfile}`);
+
+  const agentDir = path.join(input.investigationDir, "repro-agent");
+  const store = await createArtifactStore(input.investigationId, agentDir);
+  await mkdir(path.join(agentDir, "tool-calls"), { recursive: true });
+  // Exploration screenshots (after browser actions, plus failure shots) live
+  // under exploration/screenshots/, separate from official replay artifacts.
+  const explorationStore = await createArtifactStore(
+    input.investigationId,
+    path.join(agentDir, "exploration"),
+  );
+
+  const startedAt = Date.now();
+  const counters = {
+    turns: 0,
+    browserActions: 0, // goto/click/fill/wait attempts (budget)
+    requests: 0, // request attempts (budget)
+    // Mode counters: only actions that passed validation and actually ran
+    // against the live session. Invalid attempts never count toward mode.
+    pageActionsExecuted: 0, // goto/click/fill
+    requestsExecuted: 0,
+    gotoPassed: 0, // successful goto steps (UI-first policy)
+    readPage: 0,
+    readPageOk: 0, // read_page calls that returned a digest (UI-first policy)
+    submissions: 0,
+    // Duplicate-plan guard (Change 3): rejections that never reached replay.
+    duplicatePlanRejections: 0,
+    // Failed steps whose target was ambiguous (strict-mode violations) — the
+    // reproducer_ambiguity_loop classification input.
+    ambiguousStepFailures: 0,
+    evidenceBytes: 0,
+    // fable/16 observability.
+    runStepsCalls: 0,
+    batchedActions: 0,
+    actionDeltaBytes: 0,
+    eligibleBatches: 0,
+    avoidableUnbatchedCalls: 0,
+    estimatedTurnsSaved: 0,
+  };
+  let consecutiveStandaloneActions = 0;
+
+  const boundAndAccountEvidence = (text: string) => {
+    const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
+    const bounded = truncateUtf8Bytes(text, remaining);
+    const bytes = Buffer.byteLength(bounded, "utf8");
+    counters.evidenceBytes += bytes;
+    return { text: bounded, bytes, truncated: bounded !== text };
+  };
+
+  // Duplicate-plan guard state (Change 3): behavior hash -> bounded prior
+  // failure description. Seeded from memory (commit-scoped), extended with
+  // this run's replayed-but-not-reproduced submissions.
+  const failedPlanHashes = new Map<string, string>();
+
+  for (const known of input.knownFailedPlans ?? []) {
+    if (
+      typeof known?.planHash === "string" &&
+      known.planHash &&
+      known.commitSha === input.sourceCommit
+    ) {
+      failedPlanHashes.set(
+        known.planHash,
+        `a plan that failed to reproduce in a previous investigation of this issue on this same commit: ${truncateUtf8Bytes(known.failureReason ?? "(no reason recorded)", 500)}`,
+      );
+    }
+  }
+
+  // Evidence-delta state (Change 4a) and failure-evidence state (Change 1).
+  let previousFailedReplaySummary: ReproductionEvidenceSummary | null = null;
+  let lastFailedReplaySummary: ReproductionEvidenceSummary | null = null;
+  let lastDivergence: ReproducerDivergence | null = null;
+
+  // UI-first policy: required unless the issue/memory clearly identifies an
+  // API endpoint failure. Satisfied by >=1 successful goto and >=1 read_page.
+  const apiIssueSignal = detectApiIssueSignal(
+    `${input.issueTitle}\n${input.issueBody}\n${input.pastInvestigations}`,
+  );
+  const uiFirstRequired = apiIssueSignal === null;
+  const uiFirstSatisfied = () => counters.gotoPassed >= 1 && counters.readPageOk >= 1;
+
+  if (uiFirstRequired) {
+    log("UI-first policy active: no clear API signal in the issue or memory.");
+  } else {
+    log(`UI-first policy waived: ${apiIssueSignal}.`);
+  }
+
+  // Exploration mode: page tools (goto/click/fill/read_page) vs request.
+  // "wait" is neutral. "unknown" = no meaningful action before a terminal.
+  const explorationMode = (): ReproductionMode => {
+    const pageTouches = counters.pageActionsExecuted + counters.readPage;
+
+    if (pageTouches > 0 && counters.requestsExecuted > 0) {
+      return "mixed";
+    }
+
+    if (pageTouches > 0) {
+      return "browser";
+    }
+
+    if (counters.requestsExecuted > 0) {
+      return "api-only";
+    }
+
+    return "unknown";
+  };
+  const submissions: PlanSubmissionRecord[] = [];
+  const transcript: unknown[] = [];
+  let toolCallIndex = 0;
+  let stepCounter = 0;
+  let nudged = false;
+  let forcedSubmissionReason:
+    | "runtime_error"
+    | "http_error"
+    | "validated_semantic_assertion"
+    | null = null;
+
+  // Compaction: per-task override first, then the resolved efficiency policy
+  // (default ON, fable/16). Unchanged triggers (6 tool calls / 60KB).
+  const compactor = createCompactor({
+    enabled: input.compaction ?? efficiency.compaction,
+  });
+  const factLog: string[] = [];
+  let lastReplayFeedback = "";
+
+  const buildStateSummary = (): string => {
+    const sections = [
+      factLog.length > 0
+        ? `Actions taken so far (live exploration):\n${factLog.slice(-40).map((line) => `- ${line}`).join("\n")}`
+        : "No exploration actions yet.",
+      submissions.length > 0
+        ? `Plan submissions so far:\n${submissions
+            .map(
+              (submission) =>
+                `- submission ${submission.index}: ${submission.valid ? `replay ${submission.replayOutcome ?? "?"} — ${(submission.replayReason ?? "").slice(0, 200)}` : `invalid — ${(submission.validationErrors ?? []).join(" | ").slice(0, 300)}`}`,
+            )
+            .join("\n")}`
+        : "No plan submissions yet.",
+      lastReplayFeedback ? `Latest official replay feedback:\n${lastReplayFeedback}` : "",
+      `Remaining budgets: ${budgets.maxModelTurns - counters.turns} model turn(s), ${Math.max(0, budgets.maxBrowserActions - counters.browserActions)} browser action(s), ${Math.max(0, budgets.maxRequestCalls - counters.requests)} request(s), ${Math.max(0, budgets.maxReadPageCalls - counters.readPage)} read_page call(s), ${budgets.maxPlanSubmissions - counters.submissions} submission(s).`,
+      uiFirstRequired && !uiFirstSatisfied()
+        ? "UI-first policy is still unsatisfied: perform at least one successful goto and one read_page before submitting."
+        : "",
+    ];
+
+    return sections.filter(Boolean).join("\n\n");
+  };
+
+  const pushResult = (
+    assistantContent: Anthropic.Messages.ContentBlock[],
+    toolUseId: string,
+    content: string,
+    isError: boolean,
+  ) => {
+    pushToolResult(messages, assistantContent, toolUseId, content, isError);
+    compactor.record(content.length);
+
+    if (compactor.maybeCompact(messages, buildStateSummary)) {
+      transcript.push({ type: "compaction", turn: counters.turns, event: compactor.events });
+      log(`compaction event ${compactor.events}: old history replaced with state summary.`);
+    }
+  };
+
+  // Live session state. Opened lazily; closed before every official replay.
+  let session: LiveSession | null = null;
+  let sessionBaseUrl = input.sandboxResult.baseUrl;
+  // Rolling cursors into session.evidence for read_page deltas.
+  let evidenceCursor = { console: 0, page: 0, network: 0, api: 0 };
+  // Action-delta state (fable/16): the last structured page snapshot. Diffed
+  // after successful goto/click/fill, advanced by read_page too (one page
+  // model, one cursor). Reset with the session.
+  let lastPageSnapshot: PageSnapshot | null = null;
+  // Last failed official replay (for the not_reproduced terminal state).
+  let lastReplay: { plan: ReproductionPlan; result: ReproductionResult } | null = null;
+
+  // Structured findings (Change 4): deterministic, deduplicated, bounded.
+  const findings: ReproducerFinding[] = [];
+  const findingKeys = new Set<string>();
+  let findingsCursor = { console: 0, page: 0, network: 0 };
+
+  // --- Shared single-action executor (fable/16) -------------------------------
+  // EXACTLY one implementation of each action's semantics: budget accounting,
+  // validation, execution, findings, mode counters, screenshots, and action
+  // deltas — shared by the standalone tool path and the run_steps batch path
+  // so the two can never drift. Declared as a holder so it can be assigned
+  // after the helpers it uses exist.
+  type LiveActionOutcome = {
+    resultText: string;
+    isError: boolean;
+    // True when this attempt hit a hard action budget (already reflected in
+    // resultText with the standard exhaustion message).
+    budgetExhausted: boolean;
+  };
+
+  const recordFinding = (
+    kind: ReproducerFinding["kind"],
+    observation: string,
+    sourceTool: string,
+    sourceStepId: string | null,
+  ) => {
+    const bounded = truncateUtf8Bytes(
+      redactSecrets(observation).replace(/\s+/g, " ").trim(),
+      MAX_REPRODUCER_FINDING_BYTES,
+    );
+
+    if (!bounded) {
+      return;
+    }
+
+    const key = `${kind}|${bounded}`;
+
+    if (findingKeys.has(key)) {
+      return;
+    }
+
+    findingKeys.add(key);
+    findings.push({
+      kind,
+      observation: bounded,
+      sourceTool,
+      sourceStepId,
+      evidenceClass: "live_exploration",
+    });
+  };
+
+  // New console/page errors and failed requests observed since the last
+  // findings sweep. Peeks without touching the model-facing evidenceCursor.
+  const recordNewEvidenceFindings = (
+    live: LiveSession,
+    sourceTool: string,
+    sourceStepId: string | null,
+  ) => {
+    const { evidence } = live;
+
+    for (const error of evidence.consoleErrors.slice(findingsCursor.console)) {
+      recordFinding("runtime_error", error, sourceTool, sourceStepId);
+    }
+
+    for (const error of evidence.pageErrors.slice(findingsCursor.page)) {
+      recordFinding("runtime_error", error, sourceTool, sourceStepId);
+    }
+
+    for (const failure of evidence.networkFailures.slice(findingsCursor.network)) {
+      recordFinding(
+        "response",
+        `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`,
+        sourceTool,
+        sourceStepId,
+      );
+    }
+
+    findingsCursor.console = evidence.consoleErrors.length;
+    findingsCursor.page = evidence.pageErrors.length;
+    findingsCursor.network = evidence.networkFailures.length;
+  };
+
+  const recordPriorAssertionIfMatched = async (
+    live: LiveSession,
+    sourceTool: string,
+    sourceStepId: string | null,
+    settledPageDigest?: string,
+  ) => {
+    const assertion = input.priorAttempt?.assertion;
+
+    if (!assertion) {
+      return;
+    }
+
+    // Absence assertions need a settled page after meaningful interaction.
+    // Otherwise the blank initial document would be a false-positive stop.
+    if (
+      assertion.type === "page_text" &&
+      assertion.failureWhen === "absent" &&
+      (counters.pageActionsExecuted < 2 || counters.readPageOk < 1)
+    ) {
+      return;
+    }
+
+    const evaluated =
+      assertion.type === "page_text" && settledPageDigest !== undefined
+        ? {
+            matchedFailure:
+              assertion.failureWhen === "present"
+                ? settledPageDigest.includes(assertion.contains)
+                : !settledPageDigest.includes(assertion.contains),
+            detail: `Settled page digest ${
+              settledPageDigest.includes(assertion.contains)
+                ? "contained"
+                : "did not contain"
+            } "${assertion.contains}"; failure condition is text ${assertion.failureWhen}.`,
+          }
+        : await evaluateLiveAssertion(live, assertion);
+
+    if (evaluated.matchedFailure) {
+      recordFinding(
+        "semantic_failure",
+        `validated prior assertion matched: ${evaluated.detail}`,
+        sourceTool,
+        sourceStepId,
+      );
+    }
+  };
+
+  const messages: Anthropic.Messages.MessageParam[] = [];
+
+  const finish = async (
+    status: ReproducerAgentStatus,
+    reason: string,
+    plan: ReproductionPlan | null,
+    result: ReproductionResult | null,
+  ): Promise<ReproducerAgentResult> => {
+    if (session) {
+      await session.close().catch(() => {});
+      session = null;
+    }
+
+    const mode = explorationMode();
+    const acceptedPlanMode = plan ? getPlanMode(plan) : null;
+    // The fixer only ever receives the official replay result of the frozen
+    // plan - never the exploratory browser trace or screenshots.
+    const fixerEvidenceMode = status === "reproduced" ? acceptedPlanMode : null;
+
+    // Bounded structured findings (Change 4): typed result is the runtime
+    // transport; the artifact is the audit trail.
+    const selectedFindings = selectReproducerFindings(findings);
+
+    // Failure classification (Change 1): deterministic, terminal-failure
+    // statuses only. "not_reproduced" is a truthful negative, not a failure.
+    const isTerminalFailure =
+      status === "plan_failed" ||
+      status === "exhausted" ||
+      status === "environment_failed" ||
+      status === "failed";
+    const failureCode = isTerminalFailure
+      ? classifyReproducerFailure({
+          status,
+          submissions,
+          findings: selectedFindings,
+          duplicatePlanRejections: counters.duplicatePlanRejections,
+          ambiguousStepFailures: counters.ambiguousStepFailures,
+        })
+      : null;
+    const failureEvidence: ReproducerFailureEvidence | null = failureCode
+      ? {
+          code: failureCode,
+          failureObservedLive: failureObservedLive(selectedFindings),
+          submissions: submissions.map((submission) => ({
+            planHash: submission.planHash,
+            valid: submission.valid,
+            ...(submission.validationErrors
+              ? {
+                  invalidReasons: submission.validationErrors
+                    .slice(0, 5)
+                    .map((error) => truncateUtf8Bytes(error, 300)),
+                }
+              : {}),
+            replaySignature: submission.replaySignature ?? null,
+            replayOutcome: submission.replayOutcome ?? null,
+          })),
+          lastReplayEvidence: lastFailedReplaySummary,
+          divergence: lastDivergence,
+        }
+      : null;
+
+    const agentResult: ReproducerAgentResult = {
+      plan,
+      result,
+      status,
+      reason,
+      explorationMode: mode,
+      submissions,
+      findings: selectedFindings,
+      failureCode,
+      failureEvidence,
+      turns: counters.turns,
+      compactionEvents: compactor.events,
+      efficiencyCounters: {
+        runStepsCalls: counters.runStepsCalls,
+        batchedActions: counters.batchedActions,
+        actionDeltaBytes: counters.actionDeltaBytes,
+        readPageCalls: counters.readPage,
+        eligibleBatches: counters.eligibleBatches,
+        avoidableUnbatchedCalls: counters.avoidableUnbatchedCalls,
+        estimatedTurnsSaved: counters.estimatedTurnsSaved,
+      },
+    };
+    transcript.push({ type: "final_result", status, reason, submissions, mode, failureCode });
+    await store.writeJson("transcript.json", transcript);
+    await store.writeJson("reproducer-findings.json", selectedFindings);
+
+    if (failureEvidence) {
+      await store.writeJson("failure-evidence.json", failureEvidence);
+    }
+    await store.writeJson("mode.json", {
+      mode,
+      browserActions: counters.pageActionsExecuted,
+      requestActions: counters.requestsExecuted,
+      readPageCalls: counters.readPage,
+      submittedPlans: counters.submissions,
+      submittedPlanMode: acceptedPlanMode,
+      forcedSubmissionReason,
+      uiFirstPolicy: {
+        required: uiFirstRequired,
+        satisfied: uiFirstSatisfied(),
+        apiIssueSignal,
+      },
+    });
+    await store.writeJson("reproduction-evidence-summary.json", {
+      explorationMode: mode,
+      acceptedPlanMode,
+      fixerEvidenceMode,
+      explanation: buildEvidenceExplanation(mode, acceptedPlanMode, status),
+    });
+    await store.writeJson("summary.json", {
+      status,
+      reason,
+      failureCode,
+      mode,
+      acceptedPlanMode,
+      submissions,
+      counters,
+      compactionEvents: compactor.events,
+      durationMs: Date.now() - startedAt,
+      replayOutcome: result?.outcome ?? null,
+    });
+    log(
+      `finished: ${status} (exploration: ${mode}${acceptedPlanMode ? `, accepted plan: ${acceptedPlanMode}` : ""}) — ${reason}`,
+    );
+    if (failureCode) {
+      log(`failure code: ${failureCode}`);
+    }
+    return agentResult;
+  };
+
+  const recordToolCall = async (tool: string, request: unknown, result: string) => {
+    toolCallIndex += 1;
+    const fileName = `tool-calls/${String(toolCallIndex).padStart(3, "0")}-${tool}.json`;
+    await store.writeJson(fileName, {
+      index: toolCallIndex,
+      tool,
+      request,
+      result: redactSecrets(result),
+    });
+  };
+
+  const ensureSession = async (): Promise<LiveSession> => {
+    if (!session) {
+      session = await openSession(sessionBaseUrl, { store: explorationStore });
+      evidenceCursor = { console: 0, page: 0, network: 0, api: 0 };
+      findingsCursor = { console: 0, page: 0, network: 0 };
+      lastPageSnapshot = null;
+    }
+
+    return session;
+  };
+
+  const closeSession = async () => {
+    if (session) {
+      await session.close().catch(() => {});
+      session = null;
+      lastPageSnapshot = null;
+    }
+  };
+
+  // Action delta (fable/16): after a successful goto/click/fill, diff the
+  // structured page snapshot against the previous one and return a bounded
+  // rendering. Counts toward maxEvidenceBytes (accounted by the caller);
+  // never counts as read_page and never satisfies the UI-first policy.
+  const buildActionDelta = async (live: LiveSession): Promise<string> => {
+    if (!efficiency.reproducerActionDeltas || !live.readPageSnapshot) {
+      return "";
+    }
+
+    try {
+      const snapshot = await live.readPageSnapshot();
+      const deltaLines = computePageSnapshotDelta(lastPageSnapshot, snapshot);
+      lastPageSnapshot = snapshot;
+
+      if (deltaLines.length === 0) {
+        return "";
+      }
+
+      let rendered = `PAGE DELTA (bounded; call read_page for the full digest):\n${deltaLines.join("\n")}`;
+
+      return truncateUtf8Bytes(rendered, budgets.maxActionDeltaBytes);
+    } catch {
+      return "";
+    }
+  };
+
+  const executeLiveAction = async (
+    actionName: string,
+    actionInput: Record<string, unknown>,
+    screenshotName: string,
+  ): Promise<LiveActionOutcome> => {
+    const isRequest = actionName === "request";
+
+    if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+      return {
+        resultText: "Evidence budget exhausted — submit a plan or call submit_not_reproducible.",
+        isError: true,
+        budgetExhausted: true,
+      };
+    }
+
+    if (isRequest) {
+      counters.requests += 1;
+    } else {
+      counters.browserActions += 1;
+    }
+
+    if (!isRequest && counters.browserActions > budgets.maxBrowserActions) {
+      return {
+        resultText:
+          "Browser action budget exhausted — submit a plan or call submit_not_reproducible.",
+        isError: true,
+        budgetExhausted: true,
+      };
+    }
+
+    if (isRequest && counters.requests > budgets.maxRequestCalls) {
+      return {
+        resultText:
+          "Request budget exhausted — submit a plan or call submit_not_reproducible.",
+        isError: true,
+        budgetExhausted: true,
+      };
+    }
+
+    stepCounter += 1;
+    const step = {
+      id: `live-${stepCounter}`,
+      action: actionName,
+      ...actionInput,
+    };
+
+    // Same validation rules as frozen plan steps.
+    const stepErrors = validateStep(step, stepCounter - 1);
+
+    if (stepErrors.length > 0) {
+      recordFinding(
+        "tool_failure",
+        `${actionName} rejected as invalid: ${stepErrors.join(" | ")}`,
+        actionName,
+        null,
+      );
+      return {
+        resultText: `Invalid action: ${stepErrors.join(" | ")}`,
+        isError: true,
+        budgetExhausted: false,
+      };
+    }
+
+    try {
+      const live = await ensureSession();
+      const record = await live.executeStep(step as unknown as ReproductionStep);
+      const baseResult = boundAndAccountEvidence(
+        formatStepResult(record, live, evidenceCursor, isRequest),
+      );
+      let resultText = baseResult.text;
+      let isError = record.outcome === "failed" || baseResult.truncated;
+
+      // Structured finding from the ACTUAL observation (Change 4).
+      const targetLabel =
+        typeof actionInput.path === "string"
+          ? actionInput.path
+          : actionInput.target
+            ? JSON.stringify(actionInput.target)
+            : typeof actionInput.selector === "string"
+              ? actionInput.selector
+              : "";
+
+      if (record.outcome === "failed") {
+        if (record.ambiguous) {
+          counters.ambiguousStepFailures += 1;
+        }
+
+        recordFinding(
+          "tool_failure",
+          `${actionName} ${targetLabel} failed${record.ambiguous ? " (ambiguous target)" : ""}: ${record.error ?? "unknown error"}`,
+          actionName,
+          record.id,
+        );
+      } else if (isRequest) {
+        const lastResponse =
+          live.evidence.apiResponses[live.evidence.apiResponses.length - 1];
+        recordFinding(
+          "response",
+          lastResponse
+            ? `${lastResponse.method} ${lastResponse.url} -> ${lastResponse.status}`
+            : `request ${targetLabel} executed`,
+          "request",
+          record.id,
+        );
+      } else if (actionName === "goto") {
+        recordFinding("route", `goto ${targetLabel} -> page loaded`, "goto", record.id);
+      } else if (actionName === "click" || actionName === "fill") {
+        recordFinding(
+          "element",
+          `${actionName} ${targetLabel} existed and the action succeeded`,
+          actionName,
+          record.id,
+        );
+      }
+
+      recordNewEvidenceFindings(live, actionName, record.id);
+
+      if (isRequest) {
+        counters.requestsExecuted += 1;
+      } else if (actionName !== "wait") {
+        counters.pageActionsExecuted += 1;
+
+        if (actionName === "goto" && record.outcome === "passed") {
+          counters.gotoPassed += 1;
+        }
+      }
+
+      // Exploration trace: screenshot after successful browser actions only
+      // - never for API requests or waits.
+      if (
+        record.outcome === "passed" &&
+        (actionName === "goto" || actionName === "click" || actionName === "fill")
+      ) {
+        await live.captureScreenshot(screenshotName).catch(() => null);
+
+        // Action delta (fable/16): bounded structured page diff appended to
+        // successful page-action results. Counts toward maxEvidenceBytes;
+        // never toward maxReadPageCalls or the UI-first policy.
+        const delta = await buildActionDelta(live);
+
+        if (delta) {
+          const boundedDelta = boundAndAccountEvidence(delta);
+          if (boundedDelta.text) {
+            resultText = `${resultText}\n\n${boundedDelta.text}`;
+            counters.actionDeltaBytes += boundedDelta.bytes;
+          }
+          isError ||= boundedDelta.truncated;
+        }
+      }
+
+      return { resultText, isError, budgetExhausted: false };
+    } catch (error) {
+      return {
+        resultText: `Live session unavailable: ${formatError(error)}`,
+        isError: true,
+        budgetExhausted: false,
+      };
+    }
+  };
+
+  try {
+    // The fallback may start after a one-shot plan partially mutated the app
+    // and repository. Exploration must begin from the same pristine source
+    // state that official replays use, never from abandoned setup residue.
+    const initialReset = await resetWorkspace(input.repoPath, input.sourceCommit);
+
+    if (!initialReset.ok) {
+      return await finish(
+        "failed",
+        `Workspace reset before reproducer exploration failed: ${initialReset.error}`,
+        null,
+        null,
+      );
+    }
+
+    const initialRestart = await input.restart();
+
+    if (!initialRestart.ok || !initialRestart.baseUrl) {
+      return await finish(
+        "environment_failed",
+        `Sandbox restart before reproducer exploration failed: ${initialRestart.log ?? "(no log)"}`,
+        null,
+        null,
+      );
+    }
+
+    sessionBaseUrl = initialRestart.baseUrl;
+    messages.push({
+      role: "user",
+      content: buildInitialMessage({
+        ...input,
+        sandboxResult: { ...input.sandboxResult, baseUrl: sessionBaseUrl },
+      }),
+    });
+
+    while (true) {
+      input.abortSignal?.throwIfAborted();
+      if (Date.now() - startedAt > budgets.maxWallTimeMs) {
+        return await finishExhausted("Wall-time budget exhausted.");
+      }
+
+      if (counters.turns >= budgets.maxModelTurns) {
+        return await finishExhausted("Model turn budget exhausted.");
+      }
+
+      counters.turns += 1;
+
+      // Once deterministic live evidence contains the failure, exploration
+      // has achieved its purpose. Force the next turn to freeze a plan so the
+      // model cannot spend the remaining budget re-querying the same state.
+      const forcePlanSubmission =
+        counters.submissions === 0 &&
+        (!uiFirstRequired || uiFirstSatisfied()) &&
+        failureObservedLive(findings);
+      if (forcePlanSubmission) {
+        forcedSubmissionReason = liveFailureReason(findings);
+        transcript.push({
+          type: "submission_forced",
+          turn: counters.turns,
+          reason: forcedSubmissionReason,
+        });
+      }
+      const forceActionBatch =
+        !forcePlanSubmission &&
+        efficiency.reproducerRunSteps &&
+        counters.submissions === 0 &&
+        consecutiveStandaloneActions >= 2;
+
+      const message = await createMessage({
+        model: MODEL,
+        max_tokens: budgets.maxResponseTokens,
+        system: systemPrompt,
+        tools,
+        tool_choice: forcePlanSubmission
+          ? { type: "tool", name: "submit_plan", disable_parallel_tool_use: true }
+          : forceActionBatch
+            ? { type: "tool", name: "run_steps", disable_parallel_tool_use: true }
+            : { type: "any", disable_parallel_tool_use: true },
+        messages: [...messages],
+      });
+
+      const toolUse = message.content.find(
+        (block): block is Anthropic.Messages.ToolUseBlock => block.type === "tool_use",
+      );
+
+      if (!toolUse) {
+        transcript.push({
+          type: "non_tool_response",
+          turn: counters.turns,
+          stopReason: message.stop_reason,
+        });
+
+        if (nudged) {
+          return await finish(
+            "failed",
+            "The model returned two consecutive responses without a tool call.",
+            null,
+            null,
+          );
+        }
+
+        nudged = true;
+        messages.push(
+          { role: "assistant", content: nonEmptyContent(message.content) },
+          { role: "user", content: "Respond with exactly one tool call." },
+        );
+        continue;
+      }
+
+      transcript.push({
+        type: "model_action",
+        turn: counters.turns,
+        tool: toolUse.name,
+        input: toolUse.name === "submit_plan" ? "(see tool-calls artifact)" : toolUse.input,
+      });
+      log(`turn ${counters.turns}: ${toolUse.name}`);
+
+      // --- UI-first policy gate on terminal tools ------------------------------
+      // Both terminals are blocked (WITHOUT consuming a submission) until the
+      // agent has actually looked at the app, unless the issue/memory clearly
+      // identified an API endpoint failure. Bounded by the turn budget.
+      if (
+        (toolUse.name === "submit_plan" || toolUse.name === "submit_not_reproducible") &&
+        uiFirstRequired &&
+        !uiFirstSatisfied()
+      ) {
+        const policyMessage =
+          "Policy: this issue does not clearly identify an API endpoint failure, so you must inspect the running app first - perform at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. This attempt was NOT counted against your submission budget.";
+
+        transcript.push({
+          type: "ui_first_policy_rejection",
+          turn: counters.turns,
+          tool: toolUse.name,
+          gotoPassed: counters.gotoPassed,
+          readPageOk: counters.readPageOk,
+        });
+        log(`UI-first policy blocked ${toolUse.name} (goto: ${counters.gotoPassed}, read_page: ${counters.readPageOk}).`);
+        await recordToolCall(toolUse.name, toolUse.input, policyMessage);
+
+        pushResult(message.content, toolUse.id, policyMessage, true);
+        continue;
+      }
+
+      // --- Terminal: agent declares not reproducible -------------------------
+      if (toolUse.name === "submit_not_reproducible") {
+        const reason =
+          typeof (toolUse.input as { reason?: unknown })?.reason === "string"
+            ? (toolUse.input as { reason: string }).reason
+            : "(no reason given)";
+        await recordToolCall("submit_not_reproducible", toolUse.input, reason);
+        return await finish("plan_failed", `Agent declared not reproducible: ${reason}`, null, null);
+      }
+
+      // --- Terminal-capable: submit_plan --------------------------------------
+      if (toolUse.name === "submit_plan") {
+        counters.submissions += 1;
+        const explorationModeAtSubmission = explorationMode();
+
+        const submitted = toolUse.input as Record<string, unknown>;
+        const candidate = {
+          version: REPRODUCTION_PLAN_VERSION,
+          baseUrl: sessionBaseUrl,
+          steps: submitted.steps,
+          expectedBehavior: submitted.expectedBehavior,
+          failureCondition: submitted.failureCondition,
+          assertion: submitted.assertion,
+        };
+
+        // Canonical behavior hash (Change 1/3): computed for every submission,
+        // including invalid ones (hashed over the raw submitted values).
+        const planHash = hashPlanBehavior(candidate as unknown as ReproductionPlan);
+
+        const validation = validateReproductionPlan(candidate);
+
+        if (!validation.ok) {
+          submissions.push({
+            index: counters.submissions,
+            valid: false,
+            planHash,
+            explorationModeAtSubmission,
+            validationErrors: validation.errors,
+          });
+          transcript.push({
+            type: "plan_submission",
+            turn: counters.turns,
+            valid: false,
+            errors: validation.errors,
+          });
+          log(`submission ${counters.submissions}: invalid (${validation.errors.length} error(s))`);
+
+          const feedback = `The submitted plan is invalid:\n${validation.errors.map((error) => `- ${error}`).join("\n")}`;
+          await recordToolCall("submit_plan", submitted, feedback);
+
+          if (counters.submissions >= budgets.maxPlanSubmissions) {
+            return await finishExhausted(
+              `Plan submission budget exhausted (${budgets.maxPlanSubmissions} submissions, none reproduced).`,
+            );
+          }
+
+          pushResult(message.content, toolUse.id, `${feedback}\n\n${remainingSubmissions()}`, true);
+          continue;
+        }
+
+        // --- Duplicate-plan guard (Change 3) -----------------------------------
+        // A behaviorally identical plan never reaches the expensive path
+        // (workspace reset + app restart + replay) and never consumes a
+        // submission. Seeded from memory (same-commit only), extended with
+        // this run's replayed-but-not-reproduced submissions.
+        const priorPlanFailure = failedPlanHashes.get(planHash);
+
+        if (priorPlanFailure) {
+          counters.submissions -= 1; // Duplicates never consume the budget.
+          counters.duplicatePlanRejections += 1;
+
+          const rejection = `REJECTED without replay: this plan's steps and assertion are behaviorally identical to ${priorPlanFailure}. Submit a materially different plan (different steps or assertion) or call submit_not_reproducible.`;
+          await recordToolCall("submit_plan", submitted, rejection);
+          transcript.push({
+            type: "duplicate_plan_rejected",
+            turn: counters.turns,
+            planHash,
+            rejections: counters.duplicatePlanRejections,
+          });
+          log(
+            `duplicate plan rejected (${counters.duplicatePlanRejections}): hash ${planHash}`,
+          );
+
+          if (counters.duplicatePlanRejections >= 3) {
+            return await finish(
+              "failed",
+              "The model resubmitted a behaviorally identical plan three times despite rejection feedback.",
+              null,
+              null,
+            );
+          }
+
+          pushResult(message.content, toolUse.id, rejection, true);
+          continue;
+        }
+
+        // --- Official replay: pristine workspace + fresh sandbox --------------
+        await closeSession();
+
+        const reset = await resetWorkspace(input.repoPath, input.sourceCommit);
+
+        if (!reset.ok) {
+          return await finish(
+            "failed",
+            `Workspace reset before the official replay failed: ${reset.error}`,
+            null,
+            null,
+          );
+        }
+
+        const restart = await input.restart();
+
+        if (!restart.ok || !restart.baseUrl) {
+          return await finish(
+            "environment_failed",
+            `Sandbox restart before the official replay failed: ${restart.log ?? "(no log)"}`,
+            null,
+            null,
+          );
+        }
+
+        sessionBaseUrl = restart.baseUrl;
+
+        // Freeze the plan against the restarted sandbox.
+        const frozen: ReproductionPlan = JSON.parse(
+          JSON.stringify({ ...validation.plan, baseUrl: restart.baseUrl }),
+        ) as ReproductionPlan;
+
+        const planMode = getPlanMode(frozen);
+        const replayStore = await createArtifactStore(
+          input.investigationId,
+          path.join(agentDir, `replay-${counters.submissions}`),
+        );
+        await replayStore.writeJson("replay-mode.json", { mode: planMode });
+
+        const replayResult = await replayPlan(frozen, replayStore);
+
+        // Per-replay artifacts: full result plus a clear request/response
+        // trace (the primary evidence for api-only plans).
+        await replayStore.writeJson("reproduction-result.json", {
+          investigationId: input.investigationId,
+          ...replayResult,
+        });
+        await replayStore.writeJson("api-trace.json", {
+          apiResponses: replayResult.apiResponses,
+          httpResponses: replayResult.httpResponses,
+          networkFailures: replayResult.networkFailures,
+        });
+        const promotedReplayResult = rebaseExecutionArtifactPaths(
+          replayResult,
+          path.relative(input.investigationDir, replayStore.dir),
+        );
+
+        // Shared bounded evidence summary of this replay (Change 1/4).
+        const replaySummary = summarizeReproductionEvidence(replayResult);
+        const failedReplay = replayResult.outcome !== "reproduced";
+        // Live-vs-replay divergence (Change 4b): only meaningful for a replay
+        // that actually ran and did not reproduce.
+        const divergence =
+          failedReplay && replayResult.outcome !== "environment_failed"
+            ? computeReproducerDivergence(findings, frozen, replayResult)
+            : null;
+
+        submissions.push({
+          index: counters.submissions,
+          valid: true,
+          planHash,
+          replaySignature: replaySummary.signature,
+          explorationModeAtSubmission,
+          planMode,
+          replayOutcome: replayResult.outcome,
+          replayReason: replayResult.outcomeReason,
+        });
+        transcript.push({
+          type: "plan_submission",
+          turn: counters.turns,
+          valid: true,
+          planHash,
+          explorationModeAtSubmission,
+          planMode,
+          replayOutcome: replayResult.outcome,
+          replayReason: replayResult.outcomeReason,
+        });
+        log(`submission ${counters.submissions}: replay ${replayResult.outcome} — ${firstLine(replayResult.outcomeReason)}`);
+
+        const feedback = formatReplayFeedback(
+          replayResult,
+          failedReplay ? previousFailedReplaySummary : null,
+          failedReplay ? replaySummary : null,
+          divergence,
+        );
+        await recordToolCall("submit_plan", submitted, feedback);
+
+        if (replayResult.outcome === "reproduced") {
+          return await finish(
+            "reproduced",
+            replayResult.outcomeReason,
+            frozen,
+            promotedReplayResult,
+          );
+        }
+
+        lastFailedReplaySummary = replaySummary;
+
+        if (replayResult.outcome === "environment_failed") {
+          return await finish(
+            "environment_failed",
+            replayResult.outcomeReason,
+            frozen,
+            promotedReplayResult,
+          );
+        }
+
+        lastDivergence = divergence;
+        previousFailedReplaySummary = replaySummary;
+        // Register the failed plan so an identical resubmission is rejected
+        // without another reset/restart/replay (Change 3).
+        failedPlanHashes.set(
+          planHash,
+          `submission ${counters.submissions}, which replayed with outcome ${replayResult.outcome} (${truncateUtf8Bytes(replayResult.outcomeReason, 300)})`,
+        );
+
+        lastReplay = { plan: frozen, result: promotedReplayResult };
+
+        if (counters.submissions >= budgets.maxPlanSubmissions) {
+          return await finishExhausted(
+            `Plan submission budget exhausted (${budgets.maxPlanSubmissions} submissions, none reproduced).`,
+          );
+        }
+
+        lastReplayFeedback = feedback;
+        pushResult(
+          message.content,
+          toolUse.id,
+          `${feedback}\n\nThe workspace and app were reset to a pristine state. ${remainingSubmissions()} You may explore again (a fresh live session will open) and revise.`,
+          true,
+        );
+        continue;
+      }
+
+      // --- Non-terminal tools ---------------------------------------------------
+      let resultText: string;
+      let isError = false;
+
+      if (toolUse.name === "read_page") {
+        consecutiveStandaloneActions = 0;
+        counters.readPage += 1;
+        if (counters.readPage > budgets.maxReadPageCalls) {
+          resultText = "read_page budget exhausted — submit a plan or call submit_not_reproducible.";
+          isError = true;
+        } else if (counters.evidenceBytes >= budgets.maxEvidenceBytes) {
+          resultText = "Evidence budget exhausted — submit a plan or call submit_not_reproducible.";
+          isError = true;
+        } else {
+          try {
+            const live = await ensureSession();
+            // One page model: read_page renders the same structured snapshot
+            // the action deltas diff, and advances the snapshot cursor so the
+            // next action delta is relative to this deliberate look. Falls
+            // back to the plain digest for sessions without snapshot support.
+            const snapshot = live.readPageSnapshot ? await live.readPageSnapshot() : null;
+
+            if (snapshot) {
+              lastPageSnapshot = snapshot;
+            }
+
+            const digest = snapshot
+              ? formatPageSnapshot(snapshot)
+              : await live.readPageDigest();
+            const delta = drainEvidenceDelta(live, evidenceCursor);
+            const digestResult = truncateText(
+              `${digest}\n\n${delta}`,
+              budgets.maxDigestBytes,
+            );
+            const bounded = boundAndAccountEvidence(digestResult);
+            resultText = bounded.text;
+            isError = bounded.truncated;
+            counters.readPageOk += 1;
+            recordFinding(
+              "route",
+              `page observed: ${digest.split("\n").slice(0, 2).join(" | ")}`,
+              "read_page",
+              null,
+            );
+            recordNewEvidenceFindings(live, "read_page", null);
+            await recordPriorAssertionIfMatched(live, "read_page", null, digest);
+            await live
+              .captureScreenshot(`${String(toolCallIndex + 1).padStart(3, "0")}-after-read_page`)
+              .catch(() => null);
+          } catch (error) {
+            resultText = `Live session unavailable: ${formatError(error)}`;
+            isError = true;
+          }
+        }
+      } else if (toolUse.name === "run_steps") {
+        // run_steps (fable/16): sequential batch of existing actions through
+        // the SAME executeLiveAction the standalone path uses. Each executed
+        // step consumes its normal budget; batching saves turns, not actions.
+        if (!efficiency.reproducerRunSteps) {
+          resultText = "run_steps is disabled for this investigation.";
+          isError = true;
+        } else {
+          const rawSteps = (toolUse.input as { steps?: unknown })?.steps;
+          const allowed = new Set(["goto", "click", "fill", "wait", "request"]);
+
+          const shapeError = !Array.isArray(rawSteps)
+            ? "run_steps requires steps: an array of 2-6 actions."
+            : rawSteps.length < 2 || rawSteps.length > budgets.maxRunStepsPerCall
+              ? `run_steps requires 2-${budgets.maxRunStepsPerCall} steps (got ${rawSteps.length}).`
+              : rawSteps.some(
+                    (entry) =>
+                      entry === null ||
+                      typeof entry !== "object" ||
+                      !allowed.has(String((entry as { action?: unknown }).action)),
+                  )
+                ? "run_steps steps must each be one of goto | click | fill | wait | request. read_page and submit_* are not allowed as steps."
+                : null;
+
+          if (shapeError) {
+            resultText = shapeError;
+            isError = true;
+          } else {
+            counters.runStepsCalls += 1;
+            counters.eligibleBatches += 1;
+            consecutiveStandaloneActions = 0;
+            const evidenceBeforeBatch = counters.evidenceBytes;
+            const batchedActionsBefore = counters.batchedActions;
+            const steps = rawSteps as Array<Record<string, unknown>>;
+            const lines: string[] = [];
+            let stoppedAt: number | null = null;
+
+            for (const [index, rawStep] of steps.entries()) {
+              const { action, ...actionInput } = rawStep;
+              const actionName = String(action);
+              const outcome = await executeLiveAction(
+                actionName,
+                actionInput,
+                `${String(toolCallIndex + 1).padStart(3, "0")}-after-${actionName}-s${index + 1}`,
+              );
+
+              counters.batchedActions += 1;
+              lines.push(
+                `step ${index + 1}/${steps.length} ${actionName} ${describeActionTarget(actionInput)}: ${outcome.isError ? "FAILED" : "ok"}\n${indentBlock(outcome.resultText)}`,
+              );
+
+              if (outcome.isError) {
+                stoppedAt = index + 1;
+                break;
+              }
+            }
+            counters.estimatedTurnsSaved += Math.max(
+              0,
+              counters.batchedActions - batchedActionsBefore - 1,
+            );
+
+            if (stoppedAt !== null && stoppedAt < steps.length) {
+              for (let index = stoppedAt; index < steps.length; index += 1) {
+                lines.push(
+                  `step ${index + 1}/${steps.length} ${String(steps[index].action)}: skipped (execution stopped at step ${stoppedAt}; no budget consumed)`,
+                );
+              }
+            }
+
+            // One accumulated evidence delta, drained ONCE so a later
+            // read_page cannot report the same evidence again.
+            let evidenceSection = "";
+
+            if (session) {
+              evidenceSection = `\n\n${drainEvidenceDelta(session, evidenceCursor)}`;
+            }
+
+            const unboundedResult = [
+              stoppedAt === null
+                ? `run_steps: all ${steps.length} step(s) executed.`
+                : `run_steps: stopped at step ${stoppedAt} of ${steps.length}.`,
+              lines.join("\n"),
+            ].join("\n") + evidenceSection;
+            // executeLiveAction accounts individual pieces so it can stop the
+            // batch at the hard ceiling. Rebase that provisional accounting
+            // onto the exact final tool-result bytes, including step headings.
+            counters.evidenceBytes = evidenceBeforeBatch;
+            const boundedBatch = boundAndAccountEvidence(unboundedResult);
+            resultText = boundedBatch.text;
+            isError = stoppedAt !== null || boundedBatch.truncated;
+          }
+        }
+      } else if (BROWSER_ACTION_TOOLS.has(toolUse.name) || toolUse.name === "request") {
+        const outcome = await executeLiveAction(
+          toolUse.name,
+          toolUse.input as Record<string, unknown>,
+          `${String(toolCallIndex + 1).padStart(3, "0")}-after-${toolUse.name}`,
+        );
+        resultText = outcome.resultText;
+        isError = outcome.isError;
+        if (!outcome.budgetExhausted) {
+          consecutiveStandaloneActions += 1;
+          if (consecutiveStandaloneActions === 2) {
+            counters.eligibleBatches += 1;
+          }
+          if (consecutiveStandaloneActions > 1) {
+            counters.avoidableUnbatchedCalls += 1;
+          }
+        }
+      } else {
+        resultText = `Unknown tool "${toolUse.name}".`;
+        isError = true;
+      }
+
+      await recordToolCall(toolUse.name, toolUse.input, resultText);
+      transcript.push({
+        type: "tool_result",
+        turn: counters.turns,
+        tool: toolUse.name,
+        isError,
+        bytes: resultText.length,
+      });
+
+      factLog.push(
+        `${toolUse.name} ${JSON.stringify(toolUse.input).slice(0, 160)} -> ${isError ? `error: ${firstLine(resultText)}` : `ok (${resultText.length} bytes)`}`,
+      );
+
+      pushResult(message.content, toolUse.id, resultText, isError);
+    }
+  } catch (error) {
+    return await finish(
+      "failed",
+      `Reproducer agent failed unexpectedly: ${formatError(error)}`,
+      null,
+      null,
+    );
+  }
+
+  // Exhaustion terminal: if the last valid submission replayed cleanly and
+  // showed expected behavior, that IS a deterministic verdict - surface it as
+  // not_reproduced (with plan + result) instead of a bare "exhausted".
+  async function finishExhausted(reason: string): Promise<ReproducerAgentResult> {
+    if (lastReplay && lastReplay.result.outcome === "not_reproduced") {
+      return finish(
+        "not_reproduced",
+        `${lastReplay.result.outcomeReason} (${reason})`,
+        lastReplay.plan,
+        lastReplay.result,
+      );
+    }
+
+    return finish("exhausted", reason, null, null);
+  }
+
+  function remainingSubmissions(): string {
+    return `${budgets.maxPlanSubmissions - counters.submissions} submission(s) remaining.`;
+  }
+}
+
+// Deterministic failure classification (Change 1). Precedence: first match
+// wins. Derived only from counters, submissions, findings, and replays —
+// never from model output.
+function classifyReproducerFailure(args: {
+  status: ReproducerAgentStatus;
+  submissions: PlanSubmissionRecord[];
+  findings: ReproducerFinding[];
+  duplicatePlanRejections: number;
+  ambiguousStepFailures: number;
+}): ReproducerFailureCode {
+  if (args.status === "environment_failed") {
+    return "reproducer_environment";
+  }
+
+  if (args.duplicatePlanRejections >= 3) {
+    return "reproducer_repeated_plan";
+  }
+
+  if (args.submissions.length === 0) {
+    return "reproducer_no_submission";
+  }
+
+  if (args.submissions.every((submission) => !submission.valid)) {
+    return "reproducer_all_submissions_invalid";
+  }
+
+  if (args.ambiguousStepFailures >= 3) {
+    return "reproducer_ambiguity_loop";
+  }
+
+  if (failureObservedLive(args.findings)) {
+    return "reproducer_replay_diverged";
+  }
+
+  return "reproducer_no_failure_signal";
+}
+
+// Factual metadata only: explains the exploration-vs-proof split so a human
+// reading artifacts can immediately tell what evidence drove the fixer.
+function buildEvidenceExplanation(
+  explorationMode: ReproductionMode,
+  acceptedPlanMode: PlanMode | null,
+  status: ReproducerAgentStatus,
+): string {
+  if (!acceptedPlanMode) {
+    return `No plan was accepted (status: ${status}). Exploration mode was ${explorationMode}.`;
+  }
+
+  const proofSentence =
+    status === "reproduced"
+      ? "The fixer receives the official replay result, not the exploratory browser trace."
+      : "No fixer evidence was produced (the official replay did not reproduce the failure).";
+
+  if (explorationMode === "mixed" && acceptedPlanMode === "api-only") {
+    return `The agent used UI and API tools to understand the app, then submitted an API-only deterministic plan. ${proofSentence}`;
+  }
+
+  if (explorationMode === acceptedPlanMode) {
+    return `Exploration and the accepted plan are both ${acceptedPlanMode}. ${proofSentence}`;
+  }
+
+  return `The agent explored in ${explorationMode} mode and submitted a ${acceptedPlanMode} deterministic plan. ${proofSentence}`;
+}
+
+// --- Workspace reset ------------------------------------------------------------------
+
+async function resetWorkspace(
+  repoPath: string,
+  sourceCommit: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    await execFileAsync("git", ["checkout", "--", "."], { cwd: repoPath });
+    // Remove app-written data files from exploration; keep the extracted graph.
+    await execFileAsync("git", ["clean", "-fd", "-e", "graphify-out"], { cwd: repoPath });
+    const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repoPath });
+    const head = stdout.trim();
+
+    if (head !== sourceCommit) {
+      return { ok: false, error: `HEAD is ${head} after reset, expected ${sourceCommit}.` };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: formatError(error) };
+  }
+}
+
+// --- Tool result formatting -------------------------------------------------------------
+
+type EvidenceCursor = { console: number; page: number; network: number; api: number };
+
+function drainEvidenceDelta(session: LiveSession, cursor: EvidenceCursor): string {
+  const { evidence } = session;
+  const consoleErrors = evidence.consoleErrors.slice(cursor.console);
+  const pageErrors = evidence.pageErrors.slice(cursor.page);
+  const networkFailures = evidence.networkFailures.slice(cursor.network);
+  const apiResponses = evidence.apiResponses.slice(cursor.api);
+
+  cursor.console = evidence.consoleErrors.length;
+  cursor.page = evidence.pageErrors.length;
+  cursor.network = evidence.networkFailures.length;
+  cursor.api = evidence.apiResponses.length;
+
+  return [
+    "Evidence since last read:",
+    `Console errors: ${consoleErrors.join(" | ") || "(none)"}`,
+    `Page errors: ${pageErrors.join(" | ") || "(none)"}`,
+    `Network failures: ${networkFailures.map((failure) => `${failure.method} ${failure.url} -> ${failure.status ?? failure.failure}`).join(" | ") || "(none)"}`,
+    `API responses: ${apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status} ${response.body.slice(0, 300)}`).join(" | ") || "(none)"}`,
+  ].join("\n");
+}
+
+function formatStepResult(
+  record: StepRecord,
+  session: LiveSession,
+  cursor: EvidenceCursor,
+  includeApiBody: boolean,
+): string {
+  const lines = [`${record.action} ${record.outcome}${record.error ? `: ${record.error}` : ""}`];
+
+  if (record.ambiguous) {
+    lines.push(
+      "This target was AMBIGUOUS (matched multiple elements). Use the diagnostics above to pick a unique key before retrying.",
+    );
+  }
+
+  if (includeApiBody) {
+    const last = session.evidence.apiResponses[session.evidence.apiResponses.length - 1];
+
+    if (last) {
+      lines.push(`Response: ${last.status} ${last.statusText}`, truncateText(last.body, 4_000));
+      cursor.api = session.evidence.apiResponses.length;
+    }
+  }
+
+  return lines.join("\n");
+}
+
+// Replay feedback (Change 4): outcome + reason first, then the
+// submission-vs-previous-submission signature delta and the live-vs-replay
+// divergence (both BEFORE the per-step listing so they survive the overall
+// truncation), then the detailed listing.
+function formatReplayFeedback(
+  result: ReproductionResult,
+  previousSummary: ReproductionEvidenceSummary | null,
+  currentSummary: ReproductionEvidenceSummary | null,
+  divergence: ReproducerDivergence | null,
+): string {
+  const stepLines = result.steps.map(
+    (step) =>
+      `  ${step.id} [${step.outcome}]${step.error ? ` ${firstLine(step.error)}` : ""}`,
+  );
+
+  const sections = [
+    `OFFICIAL REPLAY (pristine workspace, fresh app): ${result.outcome}`,
+    `Reason: ${result.outcomeReason}`,
+  ];
+
+  if (previousSummary && currentSummary) {
+    const changed = previousSummary.signature !== currentSummary.signature;
+    sections.push(
+      [
+        "DELTA vs your previous submission:",
+        `Before signature: ${previousSummary.signature}`,
+        `After signature:  ${currentSummary.signature}`,
+        `Signature changed: ${changed ? "yes" : "no"}`,
+        "- Identical signature: your plan changes did not alter what the replay observed. Do not iterate on the same approach.",
+        "- Changed signature: the plan change altered observable behavior; use the new evidence.",
+      ].join("\n"),
+    );
+  }
+
+  if (divergence && hasDivergence(divergence)) {
+    sections.push(formatReproducerDivergence(divergence));
+  }
+
+  sections.push(
+    `Steps:\n${stepLines.join("\n")}`,
+    `Assertion: ${result.assertion ? `matchedFailure=${result.assertion.matchedFailure} matchedExpected=${result.assertion.matchedExpected} — ${result.assertion.detail}` : "(not evaluated)"}`,
+    `Console errors: ${result.consoleErrors.join(" | ") || "(none)"}`,
+    `Page errors: ${result.pageErrors.join(" | ") || "(none)"}`,
+    `API responses: ${result.apiResponses.map((response) => `${response.method} ${response.url} -> ${response.status} ${response.body.slice(0, 200)}`).join(" | ") || "(none)"}`,
+  );
+
+  return truncateText(sections.join("\n"), 8_000);
+}
+
+// --- Prompt --------------------------------------------------------------------------------
+
+type ReproducerSystemPromptContext = {
+  runSteps: boolean;
+  actionDeltas: boolean;
+};
+
+const buildReproducerSystemPrompt = (
+  context: ReproducerSystemPromptContext,
+) => `You are Sherlock's reproducer agent. A GitHub issue reports a bug; a LIVE instance of the app is running in a sandbox. Interact with it, observe real outcomes, and only then freeze a deterministic reproduction plan.
+
+Rules:
+- Ground every target in read_page output — target only elements you have seen, using the most specific unique key (testId > role+name > label/placeholder > id > unique text). Never use CSS selectors. Ambiguous targets fail; use the returned diagnostics to pick a unique key.
+- For repeated controls, scope the target to a grounded container with "within", for example: {"role":"button","name":"✕","within":{"role":"listitem","text":"Set up CI pipeline"}}.
+- read_page reports current values for non-secret form controls. Use those values to verify that text remains attached to the correct row after an action; password values are intentionally hidden.
+${context.runSteps ? `- Use run_steps to execute a sequence you are already confident about (login flow, form fill, navigating to a known route) in ONE call: it runs 2-6 goto/click/fill/wait/request actions sequentially, stops at the first failure, and returns per-step outcomes plus the accumulated evidence. Each step still consumes its normal action budget — run_steps saves turns, not actions. Use single actions when you genuinely need to observe the page between steps.\n` : ""}${context.actionDeltas ? `- Successful goto/click/fill results include a bounded PAGE DELTA (URL/title changes, elements that appeared or disappeared). Use it to decide your next action without a separate read_page; call read_page only when you need the full element list. Deltas do NOT satisfy the mandatory read_page look before submitting.\n` : ""}
+- The frozen plan replays against a FRESH app instance: it must not depend on state your exploration created. Include every setup step the plan needs (create the data it asserts about).
+- After async work (202 responses, queued jobs, background saves), insert an explicit "wait" step long enough for the work to finish — your interactive timing will not carry over to the replay.
+- The assertion must detect the reported failure using evidence you actually observed: copy exact strings from responses and errors you saw. Never invent error text.
+- A "console_error", "page_text", or "input_value" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
+- page_text checks body.innerText and NEVER includes the current value of an input, textarea, or select. For form state use input_value with a grounded target and failureWhen "equals" or "not_equals". For other visible text that fails to appear, use page_text with failureWhen "absent".
+- Use browser actions (goto/click/fill) for UI/user-facing bugs. Use request actions for API/backend bugs. If your reproduction is API-only, make that intentional and assert against response_status or response_body. Do not open a blank page just to create a screenshot - screenshots are only meaningful when the bug is visible on a page.
+- Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
+- Aim for the shortest plan that deterministically shows the failure.
+- Submissions are limited; explore until you have SEEN the failure before submitting.
+- Once you have seen the reported failure in live evidence, stop exploring and submit the shortest self-contained plan on your next turn.
+- PAST INVESTIGATIONS may list REPRODUCTION PLANS ALREADY TRIED. A plan whose steps and assertion behaviorally match a listed plan hash will be REJECTED automatically without replay — submit a materially different plan (different steps or assertion), and treat the recorded replay signature as evidence of what that plan actually did.
+- Respond with exactly one tool call per turn.`;
+
+// Deliberately lean initial context (cost): the reproducer explores the LIVE
+// app, so it does not need hydrated source file bodies — it gets graph
+// node/edge names as route/API/UI hints, a package/scripts summary, past
+// memory, and a bounded tail of the sandbox logs. It has no read_file/grep
+// tools, so source inspection is not assumed. The fixer still receives the
+// full refined, hydrated context after reproduction is proven.
+const SANDBOX_LOG_TAIL_LINES = 40;
+
+function tailLines(text: string, maxLines: number): string {
+  const lines = text.split("\n");
+
+  if (lines.length <= maxLines) {
+    return text;
+  }
+
+  return `[...${lines.length - maxLines} earlier line(s) omitted]\n${lines.slice(-maxLines).join("\n")}`;
+}
+
+export function summarizePackageJson(packageJson: string | null): string {
+  if (!packageJson) {
+    return "(not found)";
+  }
+
+  try {
+    const parsed = JSON.parse(packageJson) as {
+      name?: unknown;
+      scripts?: Record<string, unknown>;
+      dependencies?: Record<string, unknown>;
+      devDependencies?: Record<string, unknown>;
+    };
+
+    const scripts = Object.entries(parsed.scripts ?? {})
+      .map(([key, value]) => `  ${key}: ${String(value)}`)
+      .join("\n");
+
+    return [
+      `name: ${typeof parsed.name === "string" ? parsed.name : "(unknown)"}`,
+      `scripts:\n${scripts || "  (none)"}`,
+      `dependencies: ${Object.keys(parsed.dependencies ?? {}).join(", ") || "(none)"}`,
+      `devDependencies: ${Object.keys(parsed.devDependencies ?? {}).join(", ") || "(none)"}`,
+    ].join("\n");
+  } catch {
+    // Unparseable package.json: fall back to a bounded slice.
+    return packageJson.slice(0, 2_000);
+  }
+}
+
+// Warm start (fable/16): bounded rendering of a scripted attempt that
+// EXECUTED but did not reproduce. Lives in the initial message, inside the
+// cached prefix — cheap on every turn.
+export function formatPriorAttemptSection(
+  priorAttempt: PriorReproductionAttempt | null | undefined,
+  maxBytes: number = REPRODUCER_SHARED_LIMITS.maxPriorAttemptBytes,
+): string {
+  if (!priorAttempt || priorAttempt.executedSteps.length === 0) {
+    return "";
+  }
+
+  const passedCount = priorAttempt.executedSteps.filter(
+    (step) => step.outcome === "passed",
+  ).length;
+  const sourceLabel =
+    priorAttempt.source === "memory_replay"
+      ? "a remembered plan from a past investigation"
+      : "a one-shot scripted plan";
+  const outcomeDetail = priorAttempt.failedStep
+    ? ` First failure: step "${priorAttempt.failedStep.id}" (${priorAttempt.failedStep.action}) — ${firstLine(priorAttempt.failedStep.error ?? "no error detail")}.`
+    : priorAttempt.executedSteps.length < priorAttempt.planSteps.length
+      ? ` Execution stopped after ${priorAttempt.executedSteps.length} step(s); the remaining steps were not reached.`
+      : " Every step passed but the assertion did not match the reported failure.";
+
+  const stepLines = priorAttempt.planSteps
+    .map((step, index) => {
+      const executed = priorAttempt.executedSteps[index];
+      const status = executed
+        ? `${executed.outcome}${executed.error ? ` — ${firstLine(executed.error)}` : ""}`
+        : "not reached";
+      return `  ${index + 1}. ${JSON.stringify(step)} -> ${status}`;
+    })
+    .join("\n");
+
+  const section = `
+PRIOR SCRIPTED ATTEMPT (${sourceLabel} — already executed against a pristine app):
+${passedCount} of ${priorAttempt.planSteps.length} step(s) passed.${outcomeDetail}
+
+Steps and outcomes:
+${stepLines}
+
+Evidence from that run:
+${priorAttempt.evidenceSummary}
+
+How you MUST use this:
+- Do not re-derive what it already proved. The passed prefix is a working
+  path through the app${priorAttempt.failedStep ? ` up to the failed step` : ""}.
+- Verify its endpoint quickly (replay the successful prefix in ONE run_steps
+  call where possible), observe the state at the point of divergence, and
+  continue from there rather than exploring from scratch.
+- The failure detail above is your primary lead: the plan was close but
+  wrong at that point — inspect what the page/API actually offers there.
+`;
+
+  return truncateText(section, maxBytes);
+}
+
+function buildInitialMessage(input: ReproducerAgentInput): string {
+  return `Reproduce this issue in the live app, then submit a deterministic plan.
+
+The app is running now; use goto/read_page/click/fill/request/wait to explore it.
+${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}${formatPriorAttemptSection(input.priorAttempt)}
+Grounding rules:
+- Only reference routes, components, and UI strings that appear in the
+  evidence below or that you observe live. If you have not seen it, it does
+  not exist.
+- You cannot read source files. Ground your plan in what you observe through
+  read_page, request responses, and the graph hints above.
+
+Issue title:
+${input.issueTitle}
+
+Issue body:
+${input.issueBody || "(empty)"}
+
+package.json summary:
+${summarizePackageJson(input.packageJson)}
+
+Sandbox runtime logs (bounded tail):
+
+Base URL:
+${input.sandboxResult.baseUrl || "(unknown)"}
+
+STDOUT (last ${SANDBOX_LOG_TAIL_LINES} lines):
+${tailLines(input.sandboxResult.stdout, SANDBOX_LOG_TAIL_LINES) || "(empty)"}
+
+STDERR (last ${SANDBOX_LOG_TAIL_LINES} lines):
+${tailLines(input.sandboxResult.stderr, SANDBOX_LOG_TAIL_LINES) || "(empty)"}`;
+}
+
+// --- Small helpers ---------------------------------------------------------------------------
+
+function pushToolResult(
+  messages: Anthropic.Messages.MessageParam[],
+  assistantContent: Anthropic.Messages.ContentBlock[],
+  toolUseId: string,
+  content: string,
+  isError: boolean,
+) {
+  messages.push(
+    { role: "assistant", content: assistantContent },
+    {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: toolUseId, content, is_error: isError }],
+    },
+  );
+}
+
+function nonEmptyContent(
+  content: Anthropic.Messages.ContentBlock[],
+): Anthropic.Messages.MessageParam["content"] {
+  if (content.length > 0) {
+    return content;
+  }
+
+  return [{ type: "text", text: "(no content)" }];
+}
+
+function truncateText(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return text;
+  }
+
+  const marker = "\n[TRUNCATED]";
+  return `${truncateUtf8Bytes(text, Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8")))}${marker}`;
+}
+
+function firstLine(text: string): string {
+  const line = text.split("\n")[0] ?? "";
+  return line.length > 200 ? `${line.slice(0, 200)}...` : line;
+}
+
+// Compact target description for run_steps per-step outcome lines.
+function describeActionTarget(actionInput: Record<string, unknown>): string {
+  if (typeof actionInput.path === "string") {
+    return typeof actionInput.method === "string"
+      ? `${actionInput.method} ${actionInput.path}`
+      : actionInput.path;
+  }
+
+  if (actionInput.target) {
+    return JSON.stringify(actionInput.target).slice(0, 120);
+  }
+
+  if (typeof actionInput.ms === "number") {
+    return `${actionInput.ms}ms`;
+  }
+
+  return "";
+}
+
+function indentBlock(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => `  ${line}`)
+    .join("\n");
+}
+
+function formatError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  return String(error);
+}

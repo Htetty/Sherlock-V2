@@ -13,25 +13,51 @@
   ],
   "scripts": {
     "build": "tsc",
-    "start": "probot run ./lib/index.js",
-    "test": "vitest"
+    "start": "concurrently --kill-others --names backend,bot \"npm:serve:backend\" \"npm:serve:bot\"",
+    "serve:backend": "node ./lib/backend/server.js",
+    "serve:bot": "probot run ./lib/src/index.js",
+    "replay": "node ./lib/backend/replay.js",
+    "test": "vitest",
+    "worker": "node ./lib/backend/worker.js",
+    "worker:check": "node ./lib/backend/worker-preflight.js",
+    "worker:health": "node ./lib/backend/worker-health.js",
+    "ops:check:prod": "node ./lib/backend/ops-check.js",
+    "cleanup:retention": "node ./lib/backend/retention-cleanup.js",
+    "recover:durable-work": "node ./lib/backend/durable-recovery.js",
+    "reconcile:dashboard-data": "node ./lib/backend/dashboard-data-reconciliation.js",
+    "deploy:doctor:prod": "node scripts/deploy-doctor.mjs production",
+    "deploy:doctor:staging": "node scripts/deploy-doctor.mjs staging",
+    "deploy:smoke:prod": "node scripts/compose-smoke.mjs production",
+    "deploy:smoke:staging": "node scripts/compose-smoke.mjs staging",
+    "redis:up": "docker compose up -d redis",
+    "redis:down": "docker compose down"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@supabase/supabase-js": "^2.110.1",
+    "bullmq": "^5.79.2",
+    "concurrently": "^10.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "ioredis": "5.10.1",
+    "playwright": "^1.61.1",
     "probot": "^14.3.2"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
     "@types/node": "^24.0.0",
-    "ioredis": "^5.10.1",
     "nock": "^14.0.5",
     "smee-client": "^5.0.0",
-    "vitest": "^3.2.4",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "vitest": "^3.2.4"
   },
   "overrides": {
     "@types/pg": "8.15.1"
   },
   "engines": {
-    "node": "^20.18.1 || >= 22"
+    "node": ">= 22"
   },
   "type": "module"
 }

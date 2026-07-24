@@ -1,11 +1,36 @@
 node_modules
 npm-debug.log
+
+# Secrets / local env
 *.pem
 !mock-cert.pem
-.env.*
 .env
+.env.*
+!.env.example
+!.env.production.example
+!.env.staging.example
+
+# Mounted deployment secrets (GitHub App .pem, etc.)
+secrets/
+
+# Build / test output
 coverage
 lib
-
 dist
+
+# Local tool output
+fable
+
+# OS files
 .DS_Store
+
+# Sherlock runtime artifacts
+artifacts
+.sherlock-state
+_state
+
+# Local/private project notes
+PROJECT_OVERVIEW.md
+LOCAL_AGENT_IMPLEMENTATION_PLAN.md
+.claude/
+supabase/.temp/
