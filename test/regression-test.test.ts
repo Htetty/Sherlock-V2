@@ -12,6 +12,7 @@ import {
   buildRegressionTestPrompt,
   classifyPostPatchRun,
   classifyPrePatchRun,
+  compileDeterministicApiRegressionTest,
   extractRegressionFailureMarker,
   formatRegressionCommentLines,
   getNodeRegressionUnsupportedReason,
@@ -108,6 +109,40 @@ describe("regression proposal validation", () => {
 });
 
 describe("regression generation prompt", () => {
+  test("compiles API assertions deterministically with safely serialized values", () => {
+    const plan: ReproductionPlan = {
+      version: 1,
+      baseUrl: "http://localhost:3000",
+      steps: [
+        {
+          id: "search",
+          action: "request",
+          method: "GET",
+          path: '/api/recipes?q=pasta%22%3Bthrow+new+Error(%22nope',
+        },
+      ],
+      expectedBehavior: "Matching recipes are returned.",
+      failureCondition: "The result page is empty.",
+      assertion: {
+        type: "response_body",
+        method: "GET",
+        pathPattern: "/api/recipes",
+        failureContains: '{"items":[]}',
+        expectedContains: '"name":"Pasta"',
+      },
+    };
+
+    const first = compileDeterministicApiRegressionTest(plan, null);
+    const second = compileDeterministicApiRegressionTest(plan, null);
+
+    expect(first).not.toBeNull();
+    expect(first?.contents).toBe(second?.contents);
+    expect(hashTestContents(first!.contents)).toBe(hashTestContents(second!.contents));
+    expect(first?.contents).toContain("REGRESSION_EXPECTED_FAILURE:");
+    expect(validateRegressionProposalShape(first!).ok).toBe(true);
+    expect(first?.contents).not.toContain('throw new Error("nope');
+  });
+
   test("Node generation supports API assertions and fails closed for browser assertions", () => {
     const plan = (assertion: ReproductionPlan["assertion"]): ReproductionPlan =>
       ({ assertion }) as ReproductionPlan;

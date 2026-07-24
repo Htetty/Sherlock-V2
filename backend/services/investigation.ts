@@ -12,6 +12,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  MODEL,
   analyzeIssue,
   generateMemoryReflection,
   generateRegressionTestProposal,
@@ -22,6 +23,7 @@ import {
   summarizeInferenceRecords,
   type InferenceBudgetGuard,
   type InferenceTelemetry,
+  type AgentPhase,
 } from "./inference.js";
 import { resolveEfficiencyPolicy } from "./efficiency-policy.js";
 import {
@@ -89,10 +91,12 @@ import {
 } from "./sandbox.js";
 import {
   executeReproductionPlan,
+  openLiveSession,
   type ReproductionResult,
 } from "./playwright.js";
 import {
   getPlanMode,
+  validatePlanTargetsAgainstDigest,
   validateReproductionPlan,
   type ReproductionPlan,
 } from "./plan.js";
@@ -342,10 +346,46 @@ export async function runInvestigationPipeline(
     // recorder per investigation, appending inference-records.jsonl next to
     // the other artifacts. Recorder failures are counted internally and never
     // fail the investigation.
+    // Model routing is opt-in and phase-specific. Capable defaults remain
+    // unchanged unless the task policy or an explicit environment variable
+    // names a model for the cheap, bounded generation phases.
+    const configuredPolicies = options.policy?.inference ?? {};
+    const phasePolicies: InferenceTelemetry["policies"] = {
+      ...configuredPolicies,
+      plan: {
+        ...(configuredPolicies.plan ?? {}),
+        ...(configuredPolicies.plan?.model
+          ? {}
+          : process.env.SHERLOCK_PLAN_MODEL
+            ? { model: process.env.SHERLOCK_PLAN_MODEL }
+            : {}),
+      },
+      regression_test: {
+        ...(configuredPolicies.regression_test ?? {}),
+        ...(configuredPolicies.regression_test?.model
+          ? {}
+          : process.env.SHERLOCK_REGRESSION_MODEL
+            ? { model: process.env.SHERLOCK_REGRESSION_MODEL }
+            : {}),
+      },
+    };
+    const resolvedPhaseModels = Object.fromEntries(
+      (
+        [
+          "plan",
+          "reproduce",
+          "fix",
+          "regression_test",
+          "analysis",
+          "memory_reflection",
+        ] satisfies AgentPhase[]
+      ).map((phase) => [phase, phasePolicies?.[phase]?.model ?? MODEL]),
+    ) as Partial<Record<AgentPhase, string>>;
+
     const inferenceTelemetry: InferenceTelemetry = {
       investigationId,
       recorder: createInferenceRecorder(store.dir),
-      ...(options.policy?.inference ? { policies: options.policy.inference } : {}),
+      policies: phasePolicies,
       ...(options.policy?.inferenceBudgetGuard
         ? { budgetGuard: options.policy.inferenceBudgetGuard }
         : {}),
@@ -366,7 +406,10 @@ export async function runInvestigationPipeline(
     // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
     // incrementally so a crash still leaves a partial record.
     const costShape = createCostShapeTracker(store, budgetProfile);
-    await costShape.update({ resolvedEfficiencyPolicy: efficiency });
+    await costShape.update({
+      resolvedEfficiencyPolicy: efficiency,
+      resolvedPhaseModels,
+    });
 
     deriveUsageTotals = async () => {
       const totals = await summarizeInferenceRecords(store!.dir);
@@ -703,6 +746,11 @@ export async function runInvestigationPipeline(
           reproducerBatchedActions: reproResult.efficiencyCounters.batchedActions,
           reproducerActionDeltaBytes: reproResult.efficiencyCounters.actionDeltaBytes,
           reproducerReadPageCalls: reproResult.efficiencyCounters.readPageCalls,
+          reproducerEligibleBatches: reproResult.efficiencyCounters.eligibleBatches,
+          reproducerAvoidableUnbatchedCalls:
+            reproResult.efficiencyCounters.avoidableUnbatchedCalls,
+          reproducerEstimatedTurnsSaved:
+            reproResult.efficiencyCounters.estimatedTurnsSaved,
         });
 
         log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
@@ -853,6 +901,24 @@ export async function runInvestigationPipeline(
     if (!result && !forceReproducerAgent) {
       await costShape.update({ oneShotPlanTried: true });
 
+      let oneShotPageDigest: string | null = null;
+      try {
+        const groundingSession = await openLiveSession(sandboxSession.result.baseUrl);
+        try {
+          oneShotPageDigest = truncateUtf8Bytes(
+            await groundingSession.readPageDigest(),
+            12 * 1024,
+          );
+          await store.writeJson("one-shot-page-digest.json", {
+            digest: oneShotPageDigest,
+          });
+        } finally {
+          await groundingSession.close();
+        }
+      } catch (error) {
+        log(`One-shot DOM grounding unavailable: ${formatError(error)}`);
+      }
+
       const generated = await generateReproductionPlan(
         {
           issueTitle: payload.issueTitle,
@@ -866,6 +932,7 @@ export async function runInvestigationPipeline(
           sandboxResult: sandboxSession.result,
           graphContext,
           pastInvestigations,
+          pageDigest: oneShotPageDigest,
         },
         inferenceTelemetry,
       );
@@ -903,6 +970,22 @@ export async function runInvestigationPipeline(
           planErrors = validation.errors;
         } else {
           oneShotPlan = validation.plan;
+
+          if (oneShotPageDigest && getPlanMode(oneShotPlan) !== "api-only") {
+            const groundingErrors = validatePlanTargetsAgainstDigest(
+              oneShotPlan,
+              oneShotPageDigest,
+            );
+
+            if (groundingErrors.length > 0) {
+              log("Plan rejected because it invented browser targets:");
+              for (const groundingError of groundingErrors) {
+                log(`  - ${groundingError}`);
+              }
+              planErrors = groundingErrors;
+              oneShotPlan = null;
+            }
+          }
         }
       }
 
@@ -1975,5 +2058,6 @@ export function buildPriorReproductionAttempt(
     executedSteps,
     failedStep,
     evidenceSummary,
+    assertion: plan.assertion,
   };
 }

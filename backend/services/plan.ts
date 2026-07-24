@@ -446,6 +446,47 @@ export function getPlanMode(plan: ReproductionPlan): PlanMode {
   return "api-only";
 }
 
+// Reject browser targets invented by one-shot planning. This intentionally
+// uses a cheap conservative text check over the single live accessibility
+// digest: every locator value must have appeared in the actual page.
+export function validatePlanTargetsAgainstDigest(
+  plan: ReproductionPlan,
+  pageDigest: string,
+): string[] {
+  const normalizedDigest = pageDigest.toLocaleLowerCase();
+  const errors: string[] = [];
+
+  const checkTarget = (
+    target: DomTargetIntent | DomTargetScope,
+    location: string,
+  ) => {
+    for (const [key, rawValue] of Object.entries(target)) {
+      if (key === "within") {
+        checkTarget(rawValue as DomTargetScope, `${location}.within`);
+        continue;
+      }
+
+      const value = String(rawValue).trim().toLocaleLowerCase();
+
+      if (value && !normalizedDigest.includes(value)) {
+        errors.push(`${location}.${key} "${String(rawValue)}" was not present in the live page digest.`);
+      }
+    }
+  };
+
+  for (const [index, step] of plan.steps.entries()) {
+    if ("target" in step) {
+      checkTarget(step.target, `steps[${index}].target`);
+    }
+  }
+
+  if (plan.assertion.type === "input_value") {
+    checkTarget(plan.assertion.target, "assertion.target");
+  }
+
+  return errors;
+}
+
 const TARGET_KEYS = [
   "role",
   "name",

@@ -75,6 +75,9 @@ export type GeneratedPlan = {
 export type PlanGenerationInput = RepoEvidenceInput & {
   graphContext?: GraphContext | null;
   pastInvestigations?: string;
+  // A single bounded live DOM digest captured before one-shot planning.
+  // Browser targets must be copied from this evidence, not inferred from code.
+  pageDigest?: string | null;
 };
 
 export function buildReproductionPlanPrompt(
@@ -151,6 +154,10 @@ Assertion rules:
 - Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
 - The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
 ${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}
+${input.pageDigest ? `LIVE PAGE DIGEST (authoritative for browser targets):
+${input.pageDigest}
+
+` : ""}
 Grounding rules:
 - Only reference files, routes, components, and UI strings that appear in the
   evidence below. If it is not in the evidence, it does not exist.

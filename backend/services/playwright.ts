@@ -1012,6 +1012,27 @@ async function evaluateAssertion(
   }
 }
 
+// Evaluate a validated assertion against settled live evidence. This is only
+// a stop-exploring signal: a fresh frozen-plan replay remains the sole
+// authority that can mark an issue reproduced.
+export async function evaluateLiveAssertion(
+  live: LiveSession,
+  assertion: PlanAssertion,
+): Promise<AssertionResult> {
+  await waitForPageToSettle(live.page);
+  await flushPendingResponseCaptures(live.evidence);
+
+  const evidence = live.evidence;
+  const result = {
+    consoleErrors: evidence.consoleErrors,
+    pageErrors: evidence.pageErrors,
+    httpResponses: evidence.httpResponses,
+    apiResponses: evidence.apiResponses,
+  } as ReproductionResult;
+
+  return evaluateAssertion(assertion, result, live.page);
+}
+
 // Response-body assertions remain ordinary substring checks for text, but
 // JSON object fragments are matched structurally as a subset anywhere in the
 // decoded response. This keeps model-generated fragments stable when APIs add

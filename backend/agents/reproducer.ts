@@ -37,6 +37,7 @@ import {
   hashPlanBehavior,
   validateReproductionPlan,
   validateStep,
+  type PlanAssertion,
   type PlanMode,
   type ReproductionPlan,
   type ReproductionStep,
@@ -49,6 +50,7 @@ import {
 } from "../services/reproduction-divergence.js";
 import {
   computePageSnapshotDelta,
+  evaluateLiveAssertion,
   executeReproductionPlan,
   formatPageSnapshot,
   openLiveSession,
@@ -97,7 +99,7 @@ const REPRODUCER_SHARED_LIMITS = {
 
 export const STANDARD_REPRODUCER_BUDGETS = {
   ...REPRODUCER_SHARED_LIMITS,
-  maxModelTurns: 25,
+  maxModelTurns: 16,
   maxBrowserActions: 8, // goto/click/fill/wait combined
   maxRequestCalls: 8,
   maxReadPageCalls: 5,
@@ -197,6 +199,9 @@ export type PriorReproductionAttempt = {
   failedStep: PriorAttemptStep | null;
   // Bounded rendering of summarizeReproductionEvidence() for the failed run.
   evidenceSummary: string;
+  // The already-validated assertion from that replay. Live exploration may
+  // use it only to stop searching; the pristine replay remains authoritative.
+  assertion?: PlanAssertion;
 };
 
 export type ReproducerAgentStatus =
@@ -257,6 +262,9 @@ export type ReproducerAgentResult = {
     batchedActions: number;
     actionDeltaBytes: number;
     readPageCalls: number;
+    eligibleBatches: number;
+    avoidableUnbatchedCalls: number;
+    estimatedTurnsSaved: number;
   };
 };
 
@@ -292,11 +300,27 @@ export type ReproducerFailureEvidence = {
 // a response finding carrying a 4xx/5xx status. Shared by the failure
 // classifier and future consumers (e.g. plan_mismatch routing).
 export function failureObservedLive(findings: ReproducerFinding[]): boolean {
-  return findings.some(
-    (finding) =>
-      finding.kind === "runtime_error" ||
-      (finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation)),
-  );
+  return liveFailureReason(findings) !== null;
+}
+
+export function liveFailureReason(
+  findings: ReproducerFinding[],
+): "runtime_error" | "http_error" | "validated_semantic_assertion" | null {
+  if (findings.some((finding) => finding.kind === "semantic_failure")) {
+    return "validated_semantic_assertion";
+  }
+  if (findings.some((finding) => finding.kind === "runtime_error")) {
+    return "runtime_error";
+  }
+  if (
+    findings.some(
+      (finding) =>
+        finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation),
+    )
+  ) {
+    return "http_error";
+  }
+  return null;
 }
 
 // --- Structured findings (AGENT_LOOP_UPGRADE_PROMPT.md, Change 4) -------------
@@ -305,7 +329,13 @@ export function failureObservedLive(findings: ReproducerFinding[]): boolean {
 // time. Never model-generated prose, never byte-count metadata.
 
 export type ReproducerFinding = {
-  kind: "route" | "element" | "response" | "runtime_error" | "tool_failure";
+  kind:
+    | "route"
+    | "element"
+    | "response"
+    | "runtime_error"
+    | "semantic_failure"
+    | "tool_failure";
   observation: string;
   sourceTool: string;
   sourceStepId: string | null;
@@ -326,7 +356,7 @@ export function selectReproducerFindings(
     return [...all];
   }
 
-  const priority = new Set(["runtime_error", "route", "response"]);
+  const priority = new Set(["runtime_error", "semantic_failure", "route", "response"]);
   const selected = new Set<ReproducerFinding>();
 
   for (let index = all.length - 1; index >= 0; index -= 1) {
@@ -661,7 +691,11 @@ export async function runReproducerAgent(
     runStepsCalls: 0,
     batchedActions: 0,
     actionDeltaBytes: 0,
+    eligibleBatches: 0,
+    avoidableUnbatchedCalls: 0,
+    estimatedTurnsSaved: 0,
   };
+  let consecutiveStandaloneActions = 0;
 
   const boundAndAccountEvidence = (text: string) => {
     const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
@@ -732,6 +766,11 @@ export async function runReproducerAgent(
   let toolCallIndex = 0;
   let stepCounter = 0;
   let nudged = false;
+  let forcedSubmissionReason:
+    | "runtime_error"
+    | "http_error"
+    | "validated_semantic_assertion"
+    | null = null;
 
   // Compaction: per-task override first, then the resolved efficiency policy
   // (default ON, fable/16). Unchanged triggers (6 tool calls / 60KB).
@@ -872,6 +911,53 @@ export async function runReproducerAgent(
     findingsCursor.network = evidence.networkFailures.length;
   };
 
+  const recordPriorAssertionIfMatched = async (
+    live: LiveSession,
+    sourceTool: string,
+    sourceStepId: string | null,
+    settledPageDigest?: string,
+  ) => {
+    const assertion = input.priorAttempt?.assertion;
+
+    if (!assertion) {
+      return;
+    }
+
+    // Absence assertions need a settled page after meaningful interaction.
+    // Otherwise the blank initial document would be a false-positive stop.
+    if (
+      assertion.type === "page_text" &&
+      assertion.failureWhen === "absent" &&
+      (counters.pageActionsExecuted < 2 || counters.readPageOk < 1)
+    ) {
+      return;
+    }
+
+    const evaluated =
+      assertion.type === "page_text" && settledPageDigest !== undefined
+        ? {
+            matchedFailure:
+              assertion.failureWhen === "present"
+                ? settledPageDigest.includes(assertion.contains)
+                : !settledPageDigest.includes(assertion.contains),
+            detail: `Settled page digest ${
+              settledPageDigest.includes(assertion.contains)
+                ? "contained"
+                : "did not contain"
+            } "${assertion.contains}"; failure condition is text ${assertion.failureWhen}.`,
+          }
+        : await evaluateLiveAssertion(live, assertion);
+
+    if (evaluated.matchedFailure) {
+      recordFinding(
+        "semantic_failure",
+        `validated prior assertion matched: ${evaluated.detail}`,
+        sourceTool,
+        sourceStepId,
+      );
+    }
+  };
+
   const messages: Anthropic.Messages.MessageParam[] = [];
 
   const finish = async (
@@ -950,6 +1036,9 @@ export async function runReproducerAgent(
         batchedActions: counters.batchedActions,
         actionDeltaBytes: counters.actionDeltaBytes,
         readPageCalls: counters.readPage,
+        eligibleBatches: counters.eligibleBatches,
+        avoidableUnbatchedCalls: counters.avoidableUnbatchedCalls,
+        estimatedTurnsSaved: counters.estimatedTurnsSaved,
       },
     };
     transcript.push({ type: "final_result", status, reason, submissions, mode, failureCode });
@@ -966,6 +1055,7 @@ export async function runReproducerAgent(
       readPageCalls: counters.readPage,
       submittedPlans: counters.submissions,
       submittedPlanMode: acceptedPlanMode,
+      forcedSubmissionReason,
       uiFirstPolicy: {
         required: uiFirstRequired,
         satisfied: uiFirstSatisfied(),
@@ -1269,6 +1359,19 @@ export async function runReproducerAgent(
         counters.submissions === 0 &&
         (!uiFirstRequired || uiFirstSatisfied()) &&
         failureObservedLive(findings);
+      if (forcePlanSubmission) {
+        forcedSubmissionReason = liveFailureReason(findings);
+        transcript.push({
+          type: "submission_forced",
+          turn: counters.turns,
+          reason: forcedSubmissionReason,
+        });
+      }
+      const forceActionBatch =
+        !forcePlanSubmission &&
+        efficiency.reproducerRunSteps &&
+        counters.submissions === 0 &&
+        consecutiveStandaloneActions >= 2;
 
       const message = await createMessage({
         model: MODEL,
@@ -1277,7 +1380,9 @@ export async function runReproducerAgent(
         tools,
         tool_choice: forcePlanSubmission
           ? { type: "tool", name: "submit_plan", disable_parallel_tool_use: true }
-          : { type: "any", disable_parallel_tool_use: true },
+          : forceActionBatch
+            ? { type: "tool", name: "run_steps", disable_parallel_tool_use: true }
+            : { type: "any", disable_parallel_tool_use: true },
         messages: [...messages],
       });
 
@@ -1588,6 +1693,7 @@ export async function runReproducerAgent(
       let isError = false;
 
       if (toolUse.name === "read_page") {
+        consecutiveStandaloneActions = 0;
         counters.readPage += 1;
         if (counters.readPage > budgets.maxReadPageCalls) {
           resultText = "read_page budget exhausted — submit a plan or call submit_not_reproducible.";
@@ -1627,6 +1733,7 @@ export async function runReproducerAgent(
               null,
             );
             recordNewEvidenceFindings(live, "read_page", null);
+            await recordPriorAssertionIfMatched(live, "read_page", null, digest);
             await live
               .captureScreenshot(`${String(toolCallIndex + 1).padStart(3, "0")}-after-read_page`)
               .catch(() => null);
@@ -1664,7 +1771,10 @@ export async function runReproducerAgent(
             isError = true;
           } else {
             counters.runStepsCalls += 1;
+            counters.eligibleBatches += 1;
+            consecutiveStandaloneActions = 0;
             const evidenceBeforeBatch = counters.evidenceBytes;
+            const batchedActionsBefore = counters.batchedActions;
             const steps = rawSteps as Array<Record<string, unknown>>;
             const lines: string[] = [];
             let stoppedAt: number | null = null;
@@ -1688,6 +1798,10 @@ export async function runReproducerAgent(
                 break;
               }
             }
+            counters.estimatedTurnsSaved += Math.max(
+              0,
+              counters.batchedActions - batchedActionsBefore - 1,
+            );
 
             if (stoppedAt !== null && stoppedAt < steps.length) {
               for (let index = stoppedAt; index < steps.length; index += 1) {
@@ -1728,6 +1842,15 @@ export async function runReproducerAgent(
         );
         resultText = outcome.resultText;
         isError = outcome.isError;
+        if (!outcome.budgetExhausted) {
+          consecutiveStandaloneActions += 1;
+          if (consecutiveStandaloneActions === 2) {
+            counters.eligibleBatches += 1;
+          }
+          if (consecutiveStandaloneActions > 1) {
+            counters.avoidableUnbatchedCalls += 1;
+          }
+        }
       } else {
         resultText = `Unknown tool "${toolUse.name}".`;
         isError = true;

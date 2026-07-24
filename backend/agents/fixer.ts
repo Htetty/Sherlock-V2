@@ -413,6 +413,26 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   },
 ];
 
+function scopeReadToolPaths(
+  tool: Anthropic.Messages.Tool,
+  readableFiles: string[],
+): Anthropic.Messages.Tool {
+  if (tool.name !== "read_file" && tool.name !== "read_many") {
+    return tool;
+  }
+
+  const scoped = structuredClone(tool) as Anthropic.Messages.Tool;
+  const schema = scoped.input_schema as Record<string, any>;
+
+  if (tool.name === "read_file") {
+    schema.properties.path.enum = readableFiles;
+  } else {
+    schema.properties.files.items.properties.path.enum = readableFiles;
+  }
+
+  return scoped;
+}
+
 // run_code (fable/16): appended to the tool list only when the resolved
 // efficiency policy enables it. The list is fixed at run start, so tool
 // definitions stay byte-identical across every turn of one run (cache
@@ -468,8 +488,27 @@ export async function runFixerAgent(
   // Opt-in agent-observation mode. Default zero preserves the cost-conscious
   // behavior where sufficiently grounded fixes may patch immediately.
   const minimumInspections = getFixerMinimumInspections(budgets);
+  // Files whose FULL contents are already in the initial message. They are
+  // removed from read tool schemas, so the model cannot waste a billed turn
+  // requesting a deterministically unusable read.
+  const hydratedFullFiles = new Set(
+    input.initialSourceFiles
+      .filter((file) => !file.truncated)
+      .map((file) => path.normalize(file.path).split(path.sep).join("/")),
+  );
+  const readableFiles = input.fileTree
+    .map((file) => path.normalize(file).split(path.sep).join("/"))
+    .filter((file) => !hydratedFullFiles.has(file));
   // Fixed at run start: the tool list must be byte-identical on every turn.
-  const tools = efficiency.fixerRunCode ? [...TOOLS, RUN_CODE_TOOL] : TOOLS;
+  const readScopedTools =
+    readableFiles.length === 0
+      ? TOOLS.filter((tool) => tool.name !== "read_file" && tool.name !== "read_many")
+      : readableFiles.length <= 200
+        ? TOOLS.map((tool) => scopeReadToolPaths(tool, readableFiles))
+        : TOOLS;
+  const tools = efficiency.fixerRunCode
+    ? [...readScopedTools, RUN_CODE_TOOL]
+    : readScopedTools;
 
   const log = (message: string) => {
     console.log(`[${input.investigationId}] Fixer: ${message}`);
@@ -544,14 +583,6 @@ export async function runFixerAgent(
   const attempts: FixerAgentAttempt[] = [];
   const transcript: unknown[] = [];
 
-  // Files whose FULL contents are already in the initial message. Re-reading
-  // them is deterministically rejected (no budget consumed) — the model must
-  // use the provided context instead of rediscovering it with tools.
-  const hydratedFullFiles = new Set(
-    input.initialSourceFiles
-      .filter((file) => !file.truncated)
-      .map((file) => path.normalize(file.path).split(path.sep).join("/")),
-  );
   let toolCallIndex = 0;
   let lastAttempt: FixAttemptResult | null = null;
   let nudged = false;
@@ -990,6 +1021,10 @@ export async function runFixerAgent(
 
       counters.turns += 1;
 
+      const forcePatchRevision =
+        minimumInspections === 0 &&
+        lastVerifierFeedback.includes("DETERMINISTIC DIAGNOSTIC:");
+
       // Snapshot: the params must not alias the mutable history array, so
       // recorded/injected createMessage implementations see a stable value.
       const message = await createMessage({
@@ -1006,7 +1041,13 @@ export async function runFixerAgent(
         // Parallel reads (Phase 2, default OFF): when enabled, the model may
         // emit several READ-ONLY calls per turn under the tool-batch
         // contract; terminal/mutation tools must still be called alone.
-        tool_choice: { type: "any", disable_parallel_tool_use: !parallelReads },
+        tool_choice: forcePatchRevision
+          ? {
+              type: "tool",
+              name: "propose_patch",
+              disable_parallel_tool_use: true,
+            }
+          : { type: "any", disable_parallel_tool_use: !parallelReads },
         messages: [...messages],
       });
 
@@ -1288,6 +1329,7 @@ export async function runFixerAgent(
           sourceCommit: input.sourceCommit,
           plan: input.plan,
           originalOutcome: input.reproductionResult.outcome,
+          reproductionResult: input.reproductionResult,
           proposal: shape.proposal,
           restart: input.restart,
           repositoryLabel: input.repositoryLabel,
@@ -1892,7 +1934,6 @@ What you CANNOT do:
 
 Rules:
 ${context.minimumInspections > 0 ? `- INSPECTION TEST MODE: before propose_patch is accepted, complete at least ${context.minimumInspections} successful inspection tool calls. This temporary test setting overrides the normal instruction to patch immediately; make each inspection answer a concrete question and do not waste calls.\n` : ""}- You already receive the reproduced failure, assertion result, observed evidence, Graphify-ranked context, hydrated source files, and${context.hasMemory ? "" : " (this run: none matched)"} PAST INVESTIGATIONS memory. Treat all of it as evidence, not background noise.
-- You already receive the reproduced failure, assertion result, observed evidence, Graphify-ranked context, hydrated source files, and${context.hasMemory ? "" : " (this run: none matched)"} PAST INVESTIGATIONS memory. Treat all of it as evidence, not background noise.
 ${context.hasMemory ? `- MEMORY FIRST: if a PAST INVESTIGATIONS entry is a verified fix for this same issue and its diff is not marked STALE, adapt that diff and call propose_patch on your FIRST turn — zero exploration calls. If it is marked STALE, verify only the changed region, then patch.\n` : ""}- Before calling any non-patch tool, decide what exact fact is missing, whether it is already present in the provided evidence, how the result will change your patch, and whether you can patch now without it. If you can patch now, patch now.
 - A non-patch tool call is allowed only when it answers a concrete unknown that blocks patching.
 - Your goal is not to maximize certainty. Your goal is to make the smallest defensible patch once the evidence is sufficient. Extra tool calls are harmful unless they remove a specific blocker to patching.
@@ -2178,7 +2219,15 @@ function formatAttemptFeedback(
     .filter((item) => item.status === "failed")
     .map((item) => `  ${item.name}: ${item.detail}`);
 
+  const observed = attempt.postPatchEvidence?.assertion?.observed ?? "";
+  const deterministicDiagnostic =
+    /"items"\s*:\s*\[\s*\]/.test(observed) &&
+    /"total"\s*:\s*[1-9]\d*/.test(observed)
+      ? "DETERMINISTIC DIAGNOSTIC: the response reports total > 0 while items is empty. Filtering matched records, but pagination/slicing removed them; revise the patch directly around page offset/index handling. This is the root-cause discriminator—do not re-read hydrated files or perform generic searches."
+      : null;
+
   const tail = [
+    deterministicDiagnostic,
     failedChecks.length > 0 ? `Failed checks:\n${failedChecks.join("\n")}` : "Failed checks: (none)",
     `Changed files: ${attempt.changedFiles.join(", ") || "(none)"}`,
     `Post-patch replay outcome: ${attempt.postPatchOutcome ?? "(replay not reached)"}`,
@@ -2189,7 +2238,7 @@ function formatAttemptFeedback(
 
   let text = `${head}\n\n${delta}`;
 
-  for (const section of tail) {
+  for (const section of tail.filter((item): item is string => item !== null)) {
     const candidate = `${text}\n${section}`;
 
     if (byteLength(candidate) > maxBytes) {
