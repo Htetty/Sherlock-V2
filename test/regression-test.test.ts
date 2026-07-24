@@ -12,8 +12,10 @@ import {
   buildRegressionTestPrompt,
   classifyPostPatchRun,
   classifyPrePatchRun,
+  compileDeterministicApiRegressionTest,
   extractRegressionFailureMarker,
   formatRegressionCommentLines,
+  getNodeRegressionUnsupportedReason,
   getRegressionTimeoutMs,
   hashTestContents,
   materializeTest,
@@ -107,6 +109,73 @@ describe("regression proposal validation", () => {
 });
 
 describe("regression generation prompt", () => {
+  test("compiles API assertions deterministically with safely serialized values", () => {
+    const plan: ReproductionPlan = {
+      version: 1,
+      baseUrl: "http://localhost:3000",
+      steps: [
+        {
+          id: "search",
+          action: "request",
+          method: "GET",
+          path: '/api/recipes?q=pasta%22%3Bthrow+new+Error(%22nope',
+        },
+      ],
+      expectedBehavior: "Matching recipes are returned.",
+      failureCondition: "The result page is empty.",
+      assertion: {
+        type: "response_body",
+        method: "GET",
+        pathPattern: "/api/recipes",
+        failureContains: '{"items":[]}',
+        expectedContains: '"name":"Pasta"',
+      },
+    };
+
+    const first = compileDeterministicApiRegressionTest(plan, null);
+    const second = compileDeterministicApiRegressionTest(plan, null);
+
+    expect(first).not.toBeNull();
+    expect(first?.contents).toBe(second?.contents);
+    expect(hashTestContents(first!.contents)).toBe(hashTestContents(second!.contents));
+    expect(first?.contents).toContain("REGRESSION_EXPECTED_FAILURE:");
+    expect(validateRegressionProposalShape(first!).ok).toBe(true);
+    expect(first?.contents).not.toContain('throw new Error("nope');
+  });
+
+  test("Node generation supports API assertions and fails closed for browser assertions", () => {
+    const plan = (assertion: ReproductionPlan["assertion"]): ReproductionPlan =>
+      ({ assertion }) as ReproductionPlan;
+
+    expect(
+      getNodeRegressionUnsupportedReason(
+        plan({
+          type: "response_status",
+          expected: 200,
+          failureValue: 500,
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      getNodeRegressionUnsupportedReason(
+        plan({
+          type: "response_body",
+          failureContains: "broken",
+        }),
+      ),
+    ).toBeNull();
+
+    for (const assertion of [
+      { type: "page_text", contains: "saved", failureWhen: "absent" },
+      { type: "element_text", selector: "#status", contains: "saved" },
+      { type: "console_error", contains: "render failed" },
+    ] as ReproductionPlan["assertion"][]) {
+      expect(getNodeRegressionUnsupportedReason(plan(assertion))).toContain(
+        `browser-only "${assertion.type}"`,
+      );
+    }
+  });
+
   test("requires verified reproduction routes and the exact behavioral failure marker", () => {
     // Marker extraction: exactly one required.
     expect(extractRegressionFailureMarker(VALID_CONTENTS)).toBe(

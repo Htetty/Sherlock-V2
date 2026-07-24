@@ -25,7 +25,10 @@ import {
   REPRODUCTION_PLAN_VERSION,
   type ReproductionPlan,
 } from "../backend/services/plan.js";
-import { executeReproductionPlan } from "../backend/services/playwright.js";
+import {
+  executeReproductionPlan,
+  matchesResponseBodyAssertion,
+} from "../backend/services/playwright.js";
 import { replayInvestigation } from "../backend/replay.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -143,6 +146,32 @@ describe("investigation IDs", () => {
   });
 });
 
+describe("response body assertions", () => {
+  test("matches JSON object fragments despite extra fields and property order", () => {
+    const body = JSON.stringify([
+      {
+        id: 1,
+        title: "Design landing page",
+        notes: "",
+        done: false,
+      },
+    ]);
+
+    expect(
+      matchesResponseBodyAssertion(
+        body,
+        '"title":"Design landing page","done":false',
+      ),
+    ).toBe(true);
+    expect(
+      matchesResponseBodyAssertion(
+        body,
+        '"title":"Design landing page","done":true',
+      ),
+    ).toBe(false);
+  });
+});
+
 describe("deterministic reproduction", () => {
   test(
     "classifies the seeded login bug as reproduced and persists evidence",
@@ -215,6 +244,83 @@ describe("deterministic reproduction", () => {
       expect(result.outcome).toBe("not_reproduced");
       expect(result.assertion?.observed).toBe("401");
       expect(result.assertion?.matchedExpected).toBe(true);
+    },
+  );
+
+  test(
+    "classifies missing expected page text as the reproduced failure",
+    { timeout: 60_000 },
+    async () => {
+      const baseUrl = await startFixtureApp({ buggy: false });
+      const store = await makeStore();
+      const validation = validateReproductionPlan({
+        version: REPRODUCTION_PLAN_VERSION,
+        baseUrl,
+        steps: [{ id: "step-1", action: "goto", path: "/" }],
+        expectedBehavior: "The submitted note appears in the visible page text.",
+        failureCondition: "The submitted note is absent from the visible page text.",
+        assertion: {
+          type: "page_text",
+          contains: "Reproduce bug note",
+          failureWhen: "absent",
+        },
+      });
+
+      expect(validation.ok).toBe(true);
+
+      if (!validation.ok) {
+        return;
+      }
+
+      const result = await executeReproductionPlan(validation.plan, store);
+
+      expect(result.outcome).toBe("reproduced");
+      expect(result.assertion?.matchedFailure).toBe(true);
+      expect(result.assertion?.matchedExpected).toBe(false);
+      expect(result.assertion?.detail).toContain("failure condition is text absent");
+    },
+  );
+
+  test(
+    "classifies a targeted input value without treating it as page text",
+    { timeout: 60_000 },
+    async () => {
+      const baseUrl = await startFixtureApp({ buggy: false });
+      const store = await makeStore();
+      const validation = validateReproductionPlan({
+        version: REPRODUCTION_PLAN_VERSION,
+        baseUrl,
+        steps: [
+          { id: "step-1", action: "goto", path: "/" },
+          {
+            id: "step-2",
+            action: "fill",
+            target: { placeholder: "email" },
+            value: "moved@example.com",
+          },
+        ],
+        expectedBehavior: "The email field stays empty.",
+        failureCondition: "The email field contains the moved value.",
+        assertion: {
+          type: "input_value",
+          target: { placeholder: "email" },
+          value: "moved@example.com",
+          failureWhen: "equals",
+        },
+      });
+
+      expect(validation.ok).toBe(true);
+
+      if (!validation.ok) {
+        return;
+      }
+
+      const result = await executeReproductionPlan(validation.plan, store);
+
+      expect(result.outcome).toBe("reproduced");
+      expect(result.assertion?.observed).toBe("moved@example.com");
+      expect(result.assertion?.matchedFailure).toBe(true);
+      expect(result.assertion?.detail).toContain("Input value equaled");
     },
   );
 

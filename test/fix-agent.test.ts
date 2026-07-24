@@ -392,6 +392,38 @@ describe("fixer agent loop", () => {
     expect(feedback).toContain("rolled back");
   });
 
+  test("after behavior passes but repository validation fails, exposes only patch or stop", async () => {
+    const input = await makeInput();
+    const model = scriptedModel([
+      toolUseMessage("propose_patch", PROPOSAL_INPUT),
+      toolUseMessage("submit_blocked", {
+        reason: "The remaining build failure is unrelated to the behavioral patch.",
+      }),
+    ]);
+
+    const result = await runFixerAgent(input, {
+      createMessage: model.createMessage,
+      runFixAttempt: async () => {
+        const failed = attemptResult(
+          "rejected_tests_failed",
+          "The original failure disappeared, but npm run build failed: TypeError in prerender.",
+        );
+        failed.postPatchOutcome = "not_reproduced";
+        return failed;
+      },
+    });
+
+    expect(result.status).toBe("blocked");
+    expect(model.calls[1].tools?.map((tool) => tool.name).sort()).toEqual([
+      "propose_patch",
+      "submit_blocked",
+    ]);
+    expect(model.calls[1].tool_choice).toMatchObject({
+      type: "any",
+      disable_parallel_tool_use: true,
+    });
+  });
+
   test("stops exhausted after max patch attempts, never verified", async () => {
     const input = await makeInput();
     const model = scriptedModel([

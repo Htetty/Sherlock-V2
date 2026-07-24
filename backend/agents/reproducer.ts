@@ -37,6 +37,7 @@ import {
   hashPlanBehavior,
   validateReproductionPlan,
   validateStep,
+  type PlanAssertion,
   type PlanMode,
   type ReproductionPlan,
   type ReproductionStep,
@@ -49,6 +50,7 @@ import {
 } from "../services/reproduction-divergence.js";
 import {
   computePageSnapshotDelta,
+  evaluateLiveAssertion,
   executeReproductionPlan,
   formatPageSnapshot,
   openLiveSession,
@@ -197,6 +199,9 @@ export type PriorReproductionAttempt = {
   failedStep: PriorAttemptStep | null;
   // Bounded rendering of summarizeReproductionEvidence() for the failed run.
   evidenceSummary: string;
+  // The already-validated assertion from that replay. Live exploration may
+  // use it only to stop searching; the pristine replay remains authoritative.
+  assertion?: PlanAssertion;
 };
 
 export type ReproducerAgentStatus =
@@ -257,6 +262,9 @@ export type ReproducerAgentResult = {
     batchedActions: number;
     actionDeltaBytes: number;
     readPageCalls: number;
+    eligibleBatches: number;
+    avoidableUnbatchedCalls: number;
+    estimatedTurnsSaved: number;
   };
 };
 
@@ -292,11 +300,27 @@ export type ReproducerFailureEvidence = {
 // a response finding carrying a 4xx/5xx status. Shared by the failure
 // classifier and future consumers (e.g. plan_mismatch routing).
 export function failureObservedLive(findings: ReproducerFinding[]): boolean {
-  return findings.some(
-    (finding) =>
-      finding.kind === "runtime_error" ||
-      (finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation)),
-  );
+  return liveFailureReason(findings) !== null;
+}
+
+export function liveFailureReason(
+  findings: ReproducerFinding[],
+): "runtime_error" | "http_error" | "validated_semantic_assertion" | null {
+  if (findings.some((finding) => finding.kind === "semantic_failure")) {
+    return "validated_semantic_assertion";
+  }
+  if (findings.some((finding) => finding.kind === "runtime_error")) {
+    return "runtime_error";
+  }
+  if (
+    findings.some(
+      (finding) =>
+        finding.kind === "response" && /->\s*[45]\d\d\b/.test(finding.observation),
+    )
+  ) {
+    return "http_error";
+  }
+  return null;
 }
 
 // --- Structured findings (AGENT_LOOP_UPGRADE_PROMPT.md, Change 4) -------------
@@ -305,7 +329,13 @@ export function failureObservedLive(findings: ReproducerFinding[]): boolean {
 // time. Never model-generated prose, never byte-count metadata.
 
 export type ReproducerFinding = {
-  kind: "route" | "element" | "response" | "runtime_error" | "tool_failure";
+  kind:
+    | "route"
+    | "element"
+    | "response"
+    | "runtime_error"
+    | "semantic_failure"
+    | "tool_failure";
   observation: string;
   sourceTool: string;
   sourceStepId: string | null;
@@ -326,7 +356,7 @@ export function selectReproducerFindings(
     return [...all];
   }
 
-  const priority = new Set(["runtime_error", "route", "response"]);
+  const priority = new Set(["runtime_error", "semantic_failure", "route", "response"]);
   const selected = new Set<ReproducerFinding>();
 
   for (let index = all.length - 1; index >= 0; index -= 1) {
@@ -350,18 +380,30 @@ export type ReproducerAgentDeps = {
 
 // --- Tools -------------------------------------------------------------------------
 
+const TARGET_PROPERTIES = {
+  role: { type: "string" as const },
+  name: { type: "string" as const },
+  label: { type: "string" as const },
+  placeholder: { type: "string" as const },
+  text: { type: "string" as const },
+  testId: { type: "string" as const },
+  id: { type: "string" as const },
+};
+
+const TARGET_SCOPE_SCHEMA = {
+  type: "object" as const,
+  description:
+    "Grounded ancestor/container used to scope a repeated control. Use one or more of: role, name, label, placeholder, text, testId, id.",
+  properties: TARGET_PROPERTIES,
+};
+
 const TARGET_SCHEMA = {
   type: "object" as const,
   description:
-    'Intent target, never a CSS selector. One or more of: role, name, label, placeholder, text, testId (data-testid attribute ONLY), id (HTML id attribute). All values non-empty strings that you have seen via read_page.',
+    'Intent target, never a CSS selector. One or more of: role, name, label, placeholder, text, testId (data-testid attribute ONLY), id (HTML id attribute). Use optional "within" to scope a repeated control to a grounded ancestor. All values must be non-empty strings seen via read_page.',
   properties: {
-    role: { type: "string" },
-    name: { type: "string" },
-    label: { type: "string" },
-    placeholder: { type: "string" },
-    text: { type: "string" },
-    testId: { type: "string" },
-    id: { type: "string" },
+    ...TARGET_PROPERTIES,
+    within: TARGET_SCOPE_SCHEMA,
   },
 };
 
@@ -388,11 +430,17 @@ const PLAN_STEP_SCHEMA = {
 const ASSERTION_SCHEMA = {
   type: "object" as const,
   description:
-    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"element_text", target, contains}. console_error/element_text require at least one browser step in the plan.',
+    'Exactly one of: {type:"response_status", pathPattern?, method?, expected, failureValue} | {type:"response_body", pathPattern?, method?, failureContains, expectedContains?} (checks the LAST matching "request" step response) | {type:"console_error", contains} | {type:"page_text", contains, failureWhen:"present"|"absent"} | {type:"input_value", target, value, failureWhen:"equals"|"not_equals"}. page_text checks visible body text and never reads input values; use input_value for input/textarea/select state. Browser-state assertions require at least one browser step.',
   properties: {
     type: {
       type: "string",
-      enum: ["response_status", "response_body", "console_error", "element_text"],
+      enum: [
+        "response_status",
+        "response_body",
+        "console_error",
+        "page_text",
+        "input_value",
+      ],
     },
     pathPattern: { type: "string" },
     method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"] },
@@ -402,6 +450,11 @@ const ASSERTION_SCHEMA = {
     expectedContains: { type: "string" },
     contains: { type: "string" },
     target: TARGET_SCHEMA,
+    value: { type: "string" },
+    failureWhen: {
+      type: "string",
+      enum: ["present", "absent", "equals", "not_equals"],
+    },
   },
   required: ["type"],
 };
@@ -419,7 +472,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "click",
     description:
-      "Click an element in the live browser. Strict mode: an ambiguous target fails with per-key match diagnostics.",
+      'Click an element in the live browser. Strict mode: an ambiguous target fails with per-key match diagnostics. For repeated controls, scope the target with "within" to the row/card/list item whose text identifies it.',
     input_schema: {
       type: "object" as const,
       properties: { target: TARGET_SCHEMA },
@@ -461,7 +514,7 @@ const TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: "read_page",
     description:
-      "Digest of the CURRENT page (URL, title, interactive elements in target vocabulary) plus console/network/API evidence recorded since your last read_page.",
+      "Digest of the CURRENT page (URL, title, interactive elements in target vocabulary, and current non-secret form values) plus console/network/API evidence recorded since your last read_page.",
     input_schema: { type: "object" as const, properties: {} },
   },
   {
@@ -638,7 +691,11 @@ export async function runReproducerAgent(
     runStepsCalls: 0,
     batchedActions: 0,
     actionDeltaBytes: 0,
+    eligibleBatches: 0,
+    avoidableUnbatchedCalls: 0,
+    estimatedTurnsSaved: 0,
   };
+  let consecutiveStandaloneActions = 0;
 
   const boundAndAccountEvidence = (text: string) => {
     const remaining = Math.max(0, budgets.maxEvidenceBytes - counters.evidenceBytes);
@@ -709,6 +766,11 @@ export async function runReproducerAgent(
   let toolCallIndex = 0;
   let stepCounter = 0;
   let nudged = false;
+  let forcedSubmissionReason:
+    | "runtime_error"
+    | "http_error"
+    | "validated_semantic_assertion"
+    | null = null;
 
   // Compaction: per-task override first, then the resolved efficiency policy
   // (default ON, fable/16). Unchanged triggers (6 tool calls / 60KB).
@@ -849,6 +911,53 @@ export async function runReproducerAgent(
     findingsCursor.network = evidence.networkFailures.length;
   };
 
+  const recordPriorAssertionIfMatched = async (
+    live: LiveSession,
+    sourceTool: string,
+    sourceStepId: string | null,
+    settledPageDigest?: string,
+  ) => {
+    const assertion = input.priorAttempt?.assertion;
+
+    if (!assertion) {
+      return;
+    }
+
+    // Absence assertions need a settled page after meaningful interaction.
+    // Otherwise the blank initial document would be a false-positive stop.
+    if (
+      assertion.type === "page_text" &&
+      assertion.failureWhen === "absent" &&
+      (counters.pageActionsExecuted < 2 || counters.readPageOk < 1)
+    ) {
+      return;
+    }
+
+    const evaluated =
+      assertion.type === "page_text" && settledPageDigest !== undefined
+        ? {
+            matchedFailure:
+              assertion.failureWhen === "present"
+                ? settledPageDigest.includes(assertion.contains)
+                : !settledPageDigest.includes(assertion.contains),
+            detail: `Settled page digest ${
+              settledPageDigest.includes(assertion.contains)
+                ? "contained"
+                : "did not contain"
+            } "${assertion.contains}"; failure condition is text ${assertion.failureWhen}.`,
+          }
+        : await evaluateLiveAssertion(live, assertion);
+
+    if (evaluated.matchedFailure) {
+      recordFinding(
+        "semantic_failure",
+        `validated prior assertion matched: ${evaluated.detail}`,
+        sourceTool,
+        sourceStepId,
+      );
+    }
+  };
+
   const messages: Anthropic.Messages.MessageParam[] = [];
 
   const finish = async (
@@ -927,6 +1036,9 @@ export async function runReproducerAgent(
         batchedActions: counters.batchedActions,
         actionDeltaBytes: counters.actionDeltaBytes,
         readPageCalls: counters.readPage,
+        eligibleBatches: counters.eligibleBatches,
+        avoidableUnbatchedCalls: counters.avoidableUnbatchedCalls,
+        estimatedTurnsSaved: counters.estimatedTurnsSaved,
       },
     };
     transcript.push({ type: "final_result", status, reason, submissions, mode, failureCode });
@@ -943,6 +1055,7 @@ export async function runReproducerAgent(
       readPageCalls: counters.readPage,
       submittedPlans: counters.submissions,
       submittedPlanMode: acceptedPlanMode,
+      forcedSubmissionReason,
       uiFirstPolicy: {
         required: uiFirstRequired,
         satisfied: uiFirstSatisfied(),
@@ -1246,6 +1359,19 @@ export async function runReproducerAgent(
         counters.submissions === 0 &&
         (!uiFirstRequired || uiFirstSatisfied()) &&
         failureObservedLive(findings);
+      if (forcePlanSubmission) {
+        forcedSubmissionReason = liveFailureReason(findings);
+        transcript.push({
+          type: "submission_forced",
+          turn: counters.turns,
+          reason: forcedSubmissionReason,
+        });
+      }
+      const forceActionBatch =
+        !forcePlanSubmission &&
+        efficiency.reproducerRunSteps &&
+        counters.submissions === 0 &&
+        consecutiveStandaloneActions >= 2;
 
       const message = await createMessage({
         model: MODEL,
@@ -1254,7 +1380,9 @@ export async function runReproducerAgent(
         tools,
         tool_choice: forcePlanSubmission
           ? { type: "tool", name: "submit_plan", disable_parallel_tool_use: true }
-          : { type: "any", disable_parallel_tool_use: true },
+          : forceActionBatch
+            ? { type: "tool", name: "run_steps", disable_parallel_tool_use: true }
+            : { type: "any", disable_parallel_tool_use: true },
         messages: [...messages],
       });
 
@@ -1565,6 +1693,7 @@ export async function runReproducerAgent(
       let isError = false;
 
       if (toolUse.name === "read_page") {
+        consecutiveStandaloneActions = 0;
         counters.readPage += 1;
         if (counters.readPage > budgets.maxReadPageCalls) {
           resultText = "read_page budget exhausted — submit a plan or call submit_not_reproducible.";
@@ -1604,6 +1733,7 @@ export async function runReproducerAgent(
               null,
             );
             recordNewEvidenceFindings(live, "read_page", null);
+            await recordPriorAssertionIfMatched(live, "read_page", null, digest);
             await live
               .captureScreenshot(`${String(toolCallIndex + 1).padStart(3, "0")}-after-read_page`)
               .catch(() => null);
@@ -1641,7 +1771,10 @@ export async function runReproducerAgent(
             isError = true;
           } else {
             counters.runStepsCalls += 1;
+            counters.eligibleBatches += 1;
+            consecutiveStandaloneActions = 0;
             const evidenceBeforeBatch = counters.evidenceBytes;
+            const batchedActionsBefore = counters.batchedActions;
             const steps = rawSteps as Array<Record<string, unknown>>;
             const lines: string[] = [];
             let stoppedAt: number | null = null;
@@ -1665,6 +1798,10 @@ export async function runReproducerAgent(
                 break;
               }
             }
+            counters.estimatedTurnsSaved += Math.max(
+              0,
+              counters.batchedActions - batchedActionsBefore - 1,
+            );
 
             if (stoppedAt !== null && stoppedAt < steps.length) {
               for (let index = stoppedAt; index < steps.length; index += 1) {
@@ -1705,6 +1842,15 @@ export async function runReproducerAgent(
         );
         resultText = outcome.resultText;
         isError = outcome.isError;
+        if (!outcome.budgetExhausted) {
+          consecutiveStandaloneActions += 1;
+          if (consecutiveStandaloneActions === 2) {
+            counters.eligibleBatches += 1;
+          }
+          if (consecutiveStandaloneActions > 1) {
+            counters.avoidableUnbatchedCalls += 1;
+          }
+        }
       } else {
         resultText = `Unknown tool "${toolUse.name}".`;
         isError = true;
@@ -1955,11 +2101,14 @@ const buildReproducerSystemPrompt = (
 
 Rules:
 - Ground every target in read_page output — target only elements you have seen, using the most specific unique key (testId > role+name > label/placeholder > id > unique text). Never use CSS selectors. Ambiguous targets fail; use the returned diagnostics to pick a unique key.
+- For repeated controls, scope the target to a grounded container with "within", for example: {"role":"button","name":"✕","within":{"role":"listitem","text":"Set up CI pipeline"}}.
+- read_page reports current values for non-secret form controls. Use those values to verify that text remains attached to the correct row after an action; password values are intentionally hidden.
 ${context.runSteps ? `- Use run_steps to execute a sequence you are already confident about (login flow, form fill, navigating to a known route) in ONE call: it runs 2-6 goto/click/fill/wait/request actions sequentially, stops at the first failure, and returns per-step outcomes plus the accumulated evidence. Each step still consumes its normal action budget — run_steps saves turns, not actions. Use single actions when you genuinely need to observe the page between steps.\n` : ""}${context.actionDeltas ? `- Successful goto/click/fill results include a bounded PAGE DELTA (URL/title changes, elements that appeared or disappeared). Use it to decide your next action without a separate read_page; call read_page only when you need the full element list. Deltas do NOT satisfy the mandatory read_page look before submitting.\n` : ""}
 - The frozen plan replays against a FRESH app instance: it must not depend on state your exploration created. Include every setup step the plan needs (create the data it asserts about).
 - After async work (202 responses, queued jobs, background saves), insert an explicit "wait" step long enough for the work to finish — your interactive timing will not carry over to the replay.
 - The assertion must detect the reported failure using evidence you actually observed: copy exact strings from responses and errors you saw. Never invent error text.
-- A "console_error" or "element_text" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
+- A "console_error", "page_text", or "input_value" assertion requires at least one browser step; an API-only plan must assert "response_status" or "response_body" (checked against the LAST matching "request" step).
+- page_text checks body.innerText and NEVER includes the current value of an input, textarea, or select. For form state use input_value with a grounded target and failureWhen "equals" or "not_equals". For other visible text that fails to appear, use page_text with failureWhen "absent".
 - Use browser actions (goto/click/fill) for UI/user-facing bugs. Use request actions for API/backend bugs. If your reproduction is API-only, make that intentional and assert against response_status or response_body. Do not open a blank page just to create a screenshot - screenshots are only meaningful when the bug is visible on a page.
 - Unless the issue or past investigations clearly identify an API endpoint failure (an explicit method and path, an /api/... route, or an endpoint with a status code), you MUST look at the running app first: at least one successful goto and one read_page before submitting a plan or declaring the issue not reproducible. Submissions that skip this are rejected.
 - Aim for the shortest plan that deterministically shows the failure.

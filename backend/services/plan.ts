@@ -13,7 +13,7 @@ export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 // zero or multiple matches fail the step instead of guessing. The model-facing
 // prompt only teaches targets; raw selectors remain valid for saved-plan
 // replay compatibility.
-export type DomTargetIntent = {
+export type DomTargetScope = {
   role?: string;
   name?: string;
   label?: string;
@@ -23,6 +23,12 @@ export type DomTargetIntent = {
   testId?: string;
   // HTML id attribute value.
   id?: string;
+};
+
+export type DomTargetIntent = DomTargetScope & {
+  // Scope this target to a grounded ancestor/container, e.g. the delete
+  // button within the list item whose text names the task.
+  within?: DomTargetScope;
 };
 
 export type ReproductionStep =
@@ -57,6 +63,17 @@ export type PlanAssertion =
   | {
       type: "console_error";
       contains: string;
+    }
+  | {
+      type: "page_text";
+      contains: string;
+      failureWhen: "present" | "absent";
+    }
+  | {
+      type: "input_value";
+      target: DomTargetIntent;
+      value: string;
+      failureWhen: "equals" | "not_equals";
     }
   | {
       type: "element_text";
@@ -118,9 +135,14 @@ export function isSafeStepId(value: unknown): value is string {
 }
 
 // Steps that drive a real browser page. Assertions that read browser state
-// (console errors, element text) are vacuous without at least one of these.
+// (console errors, page/element text) are vacuous without at least one of these.
 const BROWSER_ACTIONS = new Set(["goto", "click", "fill", "waitForSelector"]);
-const BROWSER_ONLY_ASSERTIONS = new Set(["console_error", "element_text"]);
+const BROWSER_ONLY_ASSERTIONS = new Set([
+  "console_error",
+  "page_text",
+  "input_value",
+  "element_text",
+]);
 
 export function validateReproductionPlan(value: unknown): PlanValidationResult {
   const errors: string[] = [];
@@ -335,6 +357,31 @@ function validateAssertion(value: unknown): string[] {
         return ["console_error assertion must have a non-empty string contains."];
       }
       return [];
+    case "page_text":
+      if (
+        !hasOnlyKeys(assertion, ["type", "contains", "failureWhen"]) ||
+        typeof assertion.contains !== "string" ||
+        !assertion.contains ||
+        (assertion.failureWhen !== "present" && assertion.failureWhen !== "absent")
+      ) {
+        return [
+          'page_text assertion must have a non-empty string contains and failureWhen set to "present" or "absent".',
+        ];
+      }
+      return [];
+    case "input_value":
+      if (
+        !hasOnlyKeys(assertion, ["type", "target", "value", "failureWhen"]) ||
+        !isDomTargetIntent(assertion.target) ||
+        typeof assertion.value !== "string" ||
+        (assertion.failureWhen !== "equals" &&
+          assertion.failureWhen !== "not_equals")
+      ) {
+        return [
+          'input_value assertion must have a valid target, a string value, and failureWhen set to "equals" or "not_equals".',
+        ];
+      }
+      return [];
     case "element_text": {
       const bySelector =
         hasOnlyKeys(assertion, ["type", "selector", "contains"]) &&
@@ -415,6 +462,47 @@ export function getPlanMode(plan: ReproductionPlan): PlanMode {
   return "api-only";
 }
 
+// Reject browser targets invented by one-shot planning. This intentionally
+// uses a cheap conservative text check over the single live accessibility
+// digest: every locator value must have appeared in the actual page.
+export function validatePlanTargetsAgainstDigest(
+  plan: ReproductionPlan,
+  pageDigest: string,
+): string[] {
+  const normalizedDigest = pageDigest.toLocaleLowerCase();
+  const errors: string[] = [];
+
+  const checkTarget = (
+    target: DomTargetIntent | DomTargetScope,
+    location: string,
+  ) => {
+    for (const [key, rawValue] of Object.entries(target)) {
+      if (key === "within") {
+        checkTarget(rawValue as DomTargetScope, `${location}.within`);
+        continue;
+      }
+
+      const value = String(rawValue).trim().toLocaleLowerCase();
+
+      if (value && !normalizedDigest.includes(value)) {
+        errors.push(`${location}.${key} "${String(rawValue)}" was not present in the live page digest.`);
+      }
+    }
+  };
+
+  for (const [index, step] of plan.steps.entries()) {
+    if ("target" in step) {
+      checkTarget(step.target, `steps[${index}].target`);
+    }
+  }
+
+  if (plan.assertion.type === "input_value") {
+    checkTarget(plan.assertion.target, "assertion.target");
+  }
+
+  return errors;
+}
+
 const TARGET_KEYS = [
   "role",
   "name",
@@ -423,20 +511,30 @@ const TARGET_KEYS = [
   "text",
   "testId",
   "id",
+  "within",
 ] as const;
 
 export function isDomTargetIntent(value: unknown): value is DomTargetIntent {
+  return isTargetObject(value, true);
+}
+
+function isTargetObject(value: unknown, allowWithin: boolean): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return false;
   }
 
   const target = value as Record<string, unknown>;
   const keys = Object.keys(target);
+  const selectorKeys = keys.filter((key) => key !== "within");
 
   return (
-    keys.length > 0 &&
+    selectorKeys.length > 0 &&
     keys.every((key) => (TARGET_KEYS as readonly string[]).includes(key)) &&
-    keys.every((key) => typeof target[key] === "string" && target[key] !== "")
+    selectorKeys.every(
+      (key) => typeof target[key] === "string" && target[key] !== "",
+    ) &&
+    (target.within === undefined ||
+      (allowWithin && isTargetObject(target.within, false)))
   );
 }
 

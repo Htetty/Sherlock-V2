@@ -12,6 +12,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  MODEL,
   analyzeIssue,
   generateMemoryReflection,
   generateRegressionTestProposal,
@@ -22,6 +23,7 @@ import {
   summarizeInferenceRecords,
   type InferenceBudgetGuard,
   type InferenceTelemetry,
+  type AgentPhase,
 } from "./inference.js";
 import { resolveEfficiencyPolicy } from "./efficiency-policy.js";
 import {
@@ -49,6 +51,7 @@ import { buildGraphContext, tokenize } from "./graphContext.js";
 import {
   appendMemory,
   boundFixDiff,
+  findReplayCandidate,
   findStaleFile,
   hashRepoFilesAtCommit,
   loadMemory,
@@ -88,10 +91,12 @@ import {
 } from "./sandbox.js";
 import {
   executeReproductionPlan,
+  openLiveSession,
   type ReproductionResult,
 } from "./playwright.js";
 import {
   getPlanMode,
+  validatePlanTargetsAgainstDigest,
   validateReproductionPlan,
   type ReproductionPlan,
 } from "./plan.js";
@@ -109,7 +114,7 @@ import {
 } from "./report.js";
 import {
   buildInvestigationReportData,
-  renderIssueReport,
+  renderIssueStatusComment,
   type InvestigationReportData,
   type ReportPullRequest,
 } from "./issue-report-renderer.js";
@@ -183,7 +188,6 @@ export type InvestigationPipelineResult = {
 // defaults, so leaving `policy` unset preserves current behavior exactly.
 export type InvestigationPolicy = {
   budgetProfile?: "standard" | "deep";
-  escalateNotReproduced?: boolean;
   // Test/debug routing: skip memory replay and one-shot planning so the
   // bounded reproducer agent handles the issue from its first observation.
   forceReproducerAgent?: boolean;
@@ -233,12 +237,11 @@ export type ReproducerFallbackCase =
 
 export function shouldRunReproducerFallback(
   fallbackCase: ReproducerFallbackCase,
-  escalateNotReproduced: boolean,
 ): boolean {
   return (
     fallbackCase === "plan_failed" ||
     fallbackCase === "execution_failed" ||
-    (fallbackCase === "not_reproduced" && escalateNotReproduced)
+    fallbackCase === "not_reproduced"
   );
 }
 
@@ -339,10 +342,46 @@ export async function runInvestigationPipeline(
     // recorder per investigation, appending inference-records.jsonl next to
     // the other artifacts. Recorder failures are counted internally and never
     // fail the investigation.
+    // Model routing is opt-in and phase-specific. Capable defaults remain
+    // unchanged unless the task policy or an explicit environment variable
+    // names a model for the cheap, bounded generation phases.
+    const configuredPolicies = options.policy?.inference ?? {};
+    const phasePolicies: InferenceTelemetry["policies"] = {
+      ...configuredPolicies,
+      plan: {
+        ...(configuredPolicies.plan ?? {}),
+        ...(configuredPolicies.plan?.model
+          ? {}
+          : process.env.SHERLOCK_PLAN_MODEL
+            ? { model: process.env.SHERLOCK_PLAN_MODEL }
+            : {}),
+      },
+      regression_test: {
+        ...(configuredPolicies.regression_test ?? {}),
+        ...(configuredPolicies.regression_test?.model
+          ? {}
+          : process.env.SHERLOCK_REGRESSION_MODEL
+            ? { model: process.env.SHERLOCK_REGRESSION_MODEL }
+            : {}),
+      },
+    };
+    const resolvedPhaseModels = Object.fromEntries(
+      (
+        [
+          "plan",
+          "reproduce",
+          "fix",
+          "regression_test",
+          "analysis",
+          "memory_reflection",
+        ] satisfies AgentPhase[]
+      ).map((phase) => [phase, phasePolicies?.[phase]?.model ?? MODEL]),
+    ) as Partial<Record<AgentPhase, string>>;
+
     const inferenceTelemetry: InferenceTelemetry = {
       investigationId,
       recorder: createInferenceRecorder(store.dir),
-      ...(options.policy?.inference ? { policies: options.policy.inference } : {}),
+      policies: phasePolicies,
       ...(options.policy?.inferenceBudgetGuard
         ? { budgetGuard: options.policy.inferenceBudgetGuard }
         : {}),
@@ -363,7 +402,10 @@ export async function runInvestigationPipeline(
     // Cost-shape summary (artifacts/<inv_id>/cost-shape.json): populated
     // incrementally so a crash still leaves a partial record.
     const costShape = createCostShapeTracker(store, budgetProfile);
-    await costShape.update({ resolvedEfficiencyPolicy: efficiency });
+    await costShape.update({
+      resolvedEfficiencyPolicy: efficiency,
+      resolvedPhaseModels,
+    });
 
     deriveUsageTotals = async () => {
       const totals = await summarizeInferenceRecords(store!.dir);
@@ -537,9 +579,6 @@ export async function runInvestigationPipeline(
     //   3. reproducer agent (docs/fable/11) as FALLBACK
     // Only executeReproductionPlan() can mark reproduced — memory is never
     // trusted without replay.
-    const escalateNotReproduced =
-      options.policy?.escalateNotReproduced ??
-      process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
     const forceReproducerAgent = shouldForceReproducerAgent(
       options.policy?.forceReproducerAgent,
     );
@@ -617,6 +656,7 @@ export async function runInvestigationPipeline(
         );
 
         await appendMemory(payload.repoUrl, {
+          issueNumber: payload.issueNumber,
           issueTitle: payload.issueTitle,
           issueTerms: issueTerms.slice(0, 8),
           commitSha: repoContext!.commit,
@@ -699,6 +739,11 @@ export async function runInvestigationPipeline(
           reproducerBatchedActions: reproResult.efficiencyCounters.batchedActions,
           reproducerActionDeltaBytes: reproResult.efficiencyCounters.actionDeltaBytes,
           reproducerReadPageCalls: reproResult.efficiencyCounters.readPageCalls,
+          reproducerEligibleBatches: reproResult.efficiencyCounters.eligibleBatches,
+          reproducerAvoidableUnbatchedCalls:
+            reproResult.efficiencyCounters.avoidableUnbatchedCalls,
+          reproducerEstimatedTurnsSaved:
+            reproResult.efficiencyCounters.estimatedTurnsSaved,
         });
 
         log(`Reproducer agent finished: ${reproResult.status} — ${reproResult.reason}`);
@@ -765,7 +810,21 @@ export async function runInvestigationPipeline(
     // A stored plan from a past verified/reproduced investigation is replayed
     // from scratch. A stale-but-attempted replay is safe (it just fails and
     // falls through); the hash check only skips obviously wasteful attempts.
-    const replayCandidate = pastEntries.find((entry) => entry.reproductionPlan);
+    const replayCandidate = findReplayCandidate(
+      pastEntries,
+      payload.issueNumber,
+      payload.issueTitle,
+    );
+
+    if (
+      !forceReproducerAgent &&
+      !replayCandidate &&
+      pastEntries.some((entry) => entry.reproductionPlan)
+    ) {
+      log(
+        "Memory plans matched repository context but belonged to different issues; using them as planning context instead of direct replay.",
+      );
+    }
 
     if (!forceReproducerAgent && replayCandidate?.reproductionPlan) {
       log("Memory replay candidate found.");
@@ -835,6 +894,24 @@ export async function runInvestigationPipeline(
     if (!result && !forceReproducerAgent) {
       await costShape.update({ oneShotPlanTried: true });
 
+      let oneShotPageDigest: string | null = null;
+      try {
+        const groundingSession = await openLiveSession(sandboxSession.result.baseUrl);
+        try {
+          oneShotPageDigest = truncateUtf8Bytes(
+            await groundingSession.readPageDigest(),
+            12 * 1024,
+          );
+          await store.writeJson("one-shot-page-digest.json", {
+            digest: oneShotPageDigest,
+          });
+        } finally {
+          await groundingSession.close();
+        }
+      } catch (error) {
+        log(`One-shot DOM grounding unavailable: ${formatError(error)}`);
+      }
+
       const generated = await generateReproductionPlan(
         {
           issueTitle: payload.issueTitle,
@@ -848,6 +925,7 @@ export async function runInvestigationPipeline(
           sandboxResult: sandboxSession.result,
           graphContext,
           pastInvestigations,
+          pageDigest: oneShotPageDigest,
         },
         inferenceTelemetry,
       );
@@ -885,11 +963,27 @@ export async function runInvestigationPipeline(
           planErrors = validation.errors;
         } else {
           oneShotPlan = validation.plan;
+
+          if (oneShotPageDigest && getPlanMode(oneShotPlan) !== "api-only") {
+            const groundingErrors = validatePlanTargetsAgainstDigest(
+              oneShotPlan,
+              oneShotPageDigest,
+            );
+
+            if (groundingErrors.length > 0) {
+              log("Plan rejected because it invented browser targets:");
+              for (const groundingError of groundingErrors) {
+                log(`  - ${groundingError}`);
+              }
+              planErrors = groundingErrors;
+              oneShotPlan = null;
+            }
+          }
         }
       }
 
       if (planErrors !== null) {
-        if (shouldRunReproducerFallback("plan_failed", escalateNotReproduced)) {
+        if (shouldRunReproducerFallback("plan_failed")) {
           log("One-shot reproduction plan failed; falling back to reproducer agent.");
           const terminal = await runReproducerAgentFallback();
 
@@ -915,12 +1009,20 @@ export async function runInvestigationPipeline(
           reproductionPath = "one_shot";
           await costShape.update({ oneShotPlanSucceeded: true });
         } else if (
-          shouldRunReproducerFallback(oneShotResult.outcome, escalateNotReproduced)
+          shouldRunReproducerFallback(
+            oneShotResult.outcome,
+          )
         ) {
           if (oneShotResult.outcome === "not_reproduced") {
-            log(
-              "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
-            );
+            if (oneShotResult.assertion?.matchedExpected === true) {
+              log(
+                "One-shot reproduction not_reproduced; falling back to reproducer agent.",
+              );
+            } else {
+              log(
+                "One-shot reproduction assertion matched neither failure nor expected behavior; falling back to reproducer agent.",
+              );
+            }
           } else {
             log(
               "One-shot reproduction execution failed; falling back to reproducer agent.",
@@ -1316,6 +1418,25 @@ export async function runInvestigationPipeline(
       log("Fix verified; skipping analyzeIssue (fix attempt carries root cause and verification detail).");
     }
 
+    // Build comparison media before freezing the PR payload so the detailed
+    // pull-request description can include it. This remains non-fatal.
+    let replayEvidence: ReplayEvidenceUrls | null = null;
+    try {
+      replayEvidence = await prepareReplayEvidence({
+        store,
+        failingVideo: result.video ?? null,
+        fixAttemptDir:
+          fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
+        passingVideo:
+          fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
+        repositoryOwner: payload.repoOwner,
+        repositoryName: payload.repoName,
+        log,
+      });
+    } catch (error) {
+      log(`Replay evidence preparation failed (non-fatal): ${formatError(error)}`);
+    }
+
     // Verified fix -> capture a durable, credential-free delivery plan while
     // the verified workspace still exists. Branch push and PR creation happen
     // only after the pipeline returns, in the separately retried delivery
@@ -1343,6 +1464,7 @@ export async function runInvestigationPipeline(
           issueNumber: payload.issueNumber,
           issueTitle: payload.issueTitle,
           plan,
+          replayEvidence,
           github: null,
           pushUrl: null,
           abortSignal: options.signal,
@@ -1519,6 +1641,7 @@ export async function runInvestigationPipeline(
       }
 
       await appendMemory(payload.repoUrl, {
+        issueNumber: payload.issueNumber,
         issueTitle: payload.issueTitle,
         issueTerms: memoryFields.issueTerms,
         commitSha: repoContext.commit,
@@ -1580,28 +1703,6 @@ export async function runInvestigationPipeline(
       ...summary,
       ...(reproductionMode ? { reproductionMode } : {}),
     };
-
-    // Replay evidence (docs/FABLE_REPLAY_EVIDENCE_PROMPT.md): build and host
-    // the comparison media from the recordings the runs already produced.
-    // Everything inside is flag-gated and degrades to null; it must never
-    // change the investigation outcome or block delivery.
-    let replayEvidence: ReplayEvidenceUrls | null = null;
-
-    try {
-      replayEvidence = await prepareReplayEvidence({
-        store,
-        failingVideo: result.video ?? null,
-        fixAttemptDir:
-          fixAttempt?.outcome === "verified" ? fixAttempt.attemptDir : null,
-        passingVideo:
-          fixAttempt?.outcome === "verified" ? fixAttempt.postPatchVideo : null,
-        repositoryOwner: payload.repoOwner,
-        repositoryName: payload.repoName,
-        log,
-      });
-    } catch (error) {
-      log(`Replay evidence preparation failed (non-fatal): ${formatError(error)}`);
-    }
 
     // Structured report data replaces the old preformatted comment sections.
     // GitHub delivery rerenders it against the final pull-request state; the
@@ -1666,7 +1767,7 @@ export async function runInvestigationPipeline(
       investigationId,
       outcome: "execution_failed",
       summary,
-      githubComment: renderIssueReport(
+      githubComment: renderIssueStatusComment(
         buildInvestigationReportData({ summary }),
         null,
       ),
@@ -1873,7 +1974,7 @@ async function finishInvestigation(
   report: InvestigationReportData | null = null,
 ): Promise<InvestigationPipelineResult> {
   const reportData = report ?? buildInvestigationReportData({ summary });
-  const githubComment = renderIssueReport(
+  const githubComment = renderIssueStatusComment(
     reportData,
     pipelineReportPullRequest(summary),
   );
@@ -1950,5 +2051,6 @@ export function buildPriorReproductionAttempt(
     executedSteps,
     failedStep,
     evidenceSummary,
+    assertion: plan.assertion,
   };
 }

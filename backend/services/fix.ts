@@ -27,7 +27,10 @@ import {
 import { parseGitStatusPorcelainZ } from "./git-status.js";
 import { analyzePatchRisk, patchRiskEnabled } from "./patch-risk.js";
 import { hashPlanBehavior, type ReproductionPlan } from "./plan.js";
-import { executeReproductionPlan } from "./playwright.js";
+import {
+  executeReproductionPlan,
+  type ReproductionResult,
+} from "./playwright.js";
 import {
   summarizeReproductionEvidence,
   type ReproductionEvidenceSummary,
@@ -42,7 +45,9 @@ import {
 import {
   classifyPostPatchRun,
   classifyPrePatchRun,
+  compileDeterministicApiRegressionTest,
   extractRegressionFailureMarker,
+  getNodeRegressionUnsupportedReason,
   type AppNetworkTarget,
   hashTestContents,
   materializeTest,
@@ -104,6 +109,9 @@ export type FixAttemptInput = {
   sourceCommit: string;
   plan: ReproductionPlan;
   originalOutcome: string;
+  // Accepted original replay. When present, API assertions can be compiled
+  // into deterministic regression tests without an inference call.
+  reproductionResult?: ReproductionResult;
   proposal: unknown;
   restart: () => Promise<RestartResult>;
   probeTimeoutMs?: number;
@@ -291,12 +299,127 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     "utf8",
   );
 
+  // --- Cheap authoritative patch preflight ---------------------------------
+  // Do not spend inference generating a regression test for a patch that
+  // cannot pass the exact saved reproduction. Successful proposals are
+  // replayed once more during final verification after fail-before proof.
+  await applyProposal(proposal, input.repoPath);
+  const preflightChangedFiles = (await runGit(input.repoPath, ["diff", "--name-only"]))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const preflightApprovedPaths = new Set(
+    proposal.files.map((file) => path.normalize(file.path)),
+  );
+  const preflightUnexpectedFiles = preflightChangedFiles.filter(
+    (file) => !preflightApprovedPaths.has(path.normalize(file)),
+  );
+
+  if (
+    preflightUnexpectedFiles.length > 0 ||
+    preflightChangedFiles.length === 0
+  ) {
+    await runGit(input.repoPath, ["checkout", "--", "."]);
+    check(
+      "patch_preflight",
+      false,
+      preflightUnexpectedFiles.length > 0
+        ? `Unexpected files modified: ${preflightUnexpectedFiles.join(", ")}`
+        : "The patch produced no changes.",
+    );
+    return finish(
+      "rejected_patch_invalid",
+      preflightUnexpectedFiles.length > 0
+        ? `The patch modified files outside the approved scope: ${preflightUnexpectedFiles.join(", ")}`
+        : "The patch produced no changes.",
+    );
+  }
+
+  const preflightRestart = await input.restart();
+  if (!preflightRestart.ok) {
+    await store.writeJson("build-result.json", {
+      ok: false,
+      baseUrl: preflightRestart.baseUrl ?? null,
+      log: preflightRestart.log ?? "",
+      stage: "patch_preflight",
+    });
+    check("patch_preflight", false, "Application restart failed during patch preflight.");
+    return finish(
+      "rejected_build_failed",
+      "The application failed to rebuild or restart during patch preflight.",
+    );
+  }
+
+  const preflightStore = await createArtifactStore(
+    input.investigationId,
+    path.join(store.dir, "patch-preflight"),
+  );
+  const preflightPlan: ReproductionPlan = {
+    ...input.plan,
+    baseUrl: preflightRestart.baseUrl ?? input.plan.baseUrl,
+  };
+  const preflightResult = await executeReproductionPlan(
+    preflightPlan,
+    preflightStore,
+    { probeTimeoutMs: input.probeTimeoutMs, videoName: "patch-preflight.webm" },
+  );
+  await preflightStore.writeJson("reproduction-result.json", {
+    investigationId: input.investigationId,
+    fixAttemptId,
+    planBehaviorHash: hashPlanBehavior(input.plan),
+    ...preflightResult,
+  });
+  result.postPatchOutcome = preflightResult.outcome;
+  result.postPatchEvidence = summarizeReproductionEvidence(preflightResult);
+  result.postPatchVideo = preflightResult.video ?? null;
+
+  const preflightHealthy =
+    preflightResult.outcome === "not_reproduced" &&
+    preflightResult.assertion?.matchedExpected === true &&
+    preflightResult.steps.every((step) => step.outcome === "passed") &&
+    preflightResult.pageErrors.length === 0;
+
+  if (!preflightHealthy) {
+    check("patch_preflight", false, preflightResult.outcomeReason);
+    const outcome =
+      preflightResult.outcome === "reproduced"
+        ? "rejected_reproduction_still_fails"
+        : preflightResult.outcome === "environment_failed"
+          ? "rejected_environment_failed"
+          : "rejected_verification_inconclusive";
+    return finish(
+      outcome,
+      preflightResult.outcome === "reproduced"
+        ? `The original failure still occurs after the patch: ${preflightResult.outcomeReason}`
+        : `Patch preflight did not clearly show expected behavior: ${preflightResult.outcomeReason}`,
+    );
+  }
+  check(
+    "patch_preflight",
+    true,
+    `Expected behavior observed before regression generation: ${preflightResult.assertion?.detail}`,
+  );
+
+  // Restore and restart the pristine source so fail-before proof uses the
+  // CURRENT original app container, never a stale container captured before
+  // a prior restart.
+  await runGit(input.repoPath, ["checkout", "--", "."]);
+  await runGit(input.repoPath, ["clean", "-fd"]);
+  const originalRestart = await input.restart();
+  if (!originalRestart.ok) {
+    return finish(
+      "rejected_environment_failed",
+      "The original application could not be restarted for regression fail-before proof.",
+    );
+  }
+
   // --- Regression test: generation + pre-patch proof ------------------------
   // Runs BEFORE the patch is applied: the generated test must fail on the
   // original source for the intended behavioral assertion. Bounded to two
   // generation attempts (initial + one refinement) — never a model loop.
   const regressionSummary: RegressionTestSummary = {
     status: "unavailable",
+    generationMode: "unavailable",
     testName: null,
     relativePath: null,
     runner: null,
@@ -319,14 +442,32 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
     });
 
   let provenRegressionTest: RegressionTestProposal | null = null;
+  const unsupportedRegressionReason = getNodeRegressionUnsupportedReason(input.plan);
+  const deterministicRegression = compileDeterministicApiRegressionTest(
+    input.plan,
+    input.reproductionResult ?? null,
+  );
+  const regressionGenerator = deterministicRegression
+    ? async () => deterministicRegression
+    : input.generateRegressionTest;
+  const maxRegressionAttempts = deterministicRegression ? 1 : 2;
 
-  if (!input.generateRegressionTest) {
+  if (unsupportedRegressionReason) {
+    regressionSummary.reason = unsupportedRegressionReason;
+  } else if (!regressionGenerator) {
     regressionSummary.reason =
       "No regression-test generator is available for this investigation.";
   } else {
+    regressionSummary.generationMode = deterministicRegression
+      ? "deterministic"
+      : "model";
     let feedback: string | null = null;
 
-    for (let attempt = 1; attempt <= 2 && provenRegressionTest === null; attempt += 1) {
+    for (
+      let attempt = 1;
+      attempt <= maxRegressionAttempts && provenRegressionTest === null;
+      attempt += 1
+    ) {
       regressionSummary.generationAttempts = attempt;
       const regressionAttemptDir = path.join(
         store.dir,
@@ -338,7 +479,7 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
       let raw: unknown;
 
       try {
-        raw = await input.generateRegressionTest(feedback);
+        raw = await regressionGenerator(feedback);
       } catch (error) {
         regressionSummary.reason = `Regression-test generation failed: ${formatError(error)}`;
         await writeFile(
@@ -425,8 +566,8 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         preRun = await runRegressionTest(input.docker ?? realDockerAdapter, {
           repoPath: preRuntime.path,
           relativePath: testProposal.relativePath,
-          targetUrl: input.plan.baseUrl,
-          appNetwork: input.appNetwork ?? null,
+          targetUrl: originalRestart.baseUrl ?? input.plan.baseUrl,
+          appNetwork: originalRestart.appNetwork ?? null,
           timeoutMs: input.regressionTimeoutMs,
         });
       } finally {
@@ -477,6 +618,25 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
           "rejected_regression_test_failed",
           `The generated regression test "${testProposal.testName}" unexpectedly passed on the original source; it cannot prove the fix.`,
         );
+      }
+
+      if (classification === "infrastructure_failed") {
+        regressionSummary.reason =
+          "Regression execution failed in Docker/network infrastructure; model refinement was skipped.";
+        await writeFile(
+          path.join(regressionAttemptDir, "result.json"),
+          JSON.stringify(
+            {
+              classification,
+              reason: regressionSummary.reason,
+              diagnostic: boundOutput(preRun.stderr || preRun.stdout),
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+        break;
       }
 
       // invalid_test / timed_out / execution_failed: not regression proof.
@@ -724,7 +884,13 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 
     const failures = validation.results
       .filter((item) => item.status === "failed" || item.status === "timed_out")
-      .map((item) => `${item.argv?.join(" ")} (${item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`})`)
+      .map((item) => {
+        const command = `${item.argv?.join(" ")} (${
+          item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`
+        })`;
+        const diagnostic = summarizeValidationFailure(item.stderr || item.stdout);
+        return diagnostic ? `${command}: ${diagnostic}` : command;
+      })
       .join(", ");
 
     return finish(
@@ -861,6 +1027,23 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         ? "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay and the proven generated regression test."
         : "The patch was applied, the application restarted, the exact saved reproduction no longer fails, all available repository validation commands passed, and the generated regression test passed.",
   );
+}
+
+function summarizeValidationFailure(output: string): string | null {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const diagnostic =
+    lines.find((line) =>
+      /^(?:error|typeerror|referenceerror|syntaxerror)\b|cannot\b|failed\b|should not\b/i.test(
+        line,
+      ),
+    ) ??
+    lines.at(-1) ??
+    null;
+
+  return diagnostic ? diagnostic.slice(0, 400) : null;
 }
 
 function formatError(error: unknown): string {

@@ -200,7 +200,13 @@ function stubSessionFactory(
     const evidence = emptyEvidence();
 
     return {
-      page: {} as LiveSession["page"],
+      page: {
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        locator: () => ({
+          innerText: async () => "RecipeBox\nSearch recipes",
+        }),
+      } as unknown as LiveSession["page"],
       baseUrl,
       evidence,
       executeStep: async (step) => {
@@ -549,6 +555,106 @@ describe("reproducer agent loop", () => {
       name: "submit_plan",
     });
     expect(result.turns).toBe(2);
+  });
+
+  test("a settled validated HTTP-200 semantic failure forces plan submission", async () => {
+    const { input } = await makeInput({
+      issueTitle: "Recipe search is empty",
+      issueBody: "Open RecipeBox, fill Search recipes with pasta, and no matching recipe appears.",
+    });
+    input.priorAttempt = {
+      source: "one_shot",
+      planSteps: [],
+      executedSteps: [],
+      failedStep: null,
+      evidenceSummary: "The plan ran but invented a Search button.",
+      assertion: {
+        type: "page_text",
+        contains: "Pasta Primavera",
+        failureWhen: "absent",
+      },
+    };
+    const sessions = stubSessionFactory([
+      stepRecord("goto", "passed"),
+      stepRecord("fill", "passed"),
+    ]);
+    const model = scriptedModel([
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("fill", {
+        target: { placeholder: "Search recipes" },
+        value: "pasta",
+      }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("submit_plan", {
+        steps: [
+          { id: "open", action: "goto", path: "/" },
+          {
+            id: "search",
+            action: "fill",
+            target: { placeholder: "Search recipes" },
+            value: "pasta",
+          },
+        ],
+        expectedBehavior: "Pasta Primavera appears.",
+        failureCondition: "Pasta Primavera is absent.",
+        assertion: {
+          type: "page_text",
+          contains: "Pasta Primavera",
+          failureWhen: "absent",
+        },
+      }),
+    ]);
+
+    const result = await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () =>
+        replayResult("reproduced", "Validated absence reproduced."),
+    });
+
+    expect(result.status).toBe("reproduced");
+    expect(result.turns).toBe(5);
+    expect(model.calls[4].tool_choice).toMatchObject({
+      type: "tool",
+      name: "submit_plan",
+    });
+    expect(result.findings.some((finding) => finding.kind === "semantic_failure")).toBe(true);
+  });
+
+  test("an absence during the initial loading interaction does not force submission", async () => {
+    const { input } = await makeInput({
+      issueTitle: "Recipe search is empty",
+      issueBody: "Open RecipeBox and search for pasta.",
+    });
+    input.priorAttempt = {
+      source: "one_shot",
+      planSteps: [],
+      executedSteps: [],
+      failedStep: null,
+      evidenceSummary: "Prior assertion",
+      assertion: {
+        type: "page_text",
+        contains: "Pasta Primavera",
+        failureWhen: "absent",
+      },
+    };
+    const sessions = stubSessionFactory([stepRecord("goto", "passed")]);
+    const model = scriptedModel([
+      toolUseMessage("goto", { path: "/" }),
+      toolUseMessage("read_page", {}),
+      toolUseMessage("submit_not_reproducible", { reason: "still loading" }),
+    ]);
+
+    await runReproducerAgent(input, {
+      createMessage: model.createMessage,
+      openLiveSession: sessions.openLiveSession,
+      executeReproductionPlan: async () => {
+        throw new Error("must not replay");
+      },
+    });
+
+    expect(model.calls[2].tool_choice).toMatchObject({ type: "any" });
   });
 
   test("detectApiIssueSignal recognizes clear API failures and rejects vague text", () => {

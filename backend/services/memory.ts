@@ -36,6 +36,9 @@ export type MemoryOutcome =
   | "analysis_complete";
 
 export type MemoryEntry = {
+  // Repository-scoped GitHub issue identity. Older entries omit this and are
+  // still useful as context, but are never trusted for direct replay.
+  issueNumber?: number;
   issueTitle: string;
   issueTerms: string[];
   commitSha: string;
@@ -247,6 +250,25 @@ export function matchMemory(
   }
 
   return selected.map(({ entry }) => entry);
+}
+
+// A successful plan from another issue is useful planning context, but it is
+// not proof of the current issue. Direct replay is reserved for reruns of the
+// same repository issue number and normalized title so an unrelated,
+// still-present defect cannot satisfy the current investigation by accident.
+export function findReplayCandidate(
+  entries: MemoryEntry[],
+  issueNumber: number,
+  issueTitle: string,
+): MemoryEntry | null {
+  const normalizedTitle = normalizeIssueTitle(issueTitle);
+
+  return entries.find(
+    (entry) =>
+      entry.reproductionPlan !== undefined &&
+      entry.issueNumber === issueNumber &&
+      normalizeIssueTitle(entry.issueTitle) === normalizedTitle,
+  ) ?? null;
 }
 
 export function memoryRole(entry: MemoryEntry): "worked" | "failed" | "context" {

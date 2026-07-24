@@ -73,7 +73,7 @@ import {
 } from "./report.js";
 import {
   normalizeInvestigationReportData,
-  renderIssueReport,
+  renderIssueStatusComment,
   type InvestigationReportData,
   type ReportPullRequest,
 } from "./issue-report-renderer.js";
@@ -2144,7 +2144,7 @@ export function buildTerminalComment(
 ): string {
   if (payload.version === 2) {
     return [
-      renderIssueReport(payload.report, reportPullRequestFromDeliveryState(state)),
+      renderIssueStatusComment(payload.report, reportPullRequestFromDeliveryState(state)),
       terminalCommentMarker(state.investigationId),
       deliveryCommentMarker(state.investigationId),
     ].join("\n\n");

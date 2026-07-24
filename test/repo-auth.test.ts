@@ -499,7 +499,8 @@ describe("transient repository errors and worker retries", () => {
     });
 
     expect(result.outcome).toBe("environment_failed");
-    expect(result.githubComment).toContain(COMBINED_ACCESS_MESSAGE);
+    expect(result.githubComment).toContain("**Environment unavailable**");
+    expect(result.githubComment).not.toContain(COMBINED_ACCESS_MESSAGE);
     expect(isTransientInfrastructureError(denied)).toBe(false);
   });
 

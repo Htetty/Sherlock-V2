@@ -75,13 +75,15 @@ export type GeneratedPlan = {
 export type PlanGenerationInput = RepoEvidenceInput & {
   graphContext?: GraphContext | null;
   pastInvestigations?: string;
+  // A single bounded live DOM digest captured before one-shot planning.
+  // Browser targets must be copied from this evidence, not inferred from code.
+  pageDigest?: string | null;
 };
 
-export async function generateReproductionPlan(
+export function buildReproductionPlanPrompt(
   input: PlanGenerationInput,
-  telemetry: InferenceTelemetry | null = null,
-): Promise<GeneratedPlan> {
-  const prompt = `
+): string {
+  return `
 You are creating a deterministic browser reproduction plan for a GitHub issue.
 
 Return ONLY valid JSON. Do not include markdown, explanations, comments, or code fences.
@@ -109,6 +111,9 @@ Do not put method or body on "goto".
 Targets describe USER INTENT, never CSS selectors. A target is an object with
 one or more of: role, name, label, placeholder, text, testId, id. Values must
 be strings that appear in the provided source code or page evidence.
+For repeated controls, a target may include a one-level "within" object using
+the same keys to identify a unique ancestor/container. Example:
+{ "role": "button", "name": "✕", "within": { "role": "listitem", "text": "Set up CI pipeline" } }
 Every target must resolve to exactly ONE element; execution runs in strict
 mode and multiple matches fail the step. Never target generic words that
 appear in buttons, filters, or headings (e.g. "Completed", "Active", "All").
@@ -125,20 +130,34 @@ Use { "id": "...", "action": "wait", "ms": 2000 } (max 10000) after triggering a
 IMPORTANT: if an endpoint runs work asynchronously (returns 202, "queued", a job id, or schedules a background job), insert a "wait" step long enough for the job to finish BEFORE the step that checks the resulting state; otherwise the check races the job and the bug cannot be observed.
 Use this exact baseUrl: ${input.sandboxResult.baseUrl}
 
+Browser-first reproduction policy:
+- When the issue gives user-facing steps such as opening a page, filling an input, clicking a control, refreshing, or observing rendered UI, and those controls are grounded in the supplied evidence, you MUST reproduce through those browser controls first.
+- Preserve the interaction surface reported by the user. Do not replace an explicit browser flow with a direct API request merely because the API produces an easier assertion.
+- A response_status assertion may observe a request triggered by a browser click; response_body can likewise inspect browser-triggered traffic. Browser steps and network assertions can be combined without adding a direct "request" step.
+- Direct API requests are a fallback only when the issue is explicitly API-only, the behavior is not reachable through visible page controls, or the supplied evidence cannot ground the reported browser flow.
+
 The "assertion" describes how to detect the reported failure. It must be exactly one of:
 { "type": "response_status", "pathPattern": "/api/path", "method": "POST", "expected": 401, "failureValue": 500 }
   (pathPattern and method are optional filters; expected is the correct status; failureValue is the buggy status)
 { "type": "response_body", "pathPattern": "/api/path", "method": "GET", "failureContains": "text present only when the bug occurs", "expectedContains": "text present only when behavior is correct" }
   (checks the body of the LAST matching "request" step response; pathPattern, method, and expectedContains are optional)
 { "type": "console_error", "contains": "substring of the expected error message" }
-{ "type": "element_text", "target": { "text": "unique text of the element" }, "contains": "text shown when the bug occurs" }
+{ "type": "page_text", "contains": "exact visible text", "failureWhen": "present" }
+  (failureWhen is "present" when seeing the text proves the bug, or "absent" when missing text proves the bug)
+{ "type": "input_value", "target": { "label": "Notes for Fix login redirect" }, "value": "Remember to update auth section", "failureWhen": "equals" }
+  (failureWhen is "equals" when that exact form value proves the bug, or "not_equals" when any other value proves the bug)
 
 Assertion rules:
-- "console_error" and "element_text" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
-- "element_text" targets must resolve to exactly one element; target the specific content in question (e.g. the exact task title), never a shared word.
+- "console_error", "page_text", and "input_value" observe the browser page, so they are only valid when the plan contains at least one browser step (goto, click, fill, waitForSelector). A plan made only of "request" steps MUST use "response_status" or "response_body".
+- page_text checks body.innerText and NEVER includes the current value of an input, textarea, or select. Use input_value for form-control state.
+- Use page_text with failureWhen "absent" when the reported bug is that expected content never appears. The contains text must be the exact visible content whose presence or absence distinguishes correct and buggy behavior.
 - Server-side errors (background jobs, API handlers) never appear in the browser console; detect them through the API state they corrupt, using "response_body" on a final "request" step that reads the state back.
 - The failure text must be something the buggy code actually produces (copy it from the provided source), never an invented message.
 ${formatGraphSection(input.graphContext)}${formatPastSection(input.pastInvestigations)}
+${input.pageDigest ? `LIVE PAGE DIGEST (authoritative for browser targets):
+${input.pageDigest}
+
+` : ""}
 Grounding rules:
 - Only reference files, routes, components, and UI strings that appear in the
   evidence below. If it is not in the evidence, it does not exist.
@@ -147,6 +166,13 @@ Grounding rules:
 
 ${formatRepoEvidence(input)}
 `;
+}
+
+export async function generateReproductionPlan(
+  input: PlanGenerationInput,
+  telemetry: InferenceTelemetry | null = null,
+): Promise<GeneratedPlan> {
+  const prompt = buildReproductionPlanPrompt(input);
 
   // Same retry-once contract as fix proposals: a malformed response is fed
   // back with the extraction error so the model can correct its format.

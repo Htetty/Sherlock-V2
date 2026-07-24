@@ -8,6 +8,7 @@
 
 import type { ArtifactStore } from "./artifacts.js";
 import type { EfficiencyPolicy } from "./efficiency-policy.js";
+import type { AgentPhase } from "./inference.js";
 
 export type BudgetProfileName = "standard" | "deep";
 
@@ -30,6 +31,9 @@ export type CostShape = {
   // --- fable/16 tool-call efficiency observability ---------------------------
   // The immutable policy resolved at investigation start (null until set).
   resolvedEfficiencyPolicy: EfficiencyPolicy | null;
+  // Exact model selected for each phase after explicit task/env policy
+  // resolution. This makes model-routing savings auditable.
+  resolvedPhaseModels: Partial<Record<AgentPhase, string>>;
   // Token totals derived from the append-only inference JSONL (one record per
   // LOGICAL call, so retries are never double counted). Null until derived.
   inputTokensTotal: number | null;
@@ -56,6 +60,9 @@ export type CostShape = {
   reproducerBatchedActions: number;
   reproducerActionDeltaBytes: number;
   reproducerReadPageCalls: number;
+  reproducerEligibleBatches: number;
+  reproducerAvoidableUnbatchedCalls: number;
+  reproducerEstimatedTurnsSaved: number;
   // Warm start (prior scripted attempt handed to the reproducer).
   warmStartUsed: boolean;
 };
@@ -88,6 +95,7 @@ export function createCostShapeTracker(
     budgetProfile,
     compactionEvents: 0,
     resolvedEfficiencyPolicy: null,
+    resolvedPhaseModels: {},
     inputTokensTotal: null,
     outputTokensTotal: null,
     cacheReadTokensTotal: null,
@@ -107,6 +115,9 @@ export function createCostShapeTracker(
     reproducerBatchedActions: 0,
     reproducerActionDeltaBytes: 0,
     reproducerReadPageCalls: 0,
+    reproducerEligibleBatches: 0,
+    reproducerAvoidableUnbatchedCalls: 0,
+    reproducerEstimatedTurnsSaved: 0,
     warmStartUsed: false,
   };
 

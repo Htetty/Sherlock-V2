@@ -1352,8 +1352,22 @@ export function renderIssueReport(
   return sections.join("\n\n");
 }
 
+// Public issue comments stay intentionally terse. The detailed investigation
+// belongs in the pull request; this comment communicates terminal status and
+// where the verified fix was delivered.
+export function renderIssueStatusComment(
+  report: InvestigationReportData,
+  pullRequest: ReportPullRequest | null,
+): string {
+  const sections = ["## Sherlock Investigation", outcomeCallout(report)];
+  const prLine = pullRequest ? pullRequestLine(pullRequest) : null;
+  if (prLine) sections.push(prLine);
+  return sections.join("\n\n");
+}
+
 // Queued placeholder body. The caller appends the hidden delivery marker so
-// terminal delivery can find and update this exact comment.
+// terminal delivery can find and replace this exact comment with the final
+// status update.
 export const QUEUED_INVESTIGATION_ASCII_ART = `⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⠤⠒⠋⠁⠑⠠⢄⠀⠀
 ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡊⠀⠀⡀⡀⡀⠀⠈⡆⠀
@@ -1385,5 +1399,5 @@ export function renderQueuedIssueReport(): string {
 // Pre-pipeline worker failure body (no pipeline result exists). The caller
 // appends the hidden markers and reconciles the queued comment.
 export function renderWorkerFailureIssueReport(input: { error: string }): string {
-  return renderIssueReport(buildWorkerFailureReportData(input), null);
+  return renderIssueStatusComment(buildWorkerFailureReportData(input), null);
 }

@@ -296,6 +296,32 @@ function buildLoginPlan(baseUrl: string): ReproductionPlan {
   return validation.plan;
 }
 
+function buildLoginUiPlan(baseUrl: string): ReproductionPlan {
+  const validation = validateReproductionPlan({
+    version: REPRODUCTION_PLAN_VERSION,
+    baseUrl,
+    steps: [
+      { id: "step-1", action: "goto", path: "/" },
+      { id: "step-2", action: "fill", selector: "[name='email']", value: "unknown@example.com" },
+      { id: "step-3", action: "click", selector: "button[type='submit']" },
+      { id: "step-4", action: "wait", ms: 100 },
+    ],
+    expectedBehavior: "The page shows Login status 401 after submitting the form.",
+    failureCondition: "The page does not show Login status 401 after submitting the form.",
+    assertion: {
+      type: "page_text",
+      contains: "Login status 401",
+      failureWhen: "absent",
+    },
+  });
+
+  if (!validation.ok) {
+    throw new Error(validation.errors.join(", "));
+  }
+
+  return validation.plan;
+}
+
 function correctProposal(overrides: Partial<FixProposal> = {}): FixProposal {
   return {
     version: FIX_PROPOSAL_VERSION,
@@ -834,6 +860,53 @@ import { readFile } from "node:fs/promises";
 const source = await readFile("server.mjs", "utf8");
 assert.ok(!source.includes("res.writeHead(500"), "REGRESSION_EXPECTED_FAILURE: login handler must not respond 500");
 `;
+
+  test(
+    "browser-only assertions skip Node regression generation and rely on the exact replay",
+    { timeout: 120_000 },
+    async () => {
+      const setup = await setupReproducedInvestigation();
+      const uiPlan = buildLoginUiPlan(setup.baseUrl);
+      const uiOriginal = await executeReproductionPlan(uiPlan, setup.store);
+      expect(uiOriginal.outcome).toBe("reproduced");
+
+      const docker = createHostEmulatingDocker();
+      let generatorCalls = 0;
+      const attempt = await runFixAttempt({
+        investigationId: setup.investigationId,
+        investigationDir: setup.store.dir,
+        repoPath: setup.repoPath,
+        sourceCommit: setup.commit,
+        plan: uiPlan,
+        originalOutcome: uiOriginal.outcome,
+        proposal: correctProposal(),
+        restart: setup.restart,
+        docker: docker.adapter,
+        generateRegressionTest: async () => {
+          generatorCalls += 1;
+          return regressionProposal(
+            `import assert from "node:assert/strict";
+assert.ok(true, "REGRESSION_EXPECTED_FAILURE: API proxy cannot prove browser text");
+`,
+            "api-proxy-for-browser-text",
+          );
+        },
+      });
+
+      expect(generatorCalls).toBe(0);
+      expect(attempt.outcome).toBe("verified");
+      expect(attempt.postPatchOutcome).toBe("not_reproduced");
+      expect(attempt.regressionTest).toMatchObject({
+        status: "unavailable",
+        generationAttempts: 0,
+        prePatch: null,
+      });
+      expect(attempt.regressionTest?.reason).toContain('browser-only "page_text"');
+      expect(
+        attempt.checks.find((check) => check.name === "regression_test"),
+      ).toMatchObject({ status: "advisory" });
+    },
+  );
 
   test(
     "fail-before/pass-after with identical bytes permits verification",

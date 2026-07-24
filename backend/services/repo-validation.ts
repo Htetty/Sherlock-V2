@@ -211,7 +211,15 @@ export async function runRepositoryValidation(
     const run = await runContainerCommand(docker, {
       purpose: `validate-${command.category}`,
       workspacePath: options.repoPath,
-      env: buildTargetEnv({ extra: { CI: "true" } }),
+      // Framework build commands (notably `next build`) require production
+      // semantics. The generic target environment defaults to development
+      // for running apps; reusing that here can mix Next's dev/prod runtimes
+      // and create prerender failures unrelated to the patch. Non-build
+      // validation uses the conventional test environment.
+      env: buildTargetEnv({
+        nodeEnv: command.category === "build" ? "production" : "test",
+        extra: { CI: "true" },
+      }),
       command: command.argv,
       timeoutMs,
       network: networkPolicy === "strict" ? "none" : undefined,

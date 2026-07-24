@@ -1,0 +1,10 @@
+[
+  { "name": "baseline" },
+  {
+    "name": "cache_on",
+    "inference": {
+      "reproduce": { "cacheMode": "system_and_tools" },
+      "fix": { "cacheMode": "system_and_tools" }
+    }
+  }
+]

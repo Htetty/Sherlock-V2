@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "experimentId": "EXAMPLE-prompt-caching-2026Q3",
+  "hypothesis": "Enabling system+tools prompt caching for the reproduce and fix phases reduces input tokens materially with no verified-fix-rate regression.",
+  "primaryCapabilityMetric": "verified_fix_rate",
+  "primaryCostMetric": "cost_per_verified_fix_usd",
+  "design": "paired",
+  "designRationale": "Same tasks and seeds under baseline (cache off) and candidate (cache on); paired reduces variance from task difficulty.",
+  "tasks": 30,
+  "trialsPerTask": 3,
+  "confidenceLevel": 0.95,
+  "ciMethod": "bootstrap",
+  "nonInferiorityMargin": 0.05,
+  "minimumEconomicEffect": ">=30% input-token reduction on reproduce+fix phases",
+  "multipleComparisonPolicy": "single pre-registered comparison (cache on vs off); no sweep, so no correction required",
+  "invalidTrialPolicy": "infrastructure_failed and timeout trials are excluded and reported; a task with >1/3 invalid trials is re-run once, then flagged",
+  "seed": 20260716,
+  "versions": {
+    "taskSet": "FILL: git SHA or tag of evals/tasks",
+    "code": "FILL: git SHA",
+    "prompts": "FILL: prompt version",
+    "models": ["FILL: exact model id(s)"],
+    "graders": "FILL: graders version",
+    "pricing": "evals/pricing.v1.json@FILL",
+    "environment": "FILL: dev host image/tag"
+  },
+  "budget": {
+    "maxLogicalModelCalls": 600,
+    "maxHttpAttempts": 900,
+    "maxEstimatedTokens": 40000000,
+    "maxEstimatedCostUsd": 50,
+    "maxWallTimeMinutes": 240,
+    "approvedBy": "FILL: approver name — REQUIRED before a full run (paid-evaluation gate)"
+  }
+}

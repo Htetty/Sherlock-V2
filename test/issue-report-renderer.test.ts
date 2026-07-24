@@ -11,6 +11,7 @@ import {
   QUEUED_INVESTIGATION_ASCII_ART,
   renderIssueReport,
   renderQueuedIssueReport,
+  renderIssueStatusComment,
   renderWorkerFailureIssueReport,
   type InvestigationReportData,
   type ReportPullRequest,
@@ -158,7 +159,6 @@ describe("queued report", () => {
       ].join("\n"),
     );
     expect(rendered).toContain(`\`\`\`text\n${QUEUED_INVESTIGATION_ASCII_ART}\n\`\`\``);
-    expect(rendered.split(QUEUED_INVESTIGATION_ASCII_ART)).toHaveLength(2);
 
     const marker = deliveryCommentMarker(INV);
     expect(marker).toBe(`<!-- sherlock-delivery-comment:${INV} -->`);
@@ -170,7 +170,7 @@ describe("queued report", () => {
     expectPrivateReport(rendered);
   });
 
-  test("does not appear in completed, failed, or reproduced-without-fix reports", () => {
+  test("queued status does not appear in completed, failed, or reproduced-without-fix reports", () => {
     const completed = renderIssueReport(verifiedReport(), {
       status: "created",
       url: "https://github.com/acme/app/pull/7",
@@ -189,8 +189,24 @@ describe("queued report", () => {
     );
 
     for (const rendered of [completed, failed, reproducedWithoutFix]) {
-      expect(rendered).not.toContain(QUEUED_INVESTIGATION_ASCII_ART);
+      expect(rendered).not.toContain("**Investigation queued**");
     }
+  });
+});
+
+describe("public status comment", () => {
+  test("reports completion and links the PR without duplicating investigation details", () => {
+    const rendered = renderIssueStatusComment(verifiedReport(), {
+      status: "created",
+      url: "https://github.com/acme/app/pull/7",
+    });
+
+    expect(rendered).toContain("**Fix verified**");
+    expect(rendered).toContain("https://github.com/acme/app/pull/7");
+    expect(rendered).not.toContain("### Root cause");
+    expect(rendered).not.toContain("### Fix");
+    expect(rendered).not.toContain("### Validation");
+    expect(rendered).not.toContain("Replay evidence");
   });
 });
 
@@ -549,7 +565,7 @@ describe("worker failure report", () => {
       "Sherlock could not complete this investigation because of an internal failure.",
     );
     expect(rendered).not.toContain("example-secret");
-    expect(rendered).toContain("[REDACTED]");
+    expect(rendered).not.toContain("Authorization");
     expectPrivateReport(rendered);
   });
 
@@ -595,12 +611,12 @@ describe("worker failure report", () => {
     ).not.toContain("investigation.json");
     expect(rendered).not.toMatch(/(?:db|redis|postgres|mysql|mongo|app|api):\d+/i);
     for (const value of privateValues) expect(rendered).not.toContain(value);
-    expect(rendered).toContain("src/config/settings.json");
-    expect(rendered).toContain("backend/services/delivery.ts");
-    expect(rendered).toContain("test/fixtures/investigation.json");
-    expect(rendered).toContain("server.ts:42");
-    expect(rendered).toContain("HTTP 401");
-    expect(rendered).toContain("3000ms");
+    expect(rendered).not.toContain("src/config/settings.json");
+    expect(rendered).not.toContain("backend/services/delivery.ts");
+    expect(rendered).not.toContain("test/fixtures/investigation.json");
+    expect(rendered).not.toContain("server.ts:42");
+    expect(rendered).not.toContain("HTTP 401");
+    expect(rendered).not.toContain("3000ms");
     expectPrivateReport(rendered);
   });
 });

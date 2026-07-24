@@ -19,6 +19,87 @@ const MAX_EDGES = 120;
 const MAX_FILES = 5;
 const MAX_FILE_CHARS = 8_000;
 
+// Sherlock only uses Graphify's deterministic code/AST graph. Graphify's
+// headless `extract` command sends documents and media to whichever LLM
+// provider it auto-detects from the parent environment, so exclude every
+// semantic/media type and give the child a minimal, credential-free env.
+// Bracketed patterns make extension matching case-insensitive on platforms
+// where fnmatch is case-sensitive.
+export const GRAPHIFY_LOCAL_ONLY_EXCLUDES = [
+  "*.[mM][dD]",
+  "*.[mM][dD][xX]",
+  "*.[qQ][mM][dD]",
+  "*.[tT][xX][tT]",
+  "*.[rR][sS][tT]",
+  "*.[hH][tT][mM][lL]",
+  "*.[yY][aA][mM][lL]",
+  "*.[yY][mM][lL]",
+  "*.[pP][dD][fF]",
+  "*.[pP][nN][gG]",
+  "*.[jJ][pP][gG]",
+  "*.[jJ][pP][eE][gG]",
+  "*.[gG][iI][fF]",
+  "*.[wW][eE][bB][pP]",
+  "*.[sS][vV][gG]",
+  "*.[dD][oO][cC][xX]",
+  "*.[xX][lL][sS][xX]",
+  "*.[gG][dD][oO][cC]",
+  "*.[gG][sS][hH][eE][eE][tT]",
+  "*.[gG][sS][lL][iI][dD][eE][sS]",
+  "*.[mM][pP]4",
+  "*.[mM][oO][vV]",
+  "*.[wW][eE][bB][mM]",
+  "*.[mM][kK][vV]",
+  "*.[aA][vV][iI]",
+  "*.[mM]4[vV]",
+  "*.[mM][pP]3",
+  "*.[wW][aA][vV]",
+  "*.[mM]4[aA]",
+  "*.[oO][gG][gG]",
+] as const;
+
+const GRAPHIFY_LOCAL_ENV_KEYS = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "PYTHONUTF8",
+  "PYTHONIOENCODING",
+  // Windows process-launch essentials. Harmless when absent elsewhere.
+  "SystemRoot",
+  "ComSpec",
+  "PATHEXT",
+  "WINDIR",
+  "USERPROFILE",
+  "LOCALAPPDATA",
+  "APPDATA",
+] as const;
+
+export function buildLocalGraphifyEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return Object.fromEntries(
+    GRAPHIFY_LOCAL_ENV_KEYS.flatMap((name) =>
+      env[name] === undefined ? [] : [[name, env[name]]],
+    ),
+  );
+}
+
+export function buildLocalGraphifyArgs(): string[] {
+  return [
+    "extract",
+    ".",
+    "--no-viz",
+    ...GRAPHIFY_LOCAL_ONLY_EXCLUDES.flatMap((pattern) => ["--exclude", pattern]),
+  ];
+}
+
 const STOPWORDS = new Set([
   "the", "and", "for", "with", "that", "this", "when", "then", "but", "not",
   "are", "was", "were", "has", "have", "had", "does", "did", "can", "cannot",
@@ -182,9 +263,9 @@ async function exists(filePath: string): Promise<boolean> {
 }
 
 async function runGraphifyExtract(repoPath: string) {
-  // Code-only extraction is fully local (tree-sitter AST); no API key needed.
-  await execFileAsync("graphify", ["extract", ".", "--no-viz"], {
+  await execFileAsync("graphify", buildLocalGraphifyArgs(), {
     cwd: repoPath,
+    env: buildLocalGraphifyEnv(),
     timeout: EXTRACT_TIMEOUT_MS,
     maxBuffer: 16 * 1024 * 1024,
   });

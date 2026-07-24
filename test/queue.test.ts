@@ -224,7 +224,8 @@ describe("investigation worker processing", () => {
     // No visible investigation id outside the hidden markers.
     expect(failureComment).not.toMatch(/Investigation: inv_/);
     expect(failureComment).not.toContain("hunter2");
-    expect(failureComment).toContain("worker failed permanently");
+    expect(failureComment).toContain("**Investigation failed**");
+    expect(failureComment).not.toContain("worker failed permanently");
     expect(stages.filter((stage) => stage === "failed")).toHaveLength(2);
 
     // The standalone formatter also redacts.

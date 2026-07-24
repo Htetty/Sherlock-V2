@@ -49,6 +49,7 @@ export type PrePatchClassification =
   | "unexpectedly_passed"
   | "invalid_test"
   | "timed_out"
+  | "infrastructure_failed"
   | "execution_failed";
 
 export type PostPatchClassification =
@@ -67,6 +68,7 @@ export type RegressionAggregate = "proven" | "blocked" | "unavailable";
 
 export type RegressionTestSummary = {
   status: RegressionAggregate;
+  generationMode: "deterministic" | "model" | "unavailable";
   testName: string | null;
   relativePath: string | null;
   runner: RegressionRunner | null;
@@ -77,6 +79,169 @@ export type RegressionTestSummary = {
   generationAttempts: number;
   reason: string | null;
 };
+
+type ApiRequestSpec = {
+  method: string;
+  path: string;
+  body?: Record<string, unknown>;
+};
+
+/**
+ * Compile the already-validated API reproduction contract into a trusted
+ * Node test. Model-controlled values are serialized as JSON string literals;
+ * none are interpolated as executable source.
+ */
+export function compileDeterministicApiRegressionTest(
+  plan: ReproductionPlan,
+  result: ReproductionResult | null,
+): RegressionTestProposal | null {
+  if (
+    plan.assertion.type !== "response_status" &&
+    plan.assertion.type !== "response_body"
+  ) {
+    return null;
+  }
+
+  const request = selectDeterministicRequest(plan, result);
+  if (!request) {
+    return null;
+  }
+
+  const assertion = plan.assertion;
+  const marker =
+    assertion.type === "response_status"
+      ? `${REGRESSION_FAILURE_MARKER_PREFIX} expected HTTP ${assertion.expected}, received the reproduced failure status`
+      : `${REGRESSION_FAILURE_MARKER_PREFIX} API response still matches the reproduced failure`;
+  const expectedPrePatchFailure =
+    assertion.type === "response_status"
+      ? `The endpoint returns HTTP ${assertion.failureValue} instead of ${assertion.expected}.`
+      : `The response body still contains ${JSON.stringify(assertion.failureContains)}.`;
+  const expectedPostPatchBehavior =
+    assertion.type === "response_status"
+      ? `The endpoint returns HTTP ${assertion.expected}.`
+      : assertion.expectedContains
+        ? `The response no longer contains the failure value and contains ${JSON.stringify(assertion.expectedContains)}.`
+        : "The response no longer contains the reproduced failure value.";
+
+  const requestOptions = {
+    method: request.method,
+    ...(request.body === undefined
+      ? {}
+      : {
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(request.body),
+        }),
+  };
+
+  const assertionSource =
+    assertion.type === "response_status"
+      ? `assert.equal(response.status, ${JSON.stringify(assertion.expected)}, ${JSON.stringify(marker)});`
+      : [
+          `const failurePresent = body.includes(${JSON.stringify(assertion.failureContains)});`,
+          assertion.expectedContains
+            ? `const expectedPresent = body.includes(${JSON.stringify(assertion.expectedContains)});`
+            : "const expectedPresent = true;",
+          `assert.ok(!failurePresent && expectedPresent, ${JSON.stringify(marker)});`,
+        ].join("\n");
+
+  const contents = [
+    'import assert from "node:assert/strict";',
+    'const target = process.env.SHERLOCK_TARGET_URL;',
+    'assert.ok(target, "SHERLOCK_TARGET_URL is required");',
+    `const requestUrl = new URL(${JSON.stringify(request.path)}, target);`,
+    `const response = await fetch(requestUrl, ${JSON.stringify(requestOptions)});`,
+    "const body = await response.text();",
+    assertionSource,
+    "",
+  ].join("\n");
+
+  const proposal: RegressionTestProposal = {
+    version: REGRESSION_PROPOSAL_VERSION,
+    testName:
+      assertion.type === "response_status"
+        ? "api-response-status-regression"
+        : "api-response-body-regression",
+    purpose: "Prove the accepted API reproduction no longer exhibits the failure.",
+    relativePath: "sherlock-regression.test.mjs",
+    runner: "node",
+    contents,
+    expectedPrePatchFailure,
+    expectedPostPatchBehavior,
+  };
+
+  return validateRegressionProposalShape(proposal).ok ? proposal : null;
+}
+
+function selectDeterministicRequest(
+  plan: ReproductionPlan,
+  result: ReproductionResult | null,
+): ApiRequestSpec | null {
+  const assertion = plan.assertion;
+  if (
+    assertion.type !== "response_status" &&
+    assertion.type !== "response_body"
+  ) {
+    return null;
+  }
+
+  const explicit = [...plan.steps]
+    .reverse()
+    .find(
+      (step) =>
+        step.action === "request" &&
+        (!assertion.method || step.method === assertion.method) &&
+        (!assertion.pathPattern || step.path.includes(assertion.pathPattern)),
+    );
+
+  if (explicit?.action === "request") {
+    return {
+      method: explicit.method,
+      path: explicit.path,
+      ...(explicit.body === undefined ? {} : { body: explicit.body }),
+    };
+  }
+
+  // Browser-triggered API calls can be compiled only when the captured
+  // request is a bodyless GET. Reconstructing POST bodies from browser traffic
+  // would be a guess and therefore falls back truthfully.
+  const captured = [...(result?.apiResponses ?? [])]
+    .reverse()
+    .find(
+      (response) =>
+        (!assertion.method || response.method === assertion.method) &&
+        (!assertion.pathPattern || response.url.includes(assertion.pathPattern)),
+    );
+
+  if (!captured || captured.method !== "GET") {
+    return null;
+  }
+
+  try {
+    const url = new URL(captured.url);
+    return { method: "GET", path: `${url.pathname}${url.search}` };
+  } catch {
+    return null;
+  }
+}
+
+// The generated runner is a plain Node process. It can faithfully exercise
+// API response assertions, but it cannot observe browser DOM or console state.
+// Keep this as an allowlist so any future assertion type fails closed until a
+// runner with matching observation semantics is implemented.
+const NODE_REGRESSION_ASSERTIONS = new Set<ReproductionPlan["assertion"]["type"]>([
+  "response_status",
+  "response_body",
+]);
+
+export function getNodeRegressionUnsupportedReason(
+  plan: ReproductionPlan,
+): string | null {
+  if (NODE_REGRESSION_ASSERTIONS.has(plan.assertion.type)) {
+    return null;
+  }
+
+  return `Generated Node regression tests cannot faithfully assert browser-only "${plan.assertion.type}" behavior. The exact Playwright replay remains authoritative.`;
+}
 
 const MAX_TEST_CHARS = 20_000;
 const MAX_NAME_CHARS = 80;
@@ -286,6 +451,15 @@ const INVALID_TEST_MARKERS = [
   /ReferenceError/,
 ];
 
+const INFRASTRUCTURE_FAILURE_MARKERS = [
+  /No such container/i,
+  /joining network namespace/i,
+  /Cannot connect to the Docker daemon/i,
+  /docker daemon/i,
+  /network .* not found/i,
+  /failed to create .*network/i,
+];
+
 export function classifyPrePatchRun(
   run: {
     exitCode: number;
@@ -304,6 +478,11 @@ export function classifyPrePatchRun(
   }
 
   const output = `${run.stdout}\n${run.stderr}`;
+
+  if (INFRASTRUCTURE_FAILURE_MARKERS.some((marker) => marker.test(output))) {
+    return "infrastructure_failed";
+  }
+
   const assertionFailed = ASSERTION_MARKERS.some((marker) => marker.test(output));
 
   // Behavioral proof requires BOTH: an assertion failure AND the exact
@@ -661,6 +840,7 @@ const PRE_PATCH_LABELS: Record<PrePatchClassification, string> = {
   unexpectedly_passed: "unexpectedly passed",
   invalid_test: "invalid test",
   timed_out: "timed out",
+  infrastructure_failed: "infrastructure failed",
   execution_failed: "execution failed",
 };
 
