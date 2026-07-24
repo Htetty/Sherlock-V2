@@ -254,6 +254,28 @@ describe("repository validation execution", () => {
     expect(docker.removed.length).toBeGreaterThan(0);
   });
 
+  test("runs builds with production semantics and other checks with test semantics", async () => {
+    const repoPath = await createRepo({
+      "package.json": pkg({ test: "vitest run", build: "next build" }),
+    });
+    const docker = createFakeDocker({
+      test: { exitCode: 0 },
+      build: { exitCode: 0 },
+    });
+
+    await runRepositoryValidation(docker.adapter, {
+      repoPath,
+      timeoutMs: 5_000,
+    });
+
+    const testArgs = docker.spawned.find((args) => args.at(-1) === "test")!;
+    const buildArgs = docker.spawned.find((args) => args.at(-1) === "build")!;
+
+    expect(testArgs.join(" ")).toContain("-e NODE_ENV=test");
+    expect(buildArgs.join(" ")).toContain("-e NODE_ENV=production");
+    expect(buildArgs.join(" ")).not.toContain("NODE_ENV=development");
+  });
+
   test("stdout and stderr are bounded so repositories cannot flood artifacts", async () => {
     const repoPath = await createRepo({ "package.json": pkg({ test: "vitest run" }) });
     const docker = createFakeDocker({

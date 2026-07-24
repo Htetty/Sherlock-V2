@@ -884,7 +884,13 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
 
     const failures = validation.results
       .filter((item) => item.status === "failed" || item.status === "timed_out")
-      .map((item) => `${item.argv?.join(" ")} (${item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`})`)
+      .map((item) => {
+        const command = `${item.argv?.join(" ")} (${
+          item.status === "timed_out" ? "timed out" : `exit ${item.exitCode}`
+        })`;
+        const diagnostic = summarizeValidationFailure(item.stderr || item.stdout);
+        return diagnostic ? `${command}: ${diagnostic}` : command;
+      })
       .join(", ");
 
     return finish(
@@ -1021,6 +1027,23 @@ export async function runFixAttempt(input: FixAttemptInput): Promise<FixAttemptR
         ? "The patch was applied, the application restarted, and the exact saved reproduction no longer fails. Repository validation was unavailable (no declared scripts), so verification relies on the reproduction replay and the proven generated regression test."
         : "The patch was applied, the application restarted, the exact saved reproduction no longer fails, all available repository validation commands passed, and the generated regression test passed.",
   );
+}
+
+function summarizeValidationFailure(output: string): string | null {
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const diagnostic =
+    lines.find((line) =>
+      /^(?:error|typeerror|referenceerror|syntaxerror)\b|cannot\b|failed\b|should not\b/i.test(
+        line,
+      ),
+    ) ??
+    lines.at(-1) ??
+    null;
+
+  return diagnostic ? diagnostic.slice(0, 400) : null;
 }
 
 function formatError(error: unknown): string {

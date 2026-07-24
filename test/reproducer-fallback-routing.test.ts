@@ -15,31 +15,24 @@ describe("reproducer fallback routing", () => {
   test("plan and execution failures always use the fallback without a feature flag", () => {
     delete process.env.REPRODUCER_AGENT_ENABLED;
 
-    expect(shouldRunReproducerFallback("plan_failed", false)).toBe(true);
-    expect(shouldRunReproducerFallback("execution_failed", false)).toBe(true);
+    expect(shouldRunReproducerFallback("plan_failed")).toBe(true);
+    expect(shouldRunReproducerFallback("execution_failed")).toBe(true);
 
     process.env.REPRODUCER_AGENT_ENABLED = "false";
-    expect(shouldRunReproducerFallback("plan_failed", false)).toBe(true);
-    expect(shouldRunReproducerFallback("execution_failed", false)).toBe(true);
+    expect(shouldRunReproducerFallback("plan_failed")).toBe(true);
+    expect(shouldRunReproducerFallback("execution_failed")).toBe(true);
   });
 
   test("memory replay and successful one-shot reproduction skip the fallback", () => {
-    expect(shouldRunReproducerFallback("memory_reproduced", true)).toBe(false);
-    expect(shouldRunReproducerFallback("reproduced", true)).toBe(false);
+    expect(shouldRunReproducerFallback("memory_reproduced")).toBe(false);
+    expect(shouldRunReproducerFallback("reproduced")).toBe(false);
   });
 
-  test("not_reproduced escalates only through its existing escalation flag", () => {
-    expect(shouldRunReproducerFallback("not_reproduced", false)).toBe(false);
-    expect(shouldRunReproducerFallback("not_reproduced", true)).toBe(true);
-  });
-
-  test("indeterminate one-shot assertions always escalate", () => {
-    expect(
-      shouldRunReproducerFallback("not_reproduced", false, false),
-    ).toBe(true);
+  test("every one-shot not_reproduced result uses the fallback", () => {
+    expect(shouldRunReproducerFallback("not_reproduced")).toBe(true);
   });
 
   test("environment failures do not invoke the reproducer fallback", () => {
-    expect(shouldRunReproducerFallback("environment_failed", true)).toBe(false);
+    expect(shouldRunReproducerFallback("environment_failed")).toBe(false);
   });
 });

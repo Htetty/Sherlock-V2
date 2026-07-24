@@ -1024,6 +1024,20 @@ export async function runFixerAgent(
       const forcePatchRevision =
         minimumInspections === 0 &&
         lastVerifierFeedback.includes("DETERMINISTIC DIAGNOSTIC:");
+      const behavioralFixAlreadyPassed =
+        lastAttempt?.outcome === "rejected_tests_failed" &&
+        lastAttempt.postPatchOutcome === "not_reproduced";
+      // Once the exact replay is healthy and only repository validation
+      // failed, broad exploration cannot add behavioral evidence. The next
+      // move must be a concrete revision or an honest stop. This prevents an
+      // unrelated build/environment failure from triggering a long sequence
+      // of reads and explorer calls.
+      const toolsForTurn = behavioralFixAlreadyPassed
+        ? tools.filter(
+            (tool) =>
+              tool.name === "propose_patch" || tool.name === "submit_blocked",
+          )
+        : tools;
 
       // Snapshot: the params must not alias the mutable history array, so
       // recorded/injected createMessage implementations see a stable value.
@@ -1037,7 +1051,7 @@ export async function runFixerAgent(
           runCodeEnabled: efficiency.fixerRunCode,
           minimumInspections,
         }),
-        tools,
+        tools: toolsForTurn,
         // Parallel reads (Phase 2, default OFF): when enabled, the model may
         // emit several READ-ONLY calls per turn under the tool-batch
         // contract; terminal/mutation tools must still be called alone.
@@ -1047,7 +1061,11 @@ export async function runFixerAgent(
               name: "propose_patch",
               disable_parallel_tool_use: true,
             }
-          : { type: "any", disable_parallel_tool_use: !parallelReads },
+          : {
+              type: "any",
+              disable_parallel_tool_use:
+                behavioralFixAlreadyPassed || !parallelReads,
+            },
         messages: [...messages],
       });
 

@@ -188,7 +188,6 @@ export type InvestigationPipelineResult = {
 // defaults, so leaving `policy` unset preserves current behavior exactly.
 export type InvestigationPolicy = {
   budgetProfile?: "standard" | "deep";
-  escalateNotReproduced?: boolean;
   // Test/debug routing: skip memory replay and one-shot planning so the
   // bounded reproducer agent handles the issue from its first observation.
   forceReproducerAgent?: boolean;
@@ -238,14 +237,11 @@ export type ReproducerFallbackCase =
 
 export function shouldRunReproducerFallback(
   fallbackCase: ReproducerFallbackCase,
-  escalateNotReproduced: boolean,
-  assertionMatchedExpected = true,
 ): boolean {
   return (
     fallbackCase === "plan_failed" ||
     fallbackCase === "execution_failed" ||
-    (fallbackCase === "not_reproduced" &&
-      (escalateNotReproduced || !assertionMatchedExpected))
+    fallbackCase === "not_reproduced"
   );
 }
 
@@ -583,9 +579,6 @@ export async function runInvestigationPipeline(
     //   3. reproducer agent (docs/fable/11) as FALLBACK
     // Only executeReproductionPlan() can mark reproduced — memory is never
     // trusted without replay.
-    const escalateNotReproduced =
-      options.policy?.escalateNotReproduced ??
-      process.env.SHERLOCK_ESCALATE_NOT_REPRODUCED === "true";
     const forceReproducerAgent = shouldForceReproducerAgent(
       options.policy?.forceReproducerAgent,
     );
@@ -990,7 +983,7 @@ export async function runInvestigationPipeline(
       }
 
       if (planErrors !== null) {
-        if (shouldRunReproducerFallback("plan_failed", escalateNotReproduced)) {
+        if (shouldRunReproducerFallback("plan_failed")) {
           log("One-shot reproduction plan failed; falling back to reproducer agent.");
           const terminal = await runReproducerAgentFallback();
 
@@ -1018,14 +1011,12 @@ export async function runInvestigationPipeline(
         } else if (
           shouldRunReproducerFallback(
             oneShotResult.outcome,
-            escalateNotReproduced,
-            oneShotResult.assertion?.matchedExpected === true,
           )
         ) {
           if (oneShotResult.outcome === "not_reproduced") {
             if (oneShotResult.assertion?.matchedExpected === true) {
               log(
-                "One-shot reproduction not_reproduced; escalating to reproducer agent (SHERLOCK_ESCALATE_NOT_REPRODUCED=true).",
+                "One-shot reproduction not_reproduced; falling back to reproducer agent.",
               );
             } else {
               log(
