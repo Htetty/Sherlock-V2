@@ -539,7 +539,7 @@ export const DEFAULT_STATE_STORE_TABLE = "investigation_states";
 export type InvestigationStateRow = {
   investigation_id: string;
   tenant_id: string | null;
-  installation_id: number | null;
+  installation_id: string | null;
   repo_owner: string | null;
   repo_name: string | null;
   issue_number: number | null;
@@ -570,7 +570,8 @@ function investigationStateRecordToRow(
   return {
     investigation_id: record.investigationId,
     tenant_id: record.tenantId ?? null,
-    installation_id: record.installationId ?? null,
+    installation_id:
+      record.installationId === undefined ? null : String(record.installationId),
     repo_owner: record.repoOwner ?? null,
     repo_name: record.repoName ?? null,
     issue_number: record.issueNumber ?? null,

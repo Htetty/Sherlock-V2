@@ -195,6 +195,7 @@ export type DeliveryState = {
   terminalPayload: DeliveryArtifactReference;
   terminalComment: {
     status: DeliveryCommentStatus;
+    id?: number | null;
     postedAt: string | null;
     reason: string | null;
     // Set before the only create request. If its acknowledgement is lost and
@@ -372,6 +373,7 @@ export async function buildDeliveryState(
     terminalPayload: provisionalTerminalPayload,
     terminalComment: {
       status: "pending",
+      id: null,
       postedAt: null,
       reason: null,
       createAttemptedAt: null,
@@ -891,6 +893,7 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
   const state = structuredClone(value) as DeliveryState;
   if (state.terminalComment && typeof state.terminalComment === "object") {
     state.terminalComment.createAttemptedAt ??= null;
+    state.terminalComment.id ??= null;
   }
   if (
     state.version !== 2 ||
@@ -924,6 +927,9 @@ function normalizeDeliveryState(value: unknown): DeliveryState {
     !sanitizeArtifactReference(state.terminalPayload) ||
     !state.terminalComment ||
     typeof state.terminalComment.status !== "string" ||
+    (state.terminalComment.id !== null &&
+      (!Number.isSafeInteger(state.terminalComment.id) ||
+        Number(state.terminalComment.id) <= 0)) ||
     (state.terminalComment.reason !== null &&
       typeof state.terminalComment.reason !== "string") ||
     (state.terminalComment.createAttemptedAt !== null &&
@@ -2620,7 +2626,7 @@ export type DeliveryExecutorDeps = {
     issueNumber: number;
     body: string;
     assertOwnership: () => Promise<void>;
-  }) => Promise<void>;
+  }) => Promise<void | { id: number }>;
   updateIssueComment?: (input: {
     installationId: number;
     owner: string;
@@ -2850,6 +2856,7 @@ async function runDeliveryUnlocked(
   // --- Terminal issue comment (owned reconciliation, always last) ----------
   if (state.terminalComment.status !== "posted") {
     try {
+      let terminalCommentId = state.terminalComment.id ?? null;
       const marker = terminalCommentMarker(state.investigationId);
       const reusableMarker = deliveryCommentMarker(state.investigationId);
       const reconcileComment = async (): Promise<TerminalCommentReconciliation> => {
@@ -2900,6 +2907,9 @@ async function runDeliveryUnlocked(
 
       let reconciliation = await reconcileComment();
       if (reconciliation.terminalCommentId !== null) {
+        if (reconciliation.terminalCommentId > 0) {
+          terminalCommentId = reconciliation.terminalCommentId;
+        }
         log(
           `[${state.investigationId}] Terminal comment already exists on the issue; not posting a duplicate.`,
         );
@@ -2923,6 +2933,7 @@ async function runDeliveryUnlocked(
                 body,
                 assertOwnership: lease.assertOwned,
               });
+              terminalCommentId = reconciliation.reusableCommentId;
             } catch (error) {
               // A failed update never authorizes a fallback create. The queued
               // comment may have been updated despite a lost acknowledgement,
@@ -2939,7 +2950,7 @@ async function runDeliveryUnlocked(
             state.terminalComment.createAttemptedAt = new Date().toISOString();
             await saveState();
             try {
-              await deps.postIssueComment({
+              const posted = await deps.postIssueComment({
                 installationId: state.installationId,
                 owner: state.repoOwner,
                 repo: state.repoName,
@@ -2947,6 +2958,13 @@ async function runDeliveryUnlocked(
                 body,
                 assertOwnership: lease.assertOwned,
               });
+              if (
+                posted &&
+                Number.isSafeInteger(posted.id) &&
+                posted.id > 0
+              ) {
+                terminalCommentId = posted.id;
+              }
             } catch (error) {
               // If GitHub accepted the create but its acknowledgement was
               // lost, a complete owned-marker scan converts it to success.
@@ -2955,6 +2973,9 @@ async function runDeliveryUnlocked(
               if (after.terminalCommentId === null) {
                 throw error;
               }
+              if (after.terminalCommentId > 0) {
+                terminalCommentId = after.terminalCommentId;
+              }
             }
           }
         }
@@ -2962,6 +2983,7 @@ async function runDeliveryUnlocked(
 
       state.terminalComment = {
         status: "posted",
+        id: terminalCommentId,
         postedAt: new Date().toISOString(),
         reason: null,
         createAttemptedAt: state.terminalComment.createAttemptedAt ?? null,
@@ -2979,6 +3001,7 @@ async function runDeliveryUnlocked(
 
       state.terminalComment = {
         status: "failed",
+        id: state.terminalComment.id ?? null,
         postedAt: null,
         reason: TERMINAL_COMMENT_FAILED_REASON,
         createAttemptedAt: state.terminalComment.createAttemptedAt ?? null,

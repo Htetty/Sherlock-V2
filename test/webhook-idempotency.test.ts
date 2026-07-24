@@ -1,12 +1,14 @@
 import type { Queue } from "bullmq";
 import type { Redis } from "ioredis";
 import { describe, expect, test } from "vitest";
+import { createWebhookInvestigationId } from "../backend/services/artifacts.js";
 import {
   INVESTIGATION_JOB_RETENTION,
   WEBHOOK_COMMAND_CLAIM_PREFIX,
   WEBHOOK_COMMAND_CLAIM_TTL_SECONDS,
   buildInvestigationJobId,
   createInvestigationQueueAdapter,
+  enqueueInvestigationJob,
   type InvestigationJobPayload,
 } from "../backend/queue/investigation-queue.js";
 
@@ -57,7 +59,9 @@ function createQueueMock(addImpl?: () => Promise<void>) {
   const queue = {
     add: async (_name: string, data: InvestigationJobPayload, options: { jobId: string }) => {
       await addImpl?.();
-      added.push({ data, jobId: options.jobId });
+      if (!added.some((entry) => entry.jobId === options.jobId)) {
+        added.push({ data, jobId: options.jobId });
+      }
     },
     close: async () => {},
   };
@@ -65,6 +69,27 @@ function createQueueMock(addImpl?: () => Promise<void>) {
 }
 
 describe("webhook command Redis claim", () => {
+  test("webhook investigation ids are stable, opaque, and command-scoped", () => {
+    const first = createWebhookInvestigationId({
+      installationId: 2,
+      triggeringCommentId: 4242,
+    });
+    expect(
+      createWebhookInvestigationId({
+        installationId: "2",
+        triggeringCommentId: "4242",
+      }),
+    ).toBe(first);
+    expect(
+      createWebhookInvestigationId({
+        installationId: 2,
+        triggeringCommentId: 4243,
+      }),
+    ).not.toBe(first);
+    expect(first).toMatch(/^inv_[0-9A-F]{20}$/);
+    expect(first).not.toContain("4242");
+  });
+
   test("two concurrent attempts have exactly one winner", async () => {
     const { redis } = createRedisMock();
     const { queue, added } = createQueueMock(async () => Promise.resolve());
@@ -156,5 +181,71 @@ describe("webhook command Redis claim", () => {
       rateLimited: false,
     });
     expect(attempts).toBe(2);
+  });
+
+  test("a pending command revives a retained failed investigation job", async () => {
+    let retried = 0;
+    const queue = {
+      add: async () =>
+        ({
+          getState: async () => "failed",
+          retry: async (state: string) => {
+            expect(state).toBe("failed");
+            retried += 1;
+          },
+        }) as never,
+    } as unknown as Pick<Queue, "add">;
+
+    await expect(enqueueInvestigationJob(queue, payload)).resolves.toBe(
+      buildInvestigationJobId(payload),
+    );
+    expect(retried).toBe(1);
+  });
+
+  test("a durable pending claim resumes the original payload after acknowledgement failure", async () => {
+    const { redis, values } = createRedisMock();
+    const { queue, added } = createQueueMock();
+    const adapter = createInvestigationQueueAdapter(redis, queue);
+    const original = { ...payload, investigationId: "inv_ORIGINAL12345" };
+    let acknowledged = false;
+    let acknowledgementAttempts = 0;
+    const options = {
+      onClaim: async () =>
+        acknowledged
+          ? "duplicate" as const
+          : { decision: "allow" as const, payload: original },
+      onEnqueued: async () => {
+        acknowledgementAttempts += 1;
+        if (acknowledgementAttempts === 1) {
+          throw new Error("Supabase acknowledgement unavailable");
+        }
+        acknowledged = true;
+      },
+    };
+
+    await expect(adapter.add(payload, options)).rejects.toThrow(
+      "Supabase acknowledgement unavailable",
+    );
+    expect(values.size).toBe(0);
+
+    await expect(adapter.add(payload, options)).resolves.toMatchObject({
+      deduplicated: false,
+      rateLimited: false,
+    });
+    expect(added).toEqual([
+      {
+        data: original,
+        jobId: buildInvestigationJobId(payload),
+      },
+    ]);
+    expect(acknowledged).toBe(true);
+
+    // Once acknowledged permanently, even a fresh Redis claim cannot enqueue.
+    values.clear();
+    await expect(adapter.add(payload, options)).resolves.toMatchObject({
+      deduplicated: true,
+      rateLimited: false,
+    });
+    expect(added).toHaveLength(1);
   });
 });

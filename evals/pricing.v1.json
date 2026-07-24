@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "currency": "USD",
+  "comment": "Per-million-token rates keyed by EXACT model identifier. Fill from the provider's current price sheet before relying on estimatedCostUsd. Unknown models yield estimatedCostUsd: null and must be surfaced as a warning in reports — never a guessed cost. Override path with SHERLOCK_PRICING_FILE. NOTE: claude-sonnet-5 rates below are the provider's INTRODUCTORY pricing, valid through 2026-08-31; starting 2026-09-01 they change to input 3 / cacheWrite5m 3.75 / cacheWrite1h 6 / cacheRead 0.30 / output 15 — update this file then.",
+  "models": {
+    "claude-sonnet-5": {
+      "effectiveDate": "2026-07-17",
+      "validThrough": "2026-08-31",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing (Claude Sonnet 5, introductory pricing through August 31, 2026)",
+      "retrievedAt": "2026-07-17",
+      "perMTok": {
+        "input": 2,
+        "output": 10,
+        "cacheRead": 0.2,
+        "cacheWrite5m": 2.5,
+        "cacheWrite1h": 4
+      }
+    }
+  }
+}

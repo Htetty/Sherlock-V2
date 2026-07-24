@@ -1,6 +1,6 @@
 // Investigation IDs and persisted artifact storage under artifacts/<id>/.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ReproductionResult } from "./playwright.js";
@@ -22,6 +22,30 @@ function createId(prefix: string) {
 
 export function createInvestigationId() {
   return createId("inv");
+}
+
+export function createWebhookInvestigationId(input: {
+  installationId: string | number;
+  triggeringCommentId: string | number;
+}) {
+  // A database timeout can make a webhook redelivery unable to read an
+  // already-created durable command. Deriving the public id from immutable
+  // GitHub identities keeps that compatibility enqueue attached to the same
+  // investigation even after Redis job retention expires. The digest keeps
+  // raw tenant/comment identities out of logs, queue listings, and URLs.
+  const digest = createHash("sha256")
+    .update(
+      JSON.stringify([
+        "github-issue-comment",
+        String(input.installationId),
+        String(input.triggeringCommentId),
+      ]),
+      "utf8",
+    )
+    .digest("hex")
+    .slice(0, 20)
+    .toUpperCase();
+  return `inv_${digest}`;
 }
 
 export function createFixAttemptId() {

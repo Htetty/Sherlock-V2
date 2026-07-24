@@ -98,12 +98,77 @@ for the design.
   recording failures fall back to the normal report.
 - `ffmpeg` in the worker image produces
   `evidence/evidence.mp4` (side-by-side) and a bounded `evidence/evidence.gif`.
-- When the existing `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are set,
-  replay evidence is automatically uploaded to the managed public
-  `sherlock-evidence` bucket under an unguessable path, then embedded in the
-  issue comment. This includes private repositories because GitHub cannot embed
-  authenticated Storage objects; anyone with the unguessable URL can view the
-  media. Bucket retention is deployment-owned.
+- Recording always stays enabled and local. **Public upload is disabled by
+  default**: media only reaches the public `sherlock-evidence` bucket when
+  `SHERLOCK_PUBLIC_REPLAY_UPLOAD_MODE=allowlist` **and** the repository's
+  exact `owner/repo` appears in `SHERLOCK_PUBLIC_REPLAY_ALLOWLIST`
+  (comma-separated, case-insensitive, no wildcards). Allowlist mode is
+  intended only for explicitly approved, Sherlock-controlled demo
+  repositories: uploaded objects are publicly readable at an unguessable URL
+  because GitHub cannot embed authenticated Storage objects. When upload is
+  skipped, the GitHub report simply omits the replay media; the investigation
+  is never affected. Previously published objects and URLs remain untouched.
+
+## Dashboard API and GitHub App onboarding
+
+The backend exposes a small SaaS control layer for the Sherlock dashboard
+frontend (separate repository):
+
+- `GET /api/me` — verifies the caller's Supabase access token
+  (`Authorization: Bearer <token>`), maps the user to their immutable GitHub
+  identity, and synchronizes `public.profiles`.
+- `GET /api/installations` — the caller's GitHub App installations, scoped
+  strictly through `user_installations` membership.
+- `POST /api/installations/start` — mints a one-time, hashed, 15-minute
+  installation state and returns the GitHub App installation URL.
+- `GET /api/github/installations/callback` — the GitHub App **setup
+  callback**. Verifies the state nonce, fetches the installation from
+  GitHub's App API with App credentials, applies the ownership policy
+  (personal installations: installation account id must equal the user's
+  GitHub id; organization installations: the verified `installation.created`
+  webhook sender id must equal the user's GitHub id), records membership, and
+  redirects to `SHERLOCK_FRONTEND_URL`. For `setup_action=update`, an
+  already-known installation may return without the one-time installation
+  nonce: the callback re-verifies it through GitHub and reconciles repository
+  access, but never creates or changes user membership on that path.
+
+Installation lifecycle webhooks (`installation.*`,
+`installation_repositories.*`) are persisted by the Probot process
+(`src/installation-events.ts`). Existing `/sherlock investigate` comment
+investigations are fully independent of dashboard onboarding: repositories
+keep working whether or not anyone has signed into the dashboard.
+
+### External configuration required (not managed by this repository)
+
+Deploying the dashboard API requires these steps **outside** this codebase —
+none of them happen automatically:
+
+1. **Supabase migrations** — apply the additive migrations in
+   [supabase/migrations/](supabase/migrations/) (profiles, installations,
+   membership, repositories, nonces + the `consume_github_installation_nonce`
+   RPC) to the shared Supabase project. Existing migrations are unchanged.
+2. **Supabase Auth** — the frontend and backend use the SAME Supabase
+   project. Enable GitHub as an auth provider. The GitHub **OAuth App**
+   callback URL points at Supabase Auth (`https://<project>.supabase.co/auth/v1/callback`),
+   NOT at this backend; the frontend owns the browser `/auth/callback` route.
+3. **Keys** — the frontend uses the publishable key; this backend uses
+   `SUPABASE_PUBLISHABLE_KEY` only to verify user tokens and
+   `SUPABASE_SERVICE_ROLE_KEY` only for trusted persistence.
+4. **GitHub App setup URL** — in the deployed GitHub App's settings, set the
+   Setup URL to `https://<backend-origin>/api/github/installations/callback`
+   and enable **Redirect on update** so adding or removing repository access
+   returns to Sherlock. `<backend-origin>` must be the same deployed origin
+   configured as the frontend's server-only `SHERLOCK_API_URL`.
+5. **GitHub App webhook events** — subscribe the deployed App to
+   **Installation**, **Installation repositories**, and **Issue comment**.
+   Editing `app.yml` alone does NOT change an existing GitHub App.
+6. **Frontend origin** — set `SHERLOCK_FRONTEND_URL` (e.g.
+   `https://getsherlock.dev`, subject to deployment verification). The setup
+   callback redirects only to this origin.
+7. **Deploy + restart** — the api container needs the new environment
+   variables (`SUPABASE_PUBLISHABLE_KEY`, `SHERLOCK_FRONTEND_URL`,
+   `GITHUB_APP_SLUG`); the worker needs the replay policy variables if you
+   enable allowlisted public uploads.
 
 ## Contributing
 
