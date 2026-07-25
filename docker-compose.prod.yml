@@ -73,7 +73,7 @@ services:
     ports:
       # Public GitHub webhook ingress. Terminate TLS in a reverse proxy and
       # forward here; do not expose plain HTTP to the internet directly.
-      - "${API_WEBHOOK_PORT:-3000}:3000"
+      - "${API_WEBHOOK_PORT:-127.0.0.1:3000}:4000"
     depends_on:
       redis:
         condition: service_healthy
