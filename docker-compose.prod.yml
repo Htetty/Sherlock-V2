@@ -71,9 +71,10 @@ services:
       # documented alternative — see docs/deployment.md).
       - github_app_private_key
     ports:
-      # Public GitHub webhook ingress. Terminate TLS in a reverse proxy and
-      # forward here; do not expose plain HTTP to the internet directly.
-      - "${API_WEBHOOK_PORT:-127.0.0.1:3000}:4000"
+      # Probot GitHub webhook receiver.
+      - "127.0.0.1:3000:3000"
+      # Sherlock backend API, health, installation, and onboarding routes.
+      - "127.0.0.1:4000:4000"
     depends_on:
       redis:
         condition: service_healthy
@@ -106,6 +107,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.worker
+    ipc: host
+    shm_size: "1gb"
     restart: unless-stopped
     logging: *bounded-logging
     env_file:
@@ -122,7 +125,8 @@ services:
       # siblings and bind-mount the clone workspace, which the daemon resolves
       # on the HOST filesystem. TMPDIR must therefore be a path that is
       # identical inside the container and on the host (see the volume below).
-      TMPDIR: ${SHERLOCK_HOST_TMP:-/var/tmp/sherlock}
+      TMPDIR: /tmp
+      SHERLOCK_HOST_TMP: ${SHERLOCK_HOST_TMP:-/var/tmp/sherlock}
       # Containerized worker: its localhost is the worker container, never
       # the Docker host, so target apps are NOT published on the host
       # loopback. Instead they attach to this shared bridge network and the

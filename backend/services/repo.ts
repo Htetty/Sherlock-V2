@@ -138,7 +138,7 @@ export async function cloneRepoForInvestigation(input: {
   }
 
   const runGit = input.runGit ?? defaultGitRunner;
-  const workspacePath = await mkdtemp(path.join(tmpdir(), "handoff-"));
+  const workspacePath = await mkdtemp(path.join(process.env.SHERLOCK_HOST_TMP ?? tmpdir(), "handoff-"));
   const repoPath = path.join(workspacePath, "repo");
 
   try {
