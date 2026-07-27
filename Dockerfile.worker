@@ -11,17 +11,18 @@
 # are siblings, any bind-mounted clone path must exist from the DAEMON
 # host's perspective — see docs/production-worker.md.
 
-FROM node:22-bookworm-slim
-
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
 # git for cloning; curl/ca-certificates for the Docker CLI and uv installs;
 # ffmpeg for automatic replay-evidence GIF/MP4 generation.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN rm -f /etc/apt/sources.list.d/nodesource.list \
+          /etc/apt/sources.list.d/nodesource.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
       git \
       ca-certificates \
       curl \
       ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-
 # Docker CLI only — the daemon comes from the mounted host socket.
 ARG DOCKER_CLI_VERSION=27.3.1
 RUN curl -fsSL "https://download.docker.com/linux/static/stable/$(uname -m)/docker-${DOCKER_CLI_VERSION}.tgz" \
@@ -50,7 +51,6 @@ RUN npm run build
 
 # Playwright Chromium plus its native libraries (the worker runs the
 # reproduction browser itself; target apps run in sibling containers).
-RUN npx playwright install --with-deps chromium
 
 # Drop build-only dependencies (playwright stays: it is a runtime dep).
 RUN npm prune --omit=dev

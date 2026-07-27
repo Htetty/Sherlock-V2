@@ -73,7 +73,7 @@ export async function createRuntimeWorkspace(
 ): Promise<RuntimeWorkspace> {
   const owner = options.owner === undefined ? resolveWorkspaceOwner() : options.owner;
   const chown = options.chown ?? ((target, uid, gid) => lchown(target, uid, gid));
-  const root = await mkdtemp(path.join(tmpdir(), "sherlock-runtime-"));
+  const root = await mkdtemp(path.join(process.env.SHERLOCK_HOST_TMP ?? tmpdir(), "sherlock-runtime-"));
   const runtimePath = path.join(root, "repo");
   const cleanup = () => rm(root, { recursive: true, force: true });
 
