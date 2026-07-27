@@ -147,9 +147,20 @@ describe("pull request title", () => {
     expect(
       renderPullRequestTitle("uses API_TOKEN=super-secret"),
     ).not.toContain("super-secret");
-    expect(renderPullRequestTitle("x".repeat(500)).length).toBeLessThanOrEqual(
-      120,
+    const longWordTitle = renderPullRequestTitle("x".repeat(500));
+    expect(longWordTitle.length).toBeLessThanOrEqual(72);
+    expect(longWordTitle).toMatch(/…$/);
+  });
+
+  test("shortens long summaries at a readable word boundary", () => {
+    const title = renderPullRequestTitle(
+      "Prevent duplicate billing notifications when retrying failed webhook deliveries",
     );
+
+    expect(title).toBe(
+      "Sherlock: Prevent duplicate billing notifications when retrying…",
+    );
+    expect(title.length).toBeLessThanOrEqual(72);
   });
 
   test("neutralizes every public title injection and infrastructure form", () => {
@@ -159,7 +170,7 @@ describe("pull request title", () => {
       "API_TOKEN=super-secret [spoof](https://evil.example)",
     );
     expect(title).toMatch(/^Sherlock: /);
-    expect(title.length).toBeLessThanOrEqual(120);
+    expect(title.length).toBeLessThanOrEqual(72);
     expect(title).not.toMatch(/(?:inv_|localhost|59743|workspaces|git-diff|super-secret|<!--|\n|\[|\]|#)/i);
     expect(title).not.toMatch(/(?:fix_ABCDEF_suffix|db:5432|reproduction-result\.json)/i);
 
@@ -186,13 +197,15 @@ describe("pull request title", () => {
     for (const value of privateValues) {
       expect(renderPullRequestTitle(`Fix ${value}`)).not.toContain(value);
     }
-    expect(
-      renderPullRequestTitle(
-        "Keep src/config/settings.json backend/services/delivery.ts server.ts:42 HTTP 401 3000ms",
-      ),
-    ).toContain(
-      "src/config/settings.json backend/services/delivery.ts server.ts:42 HTTP 401 3000ms",
-    );
+    for (const value of [
+      "src/config/settings.json",
+      "backend/services/delivery.ts",
+      "server.ts:42",
+      "HTTP 401",
+      "3000ms",
+    ]) {
+      expect(renderPullRequestTitle(`Keep ${value}`)).toContain(value);
+    }
   });
 });
 

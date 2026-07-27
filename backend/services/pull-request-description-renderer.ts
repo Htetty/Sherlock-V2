@@ -83,7 +83,10 @@ export type PullRequestDescriptionData = {
 
 // --- Bounds ------------------------------------------------------------------------
 
-const MAX_TITLE_CHARS = 120;
+// Keep the complete title within the conventional 72-character subject-line
+// width so it remains readable in GitHub's pull-request lists and notifications.
+const MAX_TITLE_CHARS = 72;
+const TITLE_PREFIX = "Sherlock: ";
 const MAX_SUMMARY_CHARS = 600;
 const MAX_ROOT_CAUSE_CHARS = 1_000;
 const MAX_BEHAVIOR_CHARS = 300;
@@ -311,9 +314,27 @@ export function buildPullRequestDescriptionData(
 export function renderPullRequestTitle(summary: string | null): string {
   const text = sanitizeTitleField(
     summary ?? "Fix verified by reproduction replay",
-    MAX_TITLE_CHARS - "Sherlock: ".length,
+    MAX_SUMMARY_CHARS,
   ) ?? "Fix verified by reproduction replay";
-  return `Sherlock: ${text}`.slice(0, MAX_TITLE_CHARS);
+  return `${TITLE_PREFIX}${truncatePullRequestTitle(
+    text,
+    MAX_TITLE_CHARS - TITLE_PREFIX.length,
+  )}`;
+}
+
+function truncatePullRequestTitle(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+
+  const candidate = text.slice(0, maxChars - 1).trimEnd();
+  const lastSpace = candidate.lastIndexOf(" ");
+  // Prefer a complete word unless doing so would discard most of the useful
+  // title (for example, when it contains a long identifier).
+  const shortened =
+    lastSpace >= Math.floor(maxChars * 0.6)
+      ? candidate.slice(0, lastSpace).trimEnd()
+      : candidate;
+
+  return `${shortened}…`;
 }
 
 const VALIDATION_CATEGORY_LABELS: Record<string, string> = {
